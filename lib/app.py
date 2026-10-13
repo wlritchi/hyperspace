@@ -28,7 +28,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
-from accounts import AccountsFile, Principal
+from accounts import AccountsFile, Principal, parse_token
 from hyperspace_protocol import (
     API_PREFIX,
     HEADER_ACTIVITY,
@@ -118,20 +118,37 @@ class ApiError(Exception):
 class _Limiter:
     """In-memory limits. They reset when the server restarts.
 
-    The table of failed authentications has a fixed maximum size, so that
-    requests from many addresses cannot use up memory.
+    Failed authentications are counted for each client address (IPv6 by /64
+    prefix). An address over the limit gets no further checks of its tokens,
+    so it cannot keep guessing. A credential that authenticated from that
+    address in the last day is still checked, so that the failures of other
+    clients behind a shared address do not lock out known clients. Both tables
+    have a fixed maximum size.
     """
 
     settings: Settings
-    max_clients: int = 10_000
+    max_entries: int = 10_000
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _requests: dict[str, deque[float]] = field(default_factory=dict[str, deque[float]])
     _failures: OrderedDict[str, deque[float]] = field(
         default_factory=OrderedDict[str, deque[float]]
     )
+    _known: OrderedDict[tuple[str, str], float] = field(
+        default_factory=OrderedDict[tuple[str, str], float]
+    )
     _bytes: dict[tuple[str, str], int] = field(
         default_factory=dict[tuple[str, str], int]
     )
+
+    @staticmethod
+    def address_key(address: str) -> str:
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return address
+        if ip.version == 6:
+            return str(ipaddress.ip_network(f"{ip}/64", strict=False))
+        return str(ip)
 
     @staticmethod
     def _trim(window: deque[float], now: float) -> None:
@@ -149,31 +166,41 @@ class _Limiter:
             return True
 
     def failed_auth(self, client: str) -> None:
+        key = self.address_key(client)
         with self._lock:
             now = time.monotonic()
-            window = self._failures.pop(client, None) or deque()
+            window = self._failures.pop(key, None) or deque()
             self._trim(window, now)
             window.append(now)
-            self._failures[client] = window
-            while len(self._failures) > self.max_clients:
+            self._failures[key] = window
+            while len(self._failures) > self.max_entries:
                 self._failures.popitem(last=False)
 
-    def auth_blocked(self, client: str) -> bool:
-        """True if `client` has too many recent failed authentications.
-
-        The server checks this only for requests whose credential is not
-        valid, so that failures from one address (for example, a shared
-        proxy) cannot lock out valid credentials.
-        """
+    def succeeded(self, client: str, credential: str) -> None:
+        key = (self.address_key(client), credential)
         with self._lock:
-            window = self._failures.get(client)
-            if window is None:
+            self._known.pop(key, None)
+            self._known[key] = time.monotonic()
+            while len(self._known) > self.max_entries:
+                self._known.popitem(last=False)
+
+    def may_check(self, client: str, credential: str | None) -> bool:
+        """False if the server must refuse this request without checking
+        its token."""
+        key = self.address_key(client)
+        with self._lock:
+            window = self._failures.get(key)
+            if window is not None:
+                self._trim(window, time.monotonic())
+                if not window:
+                    del self._failures[key]
+                    window = None
+            if window is None or len(window) < self.settings.failed_auth_per_minute:
+                return True
+            if credential is None:
                 return False
-            self._trim(window, time.monotonic())
-            if not window:
-                del self._failures[client]
-                return False
-            return len(window) >= self.settings.failed_auth_per_minute
+            seen = self._known.get((key, credential))
+            return seen is not None and time.monotonic() - seen < 86_400
 
     def add_bytes(self, credential: str, count: int) -> bool:
         day = datetime.now(UTC).strftime("%Y-%m-%d")
@@ -233,18 +260,17 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
         def wrap(handler: Handler) -> Callable[[Request], Awaitable[Response]]:
             async def endpoint(request: Request) -> Response:
                 header = request.headers.get("authorization", "")
-                principal = None
-                if header.startswith("Bearer "):
-                    principal = accounts.authenticate(header[7:].strip(), now())
+                token = header[7:].strip() if header.startswith("Bearer ") else ""
+                parsed = parse_token(token)
+                credential_id = parsed[0] if parsed is not None else None
+                client = client_address(request, settings.trusted_proxies)
+                if not limiter.may_check(client, credential_id):
+                    return error("rate_limited", "too many failed authentications")
+                principal = accounts.authenticate(token, now()) if token else None
                 if principal is None:
-                    # A valid credential is never blocked: the failures of
-                    # other clients behind the same address must not lock
-                    # it out.
-                    client = client_address(request, settings.trusted_proxies)
-                    if limiter.auth_blocked(client):
-                        return error("rate_limited", "too many failed authentications")
                     limiter.failed_auth(client)
                     return error("unauthorized")
+                limiter.succeeded(client, principal.credential)
                 if not limiter.request(principal.credential):
                     return error("rate_limited", "too many requests")
                 missing = [s for s in scopes if s not in principal.scopes]

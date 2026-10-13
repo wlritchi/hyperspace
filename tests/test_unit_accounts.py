@@ -88,7 +88,8 @@ def test_authenticate(tmp_path: Path) -> None:
         "agent-1",
         "granted",
     )
-    assert file.authenticate(token[:-1] + "A", NOW) is None
+    wrong = token[:-1] + ("B" if token.endswith("A") else "A")
+    assert file.authenticate(wrong, NOW) is None
     assert file.authenticate("garbage", NOW) is None
 
 
