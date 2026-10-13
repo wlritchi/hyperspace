@@ -1,0 +1,55 @@
+name: Tag packages
+
+# On a push to main, push the next protocol-v<version> or client-v<version>
+# tag when commits changed that package. Clients pin these tags, for example
+# `hyperspace-client @ git+https://...@client-vX.Y.Z#subdirectory=client`.
+# [skip release] in the head commit opts out.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'protocol/**'
+      - 'client/**'
+
+jobs:
+  tag:
+    runs-on: docker
+    timeout-minutes: 30
+    env:
+      RELEASE_EMAIL: ${{ vars.RELEASE_EMAIL || 'auto-release@users.noreply.invalid' }}
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
+          git config --local http.extraheader "Authorization: Basic ${AUTH}"
+          git fetch --tags origin "+${GITHUB_REF}:${GITHUB_REF}" || git fetch --tags origin
+          git checkout "${GITHUB_REF}"
+
+      - name: Tag
+        run: |
+          set -eu
+          if git log -1 --format=%B | grep -qi '\[skip release\]'; then
+            echo "[skip release] in the head commit; no tags."
+            exit 0
+          fi
+          git config user.name "auto-release"
+          git config user.email "${RELEASE_EMAIL}"
+          for PACKAGE in protocol client; do
+            PREFIX="${PACKAGE}-v"
+            VERSION="$(bash .forgejo/scripts/next-version.sh "${PREFIX}" "${PACKAGE}/")"
+            if [ -z "${VERSION}" ]; then
+              echo "${PACKAGE}: no changes."
+              continue
+            fi
+            TAG="${PREFIX}${VERSION}"
+            git tag -a "${TAG}" -m "[auto-release] ${TAG}"
+            # Fails if another run already pushed this version.
+            git push origin "refs/tags/${TAG}"
+            echo "Pushed ${TAG}"
+          done

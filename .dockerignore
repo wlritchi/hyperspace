@@ -1,0 +1,20 @@
+# The image copies only server/, lib/, scripts/, and protocol/. Keep the rest
+# out of the build context, so that unrelated edits do not change the cache.
+.git/
+.forgejo/
+.github/
+.claude/
+tests/
+docs/
+client/
+charts/
+*.md
+# hatchling needs the readme to build the protocol package.
+!protocol/README.md
+*.lock
+!server/hyperspace-server.py.lock
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/

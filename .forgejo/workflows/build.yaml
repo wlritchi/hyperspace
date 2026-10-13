@@ -1,0 +1,161 @@
+name: Release server
+
+# - Push to main: compute the next X.Y.Z from Conventional Commits since the
+#   last X.Y.Z tag, push an annotated [auto-release] tag, build and push the
+#   image, then package and push the Helm chart with the same version.
+#   [skip release] in the head commit opts out.
+# - workflow_dispatch: rebuild the release tag at the selected ref.
+#
+# Repository settings:
+# - variable REGISTRY (for example registry.example.com): the image goes to
+#   <REGISTRY>/<owner>/<repo>, the chart to oci://<REGISTRY>/<owner>/charts.
+# - secrets REGISTRY_USERNAME and REGISTRY_PASSWORD.
+# - variable RELEASE_EMAIL (optional): the tagger email of release tags.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+jobs:
+  image:
+    runs-on: buildkit
+    # Time in the queue counts against this limit.
+    timeout-minutes: 180
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      DOCKER_CONFIG: /tmp/docker
+      REGISTRY: ${{ vars.REGISTRY }}
+      IMAGE: ${{ vars.REGISTRY }}/${{ github.repository }}
+      RELEASE_EMAIL: ${{ vars.RELEASE_EMAIL || 'auto-release@users.noreply.invalid' }}
+
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
+          git config --local http.extraheader "Authorization: Basic ${AUTH}"
+          # Full history and tags: the version reads commits since the last
+          # release tag.
+          git fetch --tags origin "+${GITHUB_REF}:${GITHUB_REF}" || git fetch --tags origin
+          git checkout "${GITHUB_REF}"
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -eu
+          : > /tmp/version
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if ! TAG="$(git describe --tags --exact-match --match '[0-9]*' HEAD 2>/dev/null)"; then
+              echo "ERROR: workflow_dispatch needs HEAD at a release tag" >&2
+              exit 1
+            fi
+          else
+            if git log -1 --format=%B | grep -qi '\[skip release\]'; then
+              echo "[skip release] in the head commit; no release."
+              exit 0
+            fi
+            TAG="$(bash .forgejo/scripts/next-version.sh '')"
+            if [ -z "${TAG}" ]; then
+              echo "No commits since the last release."
+              exit 0
+            fi
+            echo "Release ${TAG}"
+            git config user.name "auto-release"
+            git config user.email "${RELEASE_EMAIL}"
+            LAST="$(git tag -l --merged HEAD | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+            RANGE="${LAST:+${LAST}..}HEAD"
+            git tag -a "${TAG}" -m "[auto-release] ${TAG}" \
+              -m "$(git log --format='- %s' "${RANGE}")"
+            echo 1 > /tmp/pushtag
+          fi
+          printf '%s\n' "${TAG}" > /tmp/version
+          echo "version=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Registry login
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          if [ ! -s /tmp/version ]; then exit 0; fi
+          set -eu
+          : "${REGISTRY:?set the REGISTRY repository variable}"
+          : "${REGISTRY_USERNAME:?set the REGISTRY_USERNAME secret}"
+          : "${REGISTRY_PASSWORD:?set the REGISTRY_PASSWORD secret}"
+          mkdir -p "$DOCKER_CONFIG"
+          printf '{"auths":{"https://%s":{"username":"%s","password":"%s"},"%s":{"username":"%s","password":"%s"}}}' \
+            "$REGISTRY" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" \
+            "$REGISTRY" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" > "$DOCKER_CONFIG/config.json"
+
+      - name: Push release tag
+        run: |
+          if [ ! -f /tmp/pushtag ]; then exit 0; fi
+          set -eu
+          TAG="$(cat /tmp/version)"
+          # Fails if another run already pushed this version.
+          git push origin "refs/tags/${TAG}"
+
+      - name: Build and push image
+        run: |
+          if [ ! -s /tmp/version ]; then exit 0; fi
+          set -eu
+          VERSION="$(cat /tmp/version)"
+          REFS="${IMAGE}:${VERSION}"
+          HIGHEST="$(git tag -l | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)"
+          if [ "${VERSION}" = "${HIGHEST}" ]; then REFS="${REFS},${IMAGE}:latest"; fi
+          CACHE="type=registry,ref=${IMAGE}:buildcache"
+          # cmdline=builtin: use the built-in Dockerfile frontend; the
+          # `# syntax=` line would start a frontend container, which this
+          # runner cannot do.
+          buildctl-daemonless.sh build \
+            --frontend dockerfile.v0 \
+            --opt cmdline=builtin \
+            --local context=. \
+            --local dockerfile=. \
+            --opt build-arg:VERSION="${VERSION}" \
+            --opt build-arg:VCS_REF="$(git rev-parse --short HEAD)" \
+            --opt build-arg:BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --import-cache "${CACHE}" \
+            --export-cache "${CACHE},mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true" \
+            --output "type=image,\"name=${REFS}\",push=true,oci-mediatypes=true"
+          echo "Pushed ${REFS}"
+
+  chart:
+    needs: image
+    if: needs.image.outputs.version != ''
+    runs-on: docker
+    timeout-minutes: 30
+    env:
+      REGISTRY: ${{ vars.REGISTRY }}
+      VERSION: ${{ needs.image.outputs.version }}
+      HELM_VERSION: v4.3.0
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
+          git config --local http.extraheader "Authorization: Basic ${AUTH}"
+          git fetch --depth 1 origin "refs/tags/${VERSION}:refs/tags/${VERSION}"
+          git checkout "refs/tags/${VERSION}"
+
+      - name: Package and push chart
+        env:
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -eu
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar xz -C /tmp
+          HELM=/tmp/linux-amd64/helm
+          "$HELM" package charts/hyperspace --version "${VERSION}" --app-version "${VERSION}" -d /tmp/chart
+          printf '%s' "${REGISTRY_PASSWORD}" | "$HELM" registry login "${REGISTRY}" \
+            --username "${REGISTRY_USERNAME}" --password-stdin
+          "$HELM" push "/tmp/chart/hyperspace-${VERSION}.tgz" "oci://${REGISTRY}/${GITHUB_REPOSITORY_OWNER}/charts"

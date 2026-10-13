@@ -1,0 +1,12 @@
+apiVersion: v2
+name: hyperspace
+description: >-
+  Append-only backup store for coding-agent transcripts, with session teleport
+  between hosts.
+type: application
+# The release workflow sets version and appVersion to the release version.
+version: 0.0.0
+appVersion: "0.0.0"
+home: https://github.com/wlritchi/hyperspace
+sources:
+  - https://github.com/wlritchi/hyperspace

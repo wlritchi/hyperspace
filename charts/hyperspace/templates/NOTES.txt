@@ -1,0 +1,23 @@
+Hyperspace {{ .Chart.AppVersion }} is installed as {{ include "hyperspace.fullname" . }}.
+
+The chart makes no credentials. Make one for each host, inside the pod:
+
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "hyperspace.fullname" . }} -- \
+    python /app/hyperspace/scripts/new-credential.py \
+    --host <host name> --scopes append,read,grant --read all
+
+Use --read all for workstations and --read granted for runners. The script
+prints the token once. Revoke a credential with scripts/revoke-credential.py.
+{{- if .Values.ingress.enabled }}
+
+Clients connect to https://{{ .Values.ingress.host }} (set HYPERSPACE_URL).
+{{- else }}
+
+No ingress is enabled. Clients need a route to the service
+{{ include "hyperspace.fullname" . }}:{{ .Values.service.port }}, over TLS.
+{{- end }}
+{{- if not .Values.server.trustedProxies }}
+
+server.trustedProxies is empty. Behind a proxy, all clients then share one
+address for the failed-auth limit. Set it to the proxy's addresses.
+{{- end }}

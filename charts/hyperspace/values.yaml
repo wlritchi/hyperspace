@@ -1,0 +1,54 @@
+# The server has one writer (the SQLite index and the generation files), so
+# the chart always runs one replica with the Recreate strategy.
+
+image:
+  repository: ""  # required, for example registry.example.com/wlritchi/hyperspace
+  tag: ""  # default: the chart's appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+persistence:
+  # The PVC for /data. Set existingClaim to use a claim that you made.
+  existingClaim: ""
+  size: 20Gi
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+
+service:
+  type: ClusterIP
+  port: 8139
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""  # required when enabled, for example hyperspace.example.com
+  tls:
+    # The name of a Secret with the certificate. Empty means no TLS block
+    # (for example, when TLS ends at a load balancer in front).
+    secretName: ""
+
+server:
+  # CIDRs of the proxies whose X-Forwarded-For the server trusts, for rate
+  # limits and the audit log. Set this to the ingress controller's addresses
+  # (or the pod network), or all clients share one address for the
+  # failed-auth limit.
+  trustedProxies: []
+  maxBody: ""  # bytes; empty for the default (8 MiB, also the maximum)
+  ratePerMinute: ""  # requests per credential; empty for the default
+  bytesPerDay: ""  # bytes per credential; empty for the default
+  failedAuthPerMinute: ""
+  globalFailedAuthPerMinute: ""
+
+extraEnv: []
+
+resources: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+podLabels: {}

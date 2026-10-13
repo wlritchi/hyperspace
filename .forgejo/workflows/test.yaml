@@ -36,6 +36,24 @@ jobs:
       - name: Pyright
         run: uvx --with-editable ./protocol --with-editable ./client pyright@1.1.408 protocol/src client/src
 
+      - name: Helm chart
+        env:
+          HELM_VERSION: v4.3.0
+          KUBECONFORM_VERSION: v0.6.7
+        run: |
+          set -eu
+          curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar xz -C /tmp
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" | tar xz -C /tmp
+          HELM=/tmp/linux-amd64/helm
+          SET="--set image.repository=registry.example.com/x/hyperspace"
+          "$HELM" lint charts/hyperspace $SET
+          "$HELM" template t charts/hyperspace $SET > /tmp/default.yaml
+          "$HELM" template t charts/hyperspace $SET \
+            --set ingress.enabled=true --set ingress.host=hyperspace.example.com \
+            --set ingress.tls.secretName=tls --set persistence.existingClaim=data \
+            --set 'server.trustedProxies={10.0.0.0/8}' > /tmp/full.yaml
+          /tmp/kubeconform -strict -summary /tmp/default.yaml /tmp/full.yaml
+
       - name: Prettier
         run: npx --yes prettier@3.9.10 --check '**/*.md'
 

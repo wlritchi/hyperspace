@@ -1,0 +1,118 @@
+{{- if not .Values.image.repository }}
+{{- fail "image.repository is required" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hyperspace.fullname" . }}
+  labels:
+    {{- include "hyperspace.labels" . | nindent 4 }}
+spec:
+  # One writer: the SQLite index and the generation files.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "hyperspace.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "hyperspace.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: hyperspace
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8139
+          env:
+            - name: HYPERSPACE_DATA_DIR
+              value: /data
+            - name: HYPERSPACE_LISTEN_HOST
+              value: "0.0.0.0"
+            - name: HYPERSPACE_PORT
+              value: "8139"
+            {{- with .Values.server.trustedProxies }}
+            - name: HYPERSPACE_TRUSTED_PROXIES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- range $name, $value := dict
+                "HYPERSPACE_MAX_BODY" .Values.server.maxBody
+                "HYPERSPACE_RATE_PER_MINUTE" .Values.server.ratePerMinute
+                "HYPERSPACE_BYTES_PER_DAY" .Values.server.bytesPerDay
+                "HYPERSPACE_FAILED_AUTH_PER_MINUTE" .Values.server.failedAuthPerMinute
+                "HYPERSPACE_GLOBAL_FAILED_AUTH_PER_MINUTE" .Values.server.globalFailedAuthPerMinute }}
+            {{- if $value }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            # The root file system is read-only; Python and SQLite need a
+            # writable /tmp.
+            - name: tmp
+              mountPath: /tmp
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "hyperspace.claimName" . }}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

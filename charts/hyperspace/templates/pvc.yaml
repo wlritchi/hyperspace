@@ -1,0 +1,21 @@
+{{- if not .Values.persistence.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "hyperspace.claimName" . }}
+  labels:
+    {{- include "hyperspace.labels" . | nindent 4 }}
+  annotations:
+    # Keep the data when the release is uninstalled: it is the only copy of
+    # the backups.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.accessModes | nindent 4 }}
+  {{- with .Values.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+{{- end }}

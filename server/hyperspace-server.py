@@ -21,6 +21,7 @@ Configuration is in environment variables; see "Configuration" in the spec.
 # ///
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +35,8 @@ from store import Store
 
 
 def main() -> None:
+    # Data files hold transcripts: no access for other users.
+    os.umask(0o027)
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
