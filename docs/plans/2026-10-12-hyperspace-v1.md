@@ -2,9 +2,9 @@
 
 Date: 2026-10-12. Spec: [hyperspace](../specs/2026-10-12-hyperspace.md).
 
-Each step is one branch or one commit, and keeps the test suite green. Steps 1
-to 8 and 10 are in this repo. Step 9 is in wlr-cc-plugins. The spec has no
-open questions for v1.
+Each step is one branch or one commit, and keeps the test suite green. All
+steps are in this repo; a marketplace (wlr-cc-plugins) lists the plugin. The
+spec has no open questions for v1.
 
 ## Step 1: repository scaffold
 
@@ -138,10 +138,9 @@ open questions for v1.
   grant, the final sync, the move aside, and the server call. On lease loss,
   the client syncs and then moves the local copy aside.
 - Arrival records, and the `teleports` server event.
-- `hyperspace notice <sid>`: print the pending arrival, move, or conflict
-  notice and mark it as delivered. `hyperspace check-resume <sid>`: the
-  prevention check for the UserPromptSubmit hook. The plugin hooks call these
-  commands.
+- The SessionStart notice (the pending arrival, move, or conflict notice,
+  shown once) and the prevention check at the first prompt after a resume.
+  `hyperspace hook` (step 9) runs them.
 - The adapter fork: copy each record with `sessionId` changed and a
   `forkedFrom` marker, and move side files to the new id. A conformance test
   compares the result with `claude --resume <id> --fork-session` on a sample
@@ -196,22 +195,20 @@ open questions for v1.
 - `scripts/stats.py`: sizes per host, workspace, and harness; the largest
   sessions; the read audit.
 
-## Step 9: plugin in wlr-cc-plugins
+## Step 9: the plugin
 
-- `hyperspace/.claude-plugin/plugin.json` (version 0.1.0) and an entry in
-  `marketplace.json`.
-- `hyperspace/hooks/hooks.json` with the hooks from the spec: a synchronous
-  notice hook on SessionStart, a synchronous notice and prevention hook on
-  UserPromptSubmit, and async checkpoint hooks on SessionStart,
-  UserPromptSubmit, PreToolUse, PostToolUse, SubagentStop, PreCompact,
-  PostCompact, Stop, and SessionEnd.
-- Standard-library hook scripts that call the CLI through a PEP 723 shim that
-  pins `hyperspace-client` to a `client-v*` tag.
-- Tests in the wlr-cc-plugins CI: the hooks never fail, the async hooks exit
-  at once, the SessionStart notice hook needs no network, the prevention hook
-  permits the prompt when the server cannot be reached, and the hooks do
-  nothing when the client is not configured.
-- Update the plugin table in wlr-cc-plugins `CLAUDE.md`.
+- `plugin/hyperspace/` in this repo, with the layout of a marketplace plugin.
+  `plugin.json` has no version: the marketplace entry's git ref selects it.
+- `hooks/hooks.json` runs `hooks/forward.sh` for every event: synchronous on
+  SessionStart and UserPromptSubmit, async on the others. The forwarder runs
+  `hyperspace hook` with the hook's JSON on stdin, or does nothing without the
+  CLI.
+- `hyperspace hook` in the client holds all hook behavior (see "Plugin" in the
+  spec), and always exits 0 with no output on an error.
+- Tests: the forwarder passes stdin and output through and does nothing with
+  no CLI; `hyperspace hook` starts the right work for each event, ignores
+  unknown events, and never fails, even with a bad configuration.
+- A marketplace (wlr-cc-plugins) lists the plugin with a `git-subdir` entry.
 
 ## Step 10: deployment docs
 

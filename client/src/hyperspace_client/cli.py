@@ -21,18 +21,16 @@ from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.checkpoint import checkpoint
 from hyperspace_client.config import Config, ConfigError
-from hyperspace_client.notices import (
-    after_sync,
-    check_resume,
-    hook_json,
-    refresh_states,
-    session_start_notice,
-)
+from hyperspace_client.hooks import handle
+from hyperspace_client.notices import after_sync, refresh_states
 from hyperspace_client.state import State
 from hyperspace_client.sync import Context, Syncer, register_host
 from hyperspace_client.teleport import TeleportError, fork, restore, send
 
 log = logging.getLogger("hyperspace")
+# Before logging is set up (for example, on a bad config file), a warning
+# must not reach stderr: a hook prints nothing on an error.
+log.addHandler(logging.NullHandler())
 
 # Events where the hook's cwd is the session's workspace.
 _START_EVENTS = ("SessionStart",)
@@ -186,52 +184,17 @@ def cmd_whoami(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
-def _session_from_hook(cfg: Config, transcript: str | None) -> LocalSession | None:
-    if not transcript:
-        return None
-    return ClaudeCode().session_for_transcript(Path(transcript))
-
-
-def cmd_notice(args: argparse.Namespace, cfg: Config) -> int:
-    """SessionStart hook: print notices. Local state only, no network."""
-    session = _session_from_hook(cfg, args.transcript)
-    if session is None:
-        return 0
-    state = State(cfg.state_dir)
+def cmd_hook(args: argparse.Namespace, cfg: Config) -> int:
+    """The entry point for harness hooks: the hook's JSON is on stdin. A hook
+    must never fail the session, so this always exits 0."""
     try:
-        text = session_start_notice(
-            state, ClaudeCode(), session, cfg.host, args.cwd, args.source
-        )
-    finally:
-        state.close()
-    if text:
-        print(text)
-    return 0
-
-
-def cmd_check_resume(args: argparse.Namespace, cfg: Config) -> int:
-    """UserPromptSubmit hook: block the first prompt after a resume if the
-    session lives elsewhere. Print notices otherwise."""
-    session = _session_from_hook(cfg, args.transcript)
-    if session is None:
-        return 0
-    state = State(cfg.state_dir)
-    try:
-        notices = state.take_notices(session.harness, session.session_id)
-        decision = None
-        if cfg.url and cfg.token:
-            api = Api(cfg.url, cfg.token, timeout=2.0)
-            try:
-                ctx = Context(api=api, state=state, adapter=ClaudeCode(), host=cfg.host)
-                decision = check_resume(ctx, session)
-            finally:
-                api.close()
-    finally:
-        state.close()
-    if decision is not None:
-        print(hook_json(decision))
-    elif notices:
-        print("\n\n".join(notices))
+        payload = json.load(sys.stdin)
+        if isinstance(payload, dict):
+            text = handle(payload, cfg)  # pyright: ignore[reportUnknownArgumentType]
+            if text:
+                print(text)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("hook: %s: %s", type(exc).__name__, exc)
     return 0
 
 
@@ -499,17 +462,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true", help="then run claude --resume")
     p.set_defaults(func=cmd_fork)
 
-    p = sub.add_parser("notice", help="hook: print notices at session start")
-    p.add_argument("--transcript")
-    p.add_argument("--cwd")
-    p.add_argument("--source", help="the SessionStart source")
-    p.set_defaults(func=cmd_notice)
-
     p = sub.add_parser(
-        "check-resume", help="hook: check the first prompt after a resume"
+        "hook", help="harness hooks: read the hook's JSON on stdin and act on it"
     )
-    p.add_argument("--transcript")
-    p.set_defaults(func=cmd_check_resume)
+    p.set_defaults(func=cmd_hook)
     return parser
 
 
@@ -517,16 +473,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     func: Callable[[argparse.Namespace, Config], int] = args.func
+    # A hook must never fail the session, whatever the configuration.
+    quiet = args.quiet or args.command == "hook"
     try:
         cfg = config_mod.load()
-        _setup_logging(cfg, args.quiet)
+        _setup_logging(cfg, quiet)
         return func(args, cfg)
     except Exit as exc:
         if exc.message:
             print(f"hyperspace: {exc.message}", file=sys.stderr)
         return exc.code
     except (ConfigError, ApiError, httpx.HTTPError, OSError) as exc:
-        if args.quiet:
+        if quiet:
             log.warning("%s: %s", type(exc).__name__, exc)
             return 0
         print(f"hyperspace: {exc}", file=sys.stderr)

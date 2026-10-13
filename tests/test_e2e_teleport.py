@@ -388,7 +388,7 @@ def test_cli_entry_point_runs() -> None:
         text=True,
         check=True,
     )
-    for command in ("sync", "teleport", "restore", "fork", "notice", "check-resume"):
+    for command in ("sync", "teleport", "restore", "fork", "hook"):
         assert command in out.stdout
 
 

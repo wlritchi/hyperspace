@@ -5,13 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" notice",
-            "timeout": 10
-          },
-          {
-            "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" start",
-            "async": true
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
+            "timeout": 15
           }
         ]
       }
@@ -21,13 +16,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" check-resume",
-            "timeout": 10
-          },
-          {
-            "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
-            "async": true
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
+            "timeout": 15
           }
         ]
       }
@@ -37,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
             "async": true
           }
         ]
@@ -48,7 +38,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
             "async": true
           }
         ]
@@ -59,7 +60,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
             "async": true
           }
         ]
@@ -70,7 +71,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
             "async": true
           }
         ]
@@ -81,7 +82,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
             "async": true
           }
         ]
@@ -92,7 +93,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
             "async": true
           }
         ]
@@ -103,7 +104,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" end",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
             "async": true
           }
         ]

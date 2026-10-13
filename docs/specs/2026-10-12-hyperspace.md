@@ -551,14 +551,14 @@ conflict.
                                         └───────────────────┘
 ```
 
-The hyperspace repo holds three parts. The plugin is in wlr-cc-plugins.
+The hyperspace repo holds four parts.
 
 | Part     | Location                      | Form                                                                                               |
 | -------- | ----------------------------- | -------------------------------------------------------------------------------------------------- |
 | Server   | `server/hyperspace-server.py` | PEP 723 script with a lock, container image                                                        |
 | Protocol | `protocol/`                   | `hyperspace-protocol` package: `TypedDict` bodies, header names, limits. Tags `protocol-vX.Y.Z`    |
 | Client   | `client/`                     | `hyperspace-client` package: sync engine, adapters, and the `hyperspace` CLI. Tags `client-vX.Y.Z` |
-| Plugin   | `wlr-cc-plugins/hyperspace/`  | Hooks that call the CLI                                                                            |
+| Plugin   | `plugin/hyperspace/`          | Hooks that forward to `hyperspace hook`                                                            |
 
 The client is a package with a CLI, not code in the plugin, for these reasons:
 
@@ -569,7 +569,8 @@ The client is a package with a CLI, not code in the plugin, for these reasons:
 - The protocol, the client, and the server change together and are tested
   together.
 
-The plugin depends on a pinned `client-v*` tag through a uv git source.
+The plugin does not depend on a client version: it forwards each hook to the
+installed `hyperspace` CLI (see "Plugin").
 
 ## Server
 
@@ -813,25 +814,31 @@ The Claude Code adapter maps local paths to session file names like this:
 It skips `.orphaned-*`, `.superseded-*`, and `*.bak` files, and the legacy
 top-level `agent-*.jsonl` files.
 
-## Plugin (wlr-cc-plugins/hyperspace)
+## Plugin
 
-Each sync hook is a standard-library script that reads the hook input, writes
-the dirty mark, starts the detached checkpoint process, and exits. Hooks catch
-every exception, so a failure never affects the session. Errors go to
-`$XDG_STATE_HOME/hyperspace/log`.
+The plugin is in this repo (`plugin/hyperspace/`). A marketplace (for example
+wlr-cc-plugins) lists it with a `git-subdir` source; the entry's `ref` selects
+the version. `plugin.json` has no version, so Claude Code uses the commit, and
+a release never edits the plugin.
 
-| Event                   | Mode  | Action                                                                                                                                                                                                                                        |
-| ----------------------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SessionStart            | sync  | Print the teleport, move, or conflict notice, if any. Local state only.                                                                                                                                                                       |
-| SessionStart            | async | Checkpoint. On `source: resume`, get the session state from the server. Also run `sync --all` if the last sweep was more than one hour ago.                                                                                                   |
-| UserPromptSubmit        | sync  | At the first prompt after a resume: block the prompt if the session moved or is conflicted (see "Prevention"). Otherwise print a new conflict notice, if any. Network only when the saved state is older than the resume, with a 2 s timeout. |
-| UserPromptSubmit        | async | Checkpoint.                                                                                                                                                                                                                                   |
-| PreToolUse              | async | Checkpoint (records the tool call before a long tool runs).                                                                                                                                                                                   |
-| PostToolUse             | async | Checkpoint.                                                                                                                                                                                                                                   |
-| SubagentStop            | async | Checkpoint.                                                                                                                                                                                                                                   |
-| PreCompact, PostCompact | async | Checkpoint.                                                                                                                                                                                                                                   |
-| Stop                    | async | Checkpoint.                                                                                                                                                                                                                                   |
-| SessionEnd              | async | Checkpoint with no wait for the interval; `setsid` so that it outlives the session.                                                                                                                                                           |
+The plugin holds no logic. For every event it runs `hooks/forward.sh`, which
+runs `hyperspace hook` (or `$HYPERSPACE_CLI hook`) with the hook's JSON on
+stdin, or does nothing if the CLI is not installed. The client installs and
+upgrades separately (`uv tool install`, or the runner image). The only
+contract between the plugin and the client is `hyperspace hook` with the
+hook's JSON on stdin; the client ignores events that it does not know, so a
+newer or older plugin works with any client.
+
+`hyperspace hook` never fails and prints nothing on an error; errors go to
+`$XDG_STATE_HOME/hyperspace/log`. Checkpoints and sweeps run in a detached
+process, so the hook returns at once and the work outlives the session.
+
+| Event                                                                                    | Hook  | Action                                                                                                                                                                                                                                                   |
+| ---------------------------------------------------------------------------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| SessionStart                                                                             | sync  | Print the teleport, move, or conflict notice, if any (local state only). Start a checkpoint, and `sync --all` if the last sweep was more than one hour ago.                                                                                              |
+| UserPromptSubmit                                                                         | sync  | Start a checkpoint. At the first prompt after a resume: block the prompt if the session moved or is conflicted (see "Prevention"). Otherwise print a new notice, if any. Network only when the saved state is older than the resume, with a 2 s timeout. |
+| PreToolUse, PostToolUse, PostToolUseFailure, SubagentStop, PreCompact, PostCompact, Stop | async | Start a checkpoint. PreToolUse records the tool call before a long tool runs.                                                                                                                                                                            |
+| SessionEnd                                                                               | async | Start a checkpoint with no wait for the interval.                                                                                                                                                                                                        |
 
 The hooks use `transcript_path` from the hook input, so they follow a
 transcript that Claude Code moved.

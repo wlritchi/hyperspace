@@ -4,7 +4,6 @@ resume. See "The teleport notice" and "Prevention" in the spec.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from pathlib import Path
@@ -158,10 +157,6 @@ def _fully_synced(state: State, transcript: Path) -> bool:
         return transcript.stat().st_size == cursor.length
     except OSError:
         return False
-
-
-def hook_json(decision: dict[str, str] | None) -> str:
-    return json.dumps(decision) if decision else ""
 
 
 def refresh_states(ctx: Context, adapter: ClaudeCode) -> int:
