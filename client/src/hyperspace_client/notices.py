@@ -112,24 +112,52 @@ def check_resume(ctx: Context, session: LocalSession) -> dict[str, str] | None:
 
 
 def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None:
-    """Act on the lease state that the last sync saw. If another host holds
-    the lease and the session does not run here, move the local copy aside
-    (its bytes are on the server). If it runs here, add a notice."""
+    """Act on the lease state that the last sync saw.
+
+    A host that held the lease and lost it (another host now holds it)
+    moves its local copy aside, so that `claude --resume` does not find a
+    stale copy. It does so only if the session does not run here and every
+    local byte is on the server. In all other cases (a host that never held
+    the lease, a running session, a conflict, bytes not yet uploaded) it
+    only adds a notice: the client never moves a file that it cannot prove
+    is safe on the server.
+    """
     record = ctx.state.session(session.harness, session.session_id)
     problem = _problem(record, ctx.host)
     if problem is None:
         return
-    if record.state == "conflicted" or adapter.is_running(session.session_id):
+    movable = (
+        record.held_lease
+        and record.state != "conflicted"
+        and record.lease_state == "held"
+        and _fully_synced(ctx.state, session.transcript)
+        and not adapter.is_running(session.session_id)
+    )
+    if not movable:
         ctx.state.add_notice(session.harness, session.session_id, "lease", problem)
         return
-    if record.lease_state == "held" and Path(session.transcript).exists():
+    if Path(session.transcript).exists():
         moved = move_aside(session.transcript, ctx.state)
+        record.held_lease = False
+        record.transcript = None
+        ctx.state.save_session(record)
         log.info(
             "%s: %s holds the lease; moved the local copy aside to %s",
             session.session_id,
             record.lease_host,
             moved,
         )
+
+
+def _fully_synced(state: State, transcript: Path) -> bool:
+    """True if the server has every byte of the local transcript."""
+    cursor = state.cursor(transcript)
+    if cursor is None:
+        return False
+    try:
+        return transcript.stat().st_size == cursor.length
+    except OSError:
+        return False
 
 
 def hook_json(decision: dict[str, str] | None) -> str:

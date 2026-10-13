@@ -116,6 +116,9 @@ class SessionRecord:
     metadata: dict[str, Any] = field(default_factory=dict[str, Any])
     sent_metadata: dict[str, Any] = field(default_factory=dict[str, Any])
     last_placement: str | None = None
+    # True after the client saw this host hold the lease. Only a host
+    # that held the lease and lost it moves its local copy aside.
+    held_lease: bool = False
 
 
 class State:
@@ -137,6 +140,11 @@ class State:
                 self._db.execute(
                     f"ALTER TABLE cursors ADD COLUMN {column} INTEGER NOT NULL DEFAULT -1"
                 )
+        columns = {r[1] for r in self._db.execute("PRAGMA table_info(sessions)")}
+        if "held_lease" not in columns:
+            self._db.execute(
+                "ALTER TABLE sessions ADD COLUMN held_lease INTEGER NOT NULL DEFAULT 0"
+            )
         self._db.commit()
 
     def close(self) -> None:
@@ -260,6 +268,7 @@ class State:
             metadata=json.loads(row["metadata"]),
             sent_metadata=json.loads(row["sent_metadata"]),
             last_placement=row["last_placement"],
+            held_lease=bool(row["held_lease"]),
         )
 
     def save_session(self, record: SessionRecord) -> None:
@@ -271,8 +280,8 @@ class State:
                 INSERT OR REPLACE INTO sessions
                 (harness, session_id, workspace, transcript, lease_state,
                  lease_host, state, state_updated, metadata, sent_metadata,
-                 last_placement)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 last_placement, held_lease)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.harness,
@@ -286,6 +295,7 @@ class State:
                     json.dumps(record.metadata),
                     json.dumps(record.sent_metadata),
                     record.last_placement,
+                    int(record.held_lease),
                 ),
             )
 

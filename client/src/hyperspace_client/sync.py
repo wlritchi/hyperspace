@@ -415,7 +415,7 @@ class Syncer:
             record.sent_metadata = server_meta
         record.metadata = metadata
         if self.result.session is not None:
-            _note_session_state(record, self.result.session)
+            _note_session_state(record, self.result.session, self.ctx.host)
         state.save_session(record)
         return self.result
 
@@ -424,10 +424,14 @@ def _server_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in metadata.items() if not k.startswith("_")}
 
 
-def _note_session_state(record: SessionRecord, body: SessionStateBody) -> None:
+def _note_session_state(
+    record: SessionRecord, body: SessionStateBody, host: str
+) -> None:
     lease = body["lease"]
     record.lease_state = lease["state"]
     record.lease_host = lease.get("host")
+    if record.lease_state == "held" and record.lease_host == host:
+        record.held_lease = True
     record.state = body["state"]
     record.state_updated = time.time()
 

@@ -419,3 +419,44 @@ def test_local_paths_stay_in_their_directories(tmp_path: Path) -> None:
     assert fake.adapter.local_path(session_dir, "subagents/agent-1.jsonl") == (
         session_dir / "subagents" / "agent-1.jsonl"
     )
+
+
+def test_a_host_that_never_held_the_lease_never_moves_files(
+    laptop: Host, agent: Host
+) -> None:
+    """Two host identities can see the same transcript (a shared config
+    directory, or a copied file). Only the host that held the lease and lost
+    it may move its copy aside; any other host only gets a notice."""
+    t = start_session(laptop, LAPTOP_WS)
+    sid = t.stem
+    laptop.ctx.api.grant("claude-code", sid, "agent-1")
+    copy = agent.fake.transcript(AGENT_WS, sid)
+    copy.write_bytes(t.read_bytes())
+    sync(agent, copy, AGENT_WS)
+    assert agent.adapter.find_transcripts(sid) == [copy]
+    refresh_states(agent.ctx, agent.adapter)
+    assert agent.adapter.find_transcripts(sid) == [copy]
+    # Even with the lease state in its record, it only gets a notice.
+    record = agent.ctx.state.session("claude-code", sid)
+    record.lease_state, record.lease_host = "held", "laptop"
+    agent.ctx.state.save_session(record)
+    session = agent.adapter.session_for_transcript(copy)
+    assert session is not None
+    after_sync(agent.ctx, agent.adapter, session)
+    assert agent.adapter.find_transcripts(sid) == [copy]
+    notices = agent.ctx.state.take_notices("claude-code", sid)
+    assert notices and "laptop holds the lease" in notices[0]
+
+
+def test_unsynced_bytes_keep_the_file_in_place(laptop: Host, agent: Host) -> None:
+    t = start_session(laptop, LAPTOP_WS)
+    sid = t.stem
+    laptop.ctx.api.grant("claude-code", sid, "agent-1")
+    restore(agent.ctx, agent.adapter, sid, AGENT_WS, steal=True)
+    # A partial last line: it cannot go up yet, so the server lacks it.
+    with open(t, "a") as f:
+        f.write('{"type": "user", "message": {"content": "half')
+    refresh_states(laptop.ctx, laptop.adapter)
+    assert laptop.adapter.find_transcripts(sid) == [t]
+    notices = laptop.ctx.state.take_notices("claude-code", sid)
+    assert notices and "agent-1 holds the lease" in notices[0]

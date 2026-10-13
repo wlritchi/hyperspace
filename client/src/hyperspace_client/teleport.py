@@ -88,9 +88,11 @@ def _active(entry: LogManifest) -> GenerationInfo:
     return next(g for g in entry["generations"] if g["id"] == entry["active"])
 
 
-def _note_lease(record: SessionRecord, body: SessionStateBody) -> None:
+def _note_lease(record: SessionRecord, body: SessionStateBody, host: str) -> None:
     record.lease_state = body["lease"]["state"]
     record.lease_host = body["lease"].get("host")
+    # A surrender ends this host's hold; a restore starts it.
+    record.held_lease = record.lease_state == "held" and record.lease_host == host
     record.state = body["state"]
     record.state_updated = time.time()
 
@@ -124,7 +126,7 @@ def send(
         ctx.api.grant(harness, session_id, to_host)
     state = ctx.api.surrender(harness, session_id, to_host)
     moved = [move_aside(t, ctx.state) for t in local]
-    _note_lease(record, state)
+    _note_lease(record, state, ctx.host)
     ctx.state.save_session(record)
     where = f"on {to_host}" if to_host else "on the target host"
     lines = [f"Surrendered the lease of {session_id}."]
@@ -240,7 +242,7 @@ def restore(
     record = ctx.state.session(harness, session_id)
     record.workspace = workspace
     record.transcript = str(target)
-    _note_lease(record, response["session"])
+    _note_lease(record, response["session"], ctx.host)
     # Metadata for later syncs comes from the restored transcript.
     record.metadata = adapter.update_metadata({}, TRANSCRIPT, target.read_bytes())
     record.sent_metadata = {}
