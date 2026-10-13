@@ -38,3 +38,8 @@ uv run -qs tests/run.py                  # tests
 uvx ruff@0.17.0 format && uvx ruff@0.17.0 check
 bunx prettier@3.9.10 --write '**/*.md'   # Markdown
 ```
+
+## License
+
+Hyperspace is dedicated to the public domain under
+[CC0 1.0 Universal](LICENSE).

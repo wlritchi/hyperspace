@@ -10,3 +10,5 @@ appVersion: "0.0.0"
 home: https://github.com/wlritchi/hyperspace
 sources:
   - https://github.com/wlritchi/hyperspace
+annotations:
+  artifacthub.io/license: CC0-1.0
