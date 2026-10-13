@@ -30,6 +30,8 @@ from hyperspace_protocol import (
     Manifest,
     Placement,
     SessionStateBody,
+    validate_file_path,
+    validate_session_id,
 )
 
 SURRENDERED = ".hyperspace-surrendered-"
@@ -189,6 +191,8 @@ def restore(
 ) -> RestoreResult:
     harness = adapter.harness
     api = ctx.api
+    # The id names local files, and can come from the server.
+    validate_session_id(session_id)
     manifest = api.manifest(harness, session_id)
     if held_only:
         lease = manifest["state"]["lease"]
@@ -216,6 +220,11 @@ def restore(
     result = RestoreResult(session_id, workspace, target)
     session_dir = target.with_suffix("")
     for entry in manifest["files"]:
+        try:
+            validate_file_path(entry["path"])
+        except ValueError:
+            result.skipped.append(entry["path"])
+            continue
         path = adapter.local_path(session_dir, entry["path"])
         if path is None:
             result.skipped.append(entry["path"])
@@ -369,7 +378,7 @@ def fork(
         raise TeleportError(f"no generation {branch} in the transcript")
     length = generations[branch]["length"]
     event = ctx.api.fork(harness, session_id, branch, length)
-    new_id = event["session_id"]
+    new_id = validate_session_id(event["session_id"])
     data = _log_bytes(ctx.api, harness, session_id, branch, length)
     target = adapter.project_dir(workspace) / f"{new_id}.jsonl"
     _atomic_write(target, adapter.fork_records(data, session_id, new_id))

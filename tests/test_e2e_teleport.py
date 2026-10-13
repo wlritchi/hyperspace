@@ -390,3 +390,32 @@ def test_cli_entry_point_runs() -> None:
     )
     for command in ("sync", "teleport", "restore", "fork", "notice", "check-resume"):
         assert command in out.stdout
+
+
+def test_restore_refuses_traversal_session_ids(laptop: Host) -> None:
+    for bad in ("../../escape", "/abs", ".hidden", "a/b"):
+        with pytest.raises(ValueError):
+            restore(laptop.ctx, laptop.adapter, bad, LAPTOP_WS)
+
+
+def test_local_paths_stay_in_their_directories(tmp_path: Path) -> None:
+    fake = FakeClaude(tmp_path / "claude")
+    session_dir = (
+        fake.adapter.project_dir(LAPTOP_WS) / "11111111-1111-1111-1111-111111111111"
+    )
+    session_dir.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (session_dir / "tool-results").symlink_to(outside)
+    assert fake.adapter.local_path(session_dir, "tool-results/x.txt") is None
+    for bad in (
+        "../x",
+        "plans/..%2Fx",
+        "plans/a%2Fb",
+        "file-history/%2E%2E",
+        "other/x",
+    ):
+        assert fake.adapter.local_path(session_dir, bad) is None, bad
+    assert fake.adapter.local_path(session_dir, "subagents/agent-1.jsonl") == (
+        session_dir / "subagents" / "agent-1.jsonl"
+    )

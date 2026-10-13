@@ -142,6 +142,7 @@ def refresh_states(ctx: Context, adapter: ClaudeCode) -> int:
     bytes gets no session state, so the sweep calls this. Return the number
     of sessions whose saved state changed."""
     changed = 0
+    index = adapter.transcript_index()
     for summary in ctx.api.sessions(
         harness=adapter.harness, host=ctx.host, limit="1000"
     ):
@@ -151,10 +152,14 @@ def refresh_states(ctx: Context, adapter: ClaudeCode) -> int:
         new = (lease["state"], lease.get("host"), summary["state"]["state"])
         if new != (record.lease_state, record.lease_host, record.state):
             changed += 1
-        record.lease_state, record.lease_host, record.state = new
-        record.state_updated = time.time()
-        ctx.state.save_session(record)
-        for transcript in adapter.find_transcripts(sid):
+            record.lease_state, record.lease_host, record.state = new
+            record.state_updated = time.time()
+            ctx.state.save_session(record)
+        if _problem(record, ctx.host) is None:
+            continue
+        # Also for a state that did not change: a session that ran during an
+        # earlier refresh can be stopped now.
+        for transcript in index.get(sid, []):
             session = adapter.session_for_transcript(transcript)
             if session is not None:
                 after_sync(ctx, adapter, session)

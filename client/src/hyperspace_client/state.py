@@ -126,6 +126,10 @@ class State:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode = WAL")
         self._db.execute("PRAGMA busy_timeout = 30000")
+        # In WAL mode, NORMAL keeps the file consistent after a crash. A
+        # power loss can lose the last cursor saves; the next sync then
+        # adopts the server copy.
+        self._db.execute("PRAGMA synchronous = NORMAL")
         self._db.executescript(_SCHEMA)
         columns = {r[1] for r in self._db.execute("PRAGMA table_info(cursors)")}
         for column in ("size", "mtime_ns"):
@@ -259,6 +263,8 @@ class State:
         )
 
     def save_session(self, record: SessionRecord) -> None:
+        if record == self.session(record.harness, record.session_id):
+            return
         with self._db:
             self._db.execute(
                 """

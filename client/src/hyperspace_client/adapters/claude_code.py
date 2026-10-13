@@ -211,19 +211,29 @@ class ClaudeCode:
     def local_path(self, session_dir: Path, rel_path: str) -> Path | None:
         """The local path for a session file path, for a session whose
         transcript is `session_dir.with_suffix('.jsonl')`. None for a file
-        that this adapter does not restore."""
+        that this adapter does not restore.
+
+        The path comes from the server, so it is checked: no empty, `.`, or
+        `..` segments, no `/` in a decoded segment, and the result (after
+        symbolic links) must be inside the directory for its kind."""
         parts = [decode_segment(p) for p in rel_path.split("/")]
-        if any(p in ("", ".", "..") or "/" in p for p in parts):
+        if any(p in ("", ".", "..") or "/" in p or "\x00" in p for p in parts):
             return None
         if rel_path == TRANSCRIPT:
-            return session_dir.with_suffix(".jsonl")
-        if parts[0] in _SIDE_DIRS:
-            return session_dir.joinpath(*parts)
-        if parts[0] == "file-history" and len(parts) == 2:
-            return self.config_dir / "file-history" / session_dir.name / parts[1]
-        if parts[0] == "plans" and len(parts) == 2:
-            return self.config_dir / "plans" / parts[1]
-        return None
+            base, path = session_dir.parent, session_dir.with_suffix(".jsonl")
+        elif parts[0] in _SIDE_DIRS:
+            base, path = session_dir, session_dir.joinpath(*parts)
+        elif parts[0] == "file-history" and len(parts) == 2:
+            base = self.config_dir / "file-history" / session_dir.name
+            path = base / parts[1]
+        elif parts[0] == "plans" and len(parts) == 2:
+            base = self.config_dir / "plans"
+            path = base / parts[1]
+        else:
+            return None
+        if not path.resolve().is_relative_to(base.resolve()):
+            return None
+        return path
 
     # --- Content ---------------------------------------------------------------
 
@@ -302,15 +312,20 @@ class ClaudeCode:
 
     def find_transcripts(self, session_id: str) -> list[Path]:
         """Every resumable copy of a session on this host."""
-        projects = self.config_dir / "projects"
-        if not projects.is_dir():
-            return []
-        name = f"{session_id}.jsonl"
-        return sorted(
-            p / name
-            for p in projects.iterdir()
-            if p.is_dir() and (p / name).is_file() and (p / name).stat().st_size > 0
-        )
+        return self.transcript_index().get(session_id, [])
+
+    def transcript_index(self) -> dict[str, list[Path]]:
+        """Every resumable transcript on this host, by session id, from one
+        scan of the project directories."""
+        index: dict[str, list[Path]] = {}
+        for session in self.discover():
+            try:
+                if session.transcript.stat().st_size == 0:
+                    continue
+            except OSError:
+                continue
+            index.setdefault(session.session_id, []).append(session.transcript)
+        return index
 
     def is_running(self, session_id: str) -> bool:
         """True if a live Claude Code process on this host has the session.

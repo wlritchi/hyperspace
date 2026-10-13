@@ -34,7 +34,7 @@ jobs:
           uvx ruff@0.17.0 check
 
       - name: Pyright
-        run: uvx --with ./protocol --with ./client pyright@1.1.408 protocol/src client/src
+        run: uvx --with-editable ./protocol --with-editable ./client pyright@1.1.408 protocol/src client/src
 
       - name: Prettier
         run: npx --yes prettier@3.9.10 --check '**/*.md'

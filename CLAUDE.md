@@ -24,7 +24,7 @@ source of truth for the model, the protocol, and the security rules.
   3.12, so check with `UV_PYTHON=3.12` before a push.
 - Format and lint: `uvx ruff@0.17.0 format` and `uvx ruff@0.17.0 check`.
 - Types:
-  `uvx --with ./protocol --with ./client pyright@1.1.408 protocol/src client/src`.
+  `uvx --with-editable ./protocol --with-editable ./client pyright@1.1.408 protocol/src client/src`.
 - Markdown: `bunx prettier@3.9.10 --write '**/*.md'` (prose wraps at 78
   columns).
 - After you change a PEP 723 script's dependencies, run
