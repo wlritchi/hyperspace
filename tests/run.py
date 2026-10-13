@@ -14,7 +14,11 @@ loopback.
 # requires-python = ">=3.12"
 # dependencies = [
 #     "pytest>=8",
+#     "hyperspace-protocol",
 # ]
+#
+# [tool.uv.sources]
+# hyperspace-protocol = { path = "../protocol", editable = true }
 # ///
 
 import sys

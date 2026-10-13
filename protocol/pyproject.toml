@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hyperspace-protocol"
+description = "Wire types and validation for the Hyperspace HTTP API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+dynamic = ["version"]
+
+# The version comes from the latest protocol-v<version> tag. The server and
+# client tags are in the same repo, so describe must ignore them.
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+root = ".."
+tag_regex = "^protocol-v(?P<version>\\d+(?:\\.\\d+)*)$"
+git_describe_command = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--match",
+    "protocol-v*",
+]
+# Builds without git metadata, such as the server image.
+fallback_version = "0.0.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hyperspace_protocol"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
