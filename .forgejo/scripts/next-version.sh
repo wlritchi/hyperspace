@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Print the next version for a tag stream, from Conventional Commits.
 #
 #   next-version.sh <tag prefix> [path ...]

@@ -42,7 +42,7 @@ jobs:
           git config user.email "${RELEASE_EMAIL}"
           for PACKAGE in protocol client; do
             PREFIX="${PACKAGE}-v"
-            VERSION="$(bash .forgejo/scripts/next-version.sh "${PREFIX}" "${PACKAGE}/")"
+            VERSION="$(sh .forgejo/scripts/next-version.sh "${PREFIX}" "${PACKAGE}/")"
             if [ -z "${VERSION}" ]; then
               echo "${PACKAGE}: no changes."
               continue

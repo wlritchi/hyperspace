@@ -60,7 +60,7 @@ jobs:
               echo "[skip release] in the head commit; no release."
               exit 0
             fi
-            TAG="$(bash .forgejo/scripts/next-version.sh '')"
+            TAG="$(sh .forgejo/scripts/next-version.sh '')"
             if [ -z "${TAG}" ]; then
               echo "No commits since the last release."
               exit 0
