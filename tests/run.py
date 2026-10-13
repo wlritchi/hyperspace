@@ -14,6 +14,7 @@ loopback.
 # requires-python = ">=3.12"
 # dependencies = [
 #     "pytest>=8",
+#     "zstandard",
 #     "hyperspace-protocol",
 # ]
 #

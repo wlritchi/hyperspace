@@ -35,7 +35,7 @@ HostKind = Literal["workstation", "runner"]
 ReadScope = Literal["own", "granted", "all"]
 Scope = Literal["append", "read", "grant"]
 GenerationCause = Literal["root", "rewrite", "diverge", "fork"]
-PlacementCause = Literal["start", "teleport", "steal", "diverge"]
+PlacementCause = Literal["start", "move", "teleport", "steal", "diverge"]
 SessionState = Literal["normal", "conflicted"]
 LeaseState = Literal["held", "reserved", "free"]
 
