@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hyperspace-client"
+description = "Hyperspace client: transcript sync, teleport, and restore"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.27", "zstandard>=0.23", "hyperspace-protocol"]
+dynamic = ["version"]
+
+[project.scripts]
+hyperspace = "hyperspace_client.cli:main"
+
+[tool.uv.sources]
+hyperspace-protocol = { path = "../protocol", editable = true }
+
+# The version comes from the latest client-v<version> tag.
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+root = ".."
+tag_regex = "^client-v(?P<version>\\d+(?:\\.\\d+)*)$"
+git_describe_command = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--match",
+    "client-v*",
+]
+fallback_version = "0.0.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hyperspace_client"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"

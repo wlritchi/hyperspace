@@ -19,10 +19,12 @@ loopback.
 #     "httpx",
 #     "httpx2",
 #     "hyperspace-protocol",
+#     "hyperspace-client",
 # ]
 #
 # [tool.uv.sources]
 # hyperspace-protocol = { path = "../protocol", editable = true }
+# hyperspace-client = { path = "../client", editable = true }
 # ///
 
 import sys
