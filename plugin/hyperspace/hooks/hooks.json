@@ -1,0 +1,113 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" notice",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" start",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" check-resume",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" checkpoint",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run -qs \"${CLAUDE_PLUGIN_ROOT}/hooks/hyperspace-hook.py\" end",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

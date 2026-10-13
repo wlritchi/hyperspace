@@ -1,0 +1,8 @@
+{
+  "name": "hyperspace",
+  "description": "Back up Claude Code transcripts to a Hyperspace server as you work, and teleport sessions between hosts",
+  "version": "0.1.0",
+  "author": {
+    "name": "wlritchi"
+  }
+}
