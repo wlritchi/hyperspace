@@ -46,7 +46,6 @@ def put(
 ) -> int:
     info, _ = store.append(
         key,
-        PATH,
         gen,
         writer,
         base,
@@ -66,15 +65,15 @@ def test_append_and_read(store: Store) -> None:
     n = put(store, g, 0, b"one\n")
     n = put(store, g, n, b"two\n")
     assert n == 8
-    assert store.read_log(KEY, PATH, g, 0, None) == b"one\ntwo\n"
-    assert store.read_log(KEY, PATH, g, 2, 6) == b"e\ntw"
+    assert store.read_log(KEY, g, 0, None) == b"one\ntwo\n"
+    assert store.read_log(KEY, g, 2, 6) == b"e\ntw"
 
 
 def test_retry_is_idempotent(store: Store) -> None:
     g = root(store)
     put(store, g, 0, b"one\n")
     assert put(store, g, 0, b"one\n") == 4
-    assert store.read_log(KEY, PATH, g, 0, None) == b"one\n"
+    assert store.read_log(KEY, g, 0, None) == b"one\n"
 
 
 def test_wrong_base_length_is_a_conflict(store: Store) -> None:
@@ -90,7 +89,7 @@ def test_wrong_base_length_is_a_conflict(store: Store) -> None:
 def test_bad_digest(store: Store) -> None:
     g = root(store)
     with pytest.raises(StoreError) as err:
-        store.append(KEY, PATH, g, LAPTOP, 0, b"x", "0" * 64, 0)
+        store.append(KEY, g, LAPTOP, 0, b"x", "0" * 64, 0)
     assert err.value.code == "bad_digest"
 
 
@@ -100,9 +99,9 @@ def test_fork_reads_through_parent(store: Store) -> None:
     put(store, g, 4, b"bbbb")
     r = store.create_generation(KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=4)
     put(store, r["id"], 4, b"cccc")
-    assert store.read_log(KEY, PATH, r["id"], 0, None) == b"aaaacccc"
-    assert store.read_log(KEY, PATH, r["id"], 2, 6) == b"aacc"
-    assert store.read_log(KEY, PATH, g, 0, None) == b"aaaabbbb"
+    assert store.read_log(KEY, r["id"], 0, None) == b"aaaacccc"
+    assert store.read_log(KEY, r["id"], 2, 6) == b"aacc"
+    assert store.read_log(KEY, g, 0, None) == b"aaaabbbb"
 
 
 def test_fork_offset_must_be_in_range(store: Store) -> None:
@@ -132,7 +131,7 @@ def test_recovery_cuts_uncommitted_frames(tmp_path: Path) -> None:
     s = Store(data, clock=Clock())
     assert log.stat().st_size == size
     put(s, g, 4, b"two\n")
-    assert s.read_log(KEY, PATH, g, 0, None) == b"one\ntwo\n"
+    assert s.read_log(KEY, g, 0, None) == b"one\ntwo\n"
     s.close()
 
 

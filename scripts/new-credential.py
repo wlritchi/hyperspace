@@ -1,0 +1,115 @@
+#!/usr/bin/env -S uv run -qs
+# vim: filetype=python
+"""Create a credential for one host and print its token once.
+
+    scripts/new-credential.py --host laptop --scopes append,read,grant --read all
+    scripts/new-credential.py --host agent-1 --scopes append,read,grant --read granted
+
+Run it where the server's data directory is (inside the server container, for
+example with `kubectl exec`). The server reloads the accounts file when it
+changes. Only the sha256 of the secret is stored.
+"""
+
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+
+import argparse
+import os
+import sys
+import tempfile
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from accounts import (
+    READ_SCOPES,
+    SCOPES,
+    Account,
+    Accounts,
+    AccountsError,
+    Credential,
+    dump_accounts,
+    new_token,
+    parse_accounts,
+)
+
+
+def data_dir() -> Path:
+    if os.environ.get("HYPERSPACE_DATA_DIR"):
+        return Path(os.environ["HYPERSPACE_DATA_DIR"])
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
+    return Path(base) / "hyperspace"
+
+
+def write_accounts(path: Path, accounts: Accounts) -> None:
+    text = dump_accounts(accounts)
+    parse_accounts(text)  # Check that the server can read what we write.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".accounts-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def load_accounts(path: Path) -> Accounts:
+    if not path.exists():
+        return Accounts()
+    return parse_accounts(path.read_text())
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
+    parser.add_argument("--account", default="default")
+    parser.add_argument("--host", required=True, help="the host name it acts as")
+    parser.add_argument(
+        "--scopes", default="append,read,grant", help=f"from {','.join(SCOPES)}"
+    )
+    parser.add_argument("--read", default="own", choices=READ_SCOPES)
+    parser.add_argument("--expires", help="expiry, ISO 8601 (for example 2027-01-01)")
+    parser.add_argument("--label", default="")
+    parser.add_argument("--data-dir", type=Path, default=None)
+    args = parser.parse_args()
+
+    path = (args.data_dir or data_dir()) / "accounts.toml"
+    scopes = frozenset(s.strip() for s in args.scopes.split(",") if s.strip())
+    expires = None
+    if args.expires:
+        expires = datetime.fromisoformat(args.expires)
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=UTC)
+    token, credential_id, digest = new_token()
+    credential = Credential(
+        id=credential_id,
+        secret_sha256=digest,
+        host=args.host,
+        scopes=scopes,
+        read=args.read,
+        expires_at=expires,
+        label=args.label,
+    )
+    try:
+        accounts = load_accounts(path)
+        account = accounts.accounts.get(args.account, Account(id=args.account))
+        accounts.accounts[args.account] = replace(
+            account, credentials=(*account.credentials, credential)
+        )
+        write_accounts(path, accounts)
+    except AccountsError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"credential {credential_id} for host {args.host} in {path}", file=sys.stderr)
+    print(token)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

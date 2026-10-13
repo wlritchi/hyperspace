@@ -1,0 +1,21 @@
+[Unit]
+Description=Hyperspace transcript server
+After=default.target
+
+[Service]
+Type=simple
+# Edit the two paths below for your machine:
+#   1. the path to `uv`                 (run: command -v uv)
+#   2. the server script in your checkout of this repository
+ExecStart=%h/.local/bin/uv run -qs %h/hyperspace/server/hyperspace-server.py
+Restart=on-failure
+RestartSec=2
+
+# Optional settings (defaults shown). See "Configuration" in the spec.
+# Environment=HYPERSPACE_LISTEN_HOST=127.0.0.1
+# Environment=HYPERSPACE_PORT=8139
+# Environment=HYPERSPACE_DATA_DIR=%h/.local/share/hyperspace
+# Environment=HYPERSPACE_TRUSTED_PROXIES=
+
+[Install]
+WantedBy=default.target

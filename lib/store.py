@@ -464,15 +464,22 @@ class Store:
         ).fetchall()
         return [_gen_from_row(r) for r in rows]
 
-    def _gen_in_session(self, key: SessionKey, path: str, generation: str) -> _Gen:
+    def _gen_in_session(self, key: SessionKey, generation: str) -> _Gen:
         session = self._require_session(key)
-        file = self._file_row(session["id"], path)
-        if file is None or file["kind"] != "log":
-            raise NotFound("file")
         gen = self._gen(generation)
-        if gen.file != file["id"]:
+        owner = self._db.execute(
+            "SELECT session FROM files WHERE id = ?", (gen.file,)
+        ).fetchone()
+        if owner is None or owner["session"] != session["id"]:
             raise NotFound("generation")
         return gen
+
+    def generation_path(self, key: SessionKey, generation: str) -> str:
+        gen = self._gen_in_session(key, generation)
+        row = self._db.execute(
+            "SELECT path FROM files WHERE id = ?", (gen.file,)
+        ).fetchone()
+        return str(row["path"])
 
     def create_generation(
         self,
@@ -546,7 +553,6 @@ class Store:
     def append(
         self,
         key: SessionKey,
-        path: str,
         generation: str,
         writer: Writer,
         base_length: int,
@@ -566,7 +572,7 @@ class Store:
         if not data:
             raise StoreError("bad_request", "empty append")
         with self._tx():
-            gen = self._gen_in_session(key, path, generation)
+            gen = self._gen_in_session(key, generation)
             session = self._require_session(key)
             if base_length != gen.length:
                 retry = self._db.execute(
@@ -617,11 +623,11 @@ class Store:
 
     @_locked
     def read_log(
-        self, key: SessionKey, path: str, generation: str, start: int, end: int | None
+        self, key: SessionKey, generation: str, start: int, end: int | None
     ) -> bytes:
         """Return bytes [start, end) of a generation, including the prefix
         that it inherits from its parents."""
-        gen = self._gen_in_session(key, path, generation)
+        gen = self._gen_in_session(key, generation)
         if end is None or end > gen.length:
             end = gen.length
         if start < 0 or start > end:
@@ -1120,7 +1126,10 @@ class Store:
     def _can_read_row(self, session: sqlite3.Row, host: str, scope: ReadScope) -> bool:
         if scope == "all":
             return True
-        if session["lease_host"] == host:
+        # Only a held lease gives read access. A lease reserved for a host
+        # does not: a surrender needs only the append scope, so a reserve
+        # must not work as a grant.
+        if session["lease_state"] == "held" and session["lease_host"] == host:
             return True
         placed = self._db.execute(
             "SELECT 1 FROM placements WHERE session = ? AND host = ? LIMIT 1",
@@ -1272,6 +1281,34 @@ class Store:
             if len(out) >= limit:
                 break
         return out
+
+    @_locked
+    def list_workspaces(
+        self, account: str, host: str, scope: ReadScope
+    ) -> list[dict[str, str | int]]:
+        """Workspaces of the sessions that `host` can read."""
+        readable = [
+            row["id"]
+            for row in self._db.execute(
+                "SELECT * FROM sessions WHERE account = ?", (account,)
+            ).fetchall()
+            if self._can_read_row(row, host, scope)
+        ]
+        found: dict[tuple[str, str], dict[str, str | int]] = {}
+        for session in readable:
+            for p in self._placements(session):
+                entry = found.setdefault(
+                    (p["host"], p["workspace"]),
+                    {
+                        "host": p["host"],
+                        "workspace": p["workspace"],
+                        "last_seen": p["last_seen"],
+                        "sessions": 0,
+                    },
+                )
+                entry["sessions"] = int(entry["sessions"]) + 1
+                entry["last_seen"] = max(str(entry["last_seen"]), p["last_seen"])
+        return sorted(found.values(), key=lambda e: str(e["last_seen"]), reverse=True)
 
     @staticmethod
     def _gen_info(gen: _Gen) -> GenerationInfo:
