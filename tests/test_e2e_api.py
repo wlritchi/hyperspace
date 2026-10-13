@@ -151,7 +151,7 @@ def test_limiter_tables_are_bounded() -> None:
     for i in range(1000):
         limiter.failed_auth(f"10.0.{i // 256}.{i % 256}")
         limiter.succeeded(f"10.0.{i // 256}.{i % 256}", "abcdefghijkl")
-    assert len(limiter._failures) == 100
+    assert len(limiter._failures) <= 100
     assert len(limiter._known) == 100
 
 
@@ -165,8 +165,25 @@ def test_blocked_entries_survive_a_flood() -> None:
     assert not limiter.may_check("192.0.2.1", None)
     for i in range(500):
         limiter.failed_auth(f"10.1.{i // 256}.{i % 256}")
-    assert len(limiter._failures) == 50
+    assert len(limiter._failures) <= 50
     assert not limiter.may_check("192.0.2.1", None)
+
+
+def test_global_limit_stops_many_addresses() -> None:
+    limiter = _Limiter(
+        Settings(
+            data_dir=Path("/nonexistent"),
+            failed_auth_per_minute=30,
+            global_failed_auth_per_minute=20,
+        )
+    )
+    limiter.succeeded("198.51.100.7", "knownknownkn")
+    for i in range(20):
+        limiter.failed_auth(f"10.2.0.{i}")
+    # No single address is over its limit, but the total is.
+    assert not limiter.may_check("203.0.113.9", "unknownunkno")
+    assert not limiter.may_check("203.0.113.9", None)
+    assert limiter.may_check("198.51.100.7", "knownknownkn")
 
 
 def test_ipv6_addresses_count_by_prefix() -> None:

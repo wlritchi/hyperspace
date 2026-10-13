@@ -646,10 +646,24 @@ run inside the server container, so they need shell access to the pod
 
 ### Configuration
 
-`HYPERSPACE_DATA_DIR` (default `$XDG_DATA_HOME/hyperspace`),
-`HYPERSPACE_LISTEN_HOST` (default `127.0.0.1`), `HYPERSPACE_PORT` (default
-`8139`), `HYPERSPACE_MAX_BODY`, `HYPERSPACE_TRUSTED_PROXIES` (the proxies
-whose `X-Forwarded-For` the server trusts, for rate limits and the audit log).
+| Variable                                   | Default                      |
+| ------------------------------------------ | ---------------------------- |
+| `HYPERSPACE_DATA_DIR`                      | `$XDG_DATA_HOME/hyperspace`  |
+| `HYPERSPACE_LISTEN_HOST`                   | `127.0.0.1`                  |
+| `HYPERSPACE_PORT`                          | `8139`                       |
+| `HYPERSPACE_MAX_BODY`                      | 8 MiB (also the maximum)     |
+| `HYPERSPACE_TRUSTED_PROXIES`               | none (comma-separated CIDRs) |
+| `HYPERSPACE_RATE_PER_MINUTE`               | 1200 requests per credential |
+| `HYPERSPACE_BYTES_PER_DAY`                 | 4 GiB per credential         |
+| `HYPERSPACE_FAILED_AUTH_PER_MINUTE`        | 30 per address (IPv6: /64)   |
+| `HYPERSPACE_GLOBAL_FAILED_AUTH_PER_MINUTE` | 1000 from all addresses      |
+
+`HYPERSPACE_TRUSTED_PROXIES` lists the proxies whose `X-Forwarded-For` the
+server trusts. Behind a proxy that is not in the list, all clients have the
+proxy's address, so they share one failed-auth limit; the server logs a
+warning when it sees this. Over a failed-auth limit, the server checks only
+credentials that authenticated from that address in the last day. The limits
+are in memory and reset when the server restarts.
 
 ## Security
 

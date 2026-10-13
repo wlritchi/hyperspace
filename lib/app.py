@@ -80,6 +80,7 @@ class Settings:
     requests_per_minute: int = 1200
     bytes_per_day: int = 4 * 1024**3
     failed_auth_per_minute: int = 30
+    global_failed_auth_per_minute: int = 1000
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -103,6 +104,9 @@ class Settings:
             bytes_per_day=int(env.get("HYPERSPACE_BYTES_PER_DAY", str(4 * 1024**3))),
             failed_auth_per_minute=int(
                 env.get("HYPERSPACE_FAILED_AUTH_PER_MINUTE", "30")
+            ),
+            global_failed_auth_per_minute=int(
+                env.get("HYPERSPACE_GLOBAL_FAILED_AUTH_PER_MINUTE", "1000")
             ),
         )
 
@@ -136,6 +140,9 @@ class _Limiter:
     _known: OrderedDict[tuple[str, str], float] = field(
         default_factory=OrderedDict[tuple[str, str], float]
     )
+    # Failed authentications from all addresses in the last minute. Its
+    # length is at most the global limit.
+    _global: deque[float] = field(default_factory=deque[float])
     _bytes: dict[tuple[str, str], int] = field(
         default_factory=dict[tuple[str, str], int]
     )
@@ -175,20 +182,25 @@ class _Limiter:
             self._failures[key] = window
             if len(self._failures) > self.max_entries:
                 self._evict(now)
+            self._trim(self._global, now)
+            if len(self._global) < self.settings.global_failed_auth_per_minute:
+                self._global.append(now)
 
     def _evict(self, now: float) -> None:
-        """Make room in the failure table. Drop entries that are not blocked
-        first, oldest first, so that new addresses cannot push a blocked
-        address out of the table."""
+        """Cut the failure table to 90% of its size, in one pass. Drop
+        entries that are not blocked first, oldest first. The cut is larger
+        than one entry, so the pass runs at most once for each tenth of the
+        table. The global limit applies whatever this table holds."""
+        target = self.max_entries * 9 // 10
         limit = self.settings.failed_auth_per_minute
         for key in list(self._failures):
-            if len(self._failures) <= self.max_entries:
+            if len(self._failures) <= target:
                 return
             window = self._failures[key]
             self._trim(window, now)
             if len(window) < limit:
                 del self._failures[key]
-        while len(self._failures) > self.max_entries:
+        while len(self._failures) > target:
             self._failures.popitem(last=False)
 
     def succeeded(self, client: str, credential: str) -> None:
@@ -201,21 +213,33 @@ class _Limiter:
 
     def may_check(self, client: str, credential: str | None) -> bool:
         """False if the server must refuse this request without checking
-        its token."""
+        its token.
+
+        Unknown credentials are refused from an address over its limit, and
+        from all addresses while the global limit is reached. A credential
+        that authenticated from this address in the last day is always
+        checked.
+        """
         key = self.address_key(client)
+        now = time.monotonic()
         with self._lock:
             window = self._failures.get(key)
             if window is not None:
-                self._trim(window, time.monotonic())
+                self._trim(window, now)
                 if not window:
                     del self._failures[key]
                     window = None
-            if window is None or len(window) < self.settings.failed_auth_per_minute:
+            self._trim(self._global, now)
+            blocked = (
+                window is not None
+                and len(window) >= self.settings.failed_auth_per_minute
+            ) or len(self._global) >= self.settings.global_failed_auth_per_minute
+            if not blocked:
                 return True
             if credential is None:
                 return False
             seen = self._known.get((key, credential))
-            return seen is not None and time.monotonic() - seen < 86_400
+            return seen is not None and now - seen < 86_400
 
     def add_bytes(self, credential: str, count: int) -> bool:
         day = datetime.now(UTC).strftime("%Y-%m-%d")
