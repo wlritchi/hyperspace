@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: docker
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          git init .
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
+          git config --local http.extraheader "Authorization: Basic ${AUTH}"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout FETCH_HEAD
+
+      - name: Install uv
+        run: |
+          set -eu
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Ruff
+        run: |
+          set -eu
+          uvx ruff@0.17.0 format --check
+          uvx ruff@0.17.0 check
+
+      - name: Prettier
+        run: npx --yes prettier@3.9.10 --check '**/*.md'
+
+      - name: Pytest
+        env:
+          UV_PYTHON: "3.12"
+        run: uv run -qs tests/run.py

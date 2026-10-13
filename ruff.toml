@@ -1,0 +1,10 @@
+target-version = "py312"
+line-length = 88
+# The server and the scripts put lib/ on sys.path at run time. List the source
+# roots here so that isort sorts those modules as first-party.
+src = ["lib", "server", "scripts", "tests", "protocol/src", "client/src"]
+# Markdown holds prose, not code to format.
+extend-exclude = ["*.md"]
+
+[lint]
+extend-select = ["I", "UP", "B"]
