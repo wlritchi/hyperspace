@@ -291,8 +291,12 @@ class Store:
         self._db.execute("PRAGMA journal_mode = WAL")
         self._db.execute("PRAGMA foreign_keys = ON")
         self._db.execute("PRAGMA synchronous = FULL")
+        # The admin scripts open the same index while the server runs.
+        self._db.execute("PRAGMA busy_timeout = 10000")
         self._migrate()
-        self.recover()
+        # Recovery (see `recover`) is not done here: only the server calls it,
+        # at startup. An admin script that runs beside the server must not cut
+        # a frame that the server is writing.
 
     # --- Infrastructure -------------------------------------------------
 
@@ -1166,6 +1170,156 @@ class Store:
                 "VALUES (?, ?, ?, ?, ?)",
                 (self.now(), key.account, host, session["id"], what),
             )
+
+    # --- Purge (admin) -----------------------------------------------------
+
+    def _descendants(self, generation: str) -> list[str]:
+        """`generation` and every generation forked from it, children first."""
+        order: list[str] = []
+        stack = [generation]
+        while stack:
+            current = stack.pop()
+            order.append(current)
+            stack.extend(
+                r["id"]
+                for r in self._db.execute(
+                    "SELECT id FROM generations WHERE parent = ?", (current,)
+                ).fetchall()
+            )
+        order.reverse()
+        return order
+
+    def _drop_generations(self, ids: list[str]) -> int:
+        """Delete index rows of generations, children first. Return the
+        number of segments removed."""
+        segments = 0
+        for gid in ids:
+            segments += self._db.execute(
+                "DELETE FROM segments WHERE generation = ?", (gid,)
+            ).rowcount
+            self._db.execute("DELETE FROM generations WHERE id = ?", (gid,))
+        return segments
+
+    def _unreferenced(self, digests: set[str]) -> list[str]:
+        return [
+            d
+            for d in digests
+            if self._db.execute(
+                "SELECT 1 FROM blob_versions WHERE sha256 = ? LIMIT 1", (d,)
+            ).fetchone()
+            is None
+        ]
+
+    def _record_purge(self, target: str, reason: str) -> None:
+        self._db.execute(
+            "INSERT INTO purges (ts, target, reason) VALUES (?, ?, ?)",
+            (self.now(), target, reason),
+        )
+
+    def _remove_files(self, generations: list[str], digests: list[str]) -> None:
+        # After the commit: the index no longer refers to these files, so a
+        # reader that gets here finds no row first.
+        for gid in generations:
+            self._framelog(gid).path.unlink(missing_ok=True)
+        for digest in digests:
+            self.objects.remove(digest)
+
+    def purge_session(self, key: SessionKey, reason: str) -> dict[str, int]:
+        """Remove a session and all its data. Its id is free again: a host
+        that still has the session and syncs it starts a new copy."""
+        with self._tx():
+            session = self._require_session(key)
+            sid = session["id"]
+            files = self._db.execute(
+                "SELECT id FROM files WHERE session = ?", (sid,)
+            ).fetchall()
+            generations: list[str] = []
+            for f in files:
+                roots = [g.id for g in self._gens_of_file(f["id"]) if g.parent is None]
+                for root in roots:
+                    generations.extend(self._descendants(root))
+            segments = self._drop_generations(generations)
+            digests = {
+                r["sha256"]
+                for r in self._db.execute(
+                    "SELECT v.sha256 FROM blob_versions v JOIN files f ON f.id = v.file "
+                    "WHERE f.session = ?",
+                    (sid,),
+                ).fetchall()
+            }
+            versions = 0
+            for f in files:
+                versions += self._db.execute(
+                    "DELETE FROM blob_versions WHERE file = ?", (f["id"],)
+                ).rowcount
+            for table in ("metadata_events", "placements", "teleports", "grants"):
+                self._db.execute(f"DELETE FROM {table} WHERE session = ?", (sid,))
+            self._db.execute("DELETE FROM files WHERE session = ?", (sid,))
+            self._db.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+            orphans = self._unreferenced(digests)
+            self._record_purge(
+                f"session {key.account}/{key.harness}/{key.session_id}", reason
+            )
+        self._remove_files(generations, orphans)
+        return {
+            "generations": len(generations),
+            "segments": segments,
+            "blob_versions": versions,
+            "objects": len(orphans),
+        }
+
+    def purge_generation(
+        self, key: SessionKey, generation: str, reason: str
+    ) -> dict[str, int]:
+        """Remove a generation and every generation forked from it (they
+        inherit its bytes)."""
+        with self._tx():
+            gen = self._gen_in_session(key, generation)
+            generations = self._descendants(generation)
+            segments = self._drop_generations(generations)
+            left = self._db.execute(
+                "SELECT COUNT(*) FROM generations WHERE file = ?", (gen.file,)
+            ).fetchone()[0]
+            if left == 0:
+                self._db.execute("DELETE FROM files WHERE id = ?", (gen.file,))
+            self._record_purge(
+                f"generation {key.account}/{key.harness}/{key.session_id}/"
+                f"{generation} (+{len(generations) - 1} forked)",
+                reason,
+            )
+        self._remove_files(generations, [])
+        return {"generations": len(generations), "segments": segments}
+
+    def purge_blob_version(
+        self, key: SessionKey, path: str, version: int, reason: str
+    ) -> dict[str, int]:
+        with self._tx():
+            session = self._require_session(key)
+            file = self._file_row(session["id"], path)
+            if file is None or file["kind"] != "blob":
+                raise NotFound("file")
+            row = self._db.execute(
+                "SELECT sha256 FROM blob_versions WHERE file = ? AND version = ?",
+                (file["id"], version),
+            ).fetchone()
+            if row is None:
+                raise NotFound("version")
+            self._db.execute(
+                "DELETE FROM blob_versions WHERE file = ? AND version = ?",
+                (file["id"], version),
+            )
+            left = self._db.execute(
+                "SELECT COUNT(*) FROM blob_versions WHERE file = ?", (file["id"],)
+            ).fetchone()[0]
+            if left == 0:
+                self._db.execute("DELETE FROM files WHERE id = ?", (file["id"],))
+            orphans = self._unreferenced({row["sha256"]})
+            self._record_purge(
+                f"blob {key.account}/{key.harness}/{key.session_id}/{path}@{version}",
+                reason,
+            )
+        self._remove_files([], orphans)
+        return {"blob_versions": 1, "objects": len(orphans)}
 
     # --- Manifest and lists ---------------------------------------------
 

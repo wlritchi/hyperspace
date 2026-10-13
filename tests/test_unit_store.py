@@ -129,6 +129,7 @@ def test_recovery_cuts_uncommitted_frames(tmp_path: Path) -> None:
     with open(log, "ab") as f:
         f.write(b"garbage from a write that did not commit")
     s = Store(data, clock=Clock())
+    assert s.recover() == [g]
     assert log.stat().st_size == size
     put(s, g, 4, b"two\n")
     assert s.read_log(KEY, g, 0, None) == b"one\ntwo\n"
@@ -328,3 +329,52 @@ def test_list_sessions_filters(store: Store) -> None:
     assert [s["session_id"] for s in store.list_sessions("acct", "laptop", "own")] == [
         "s1"
     ]
+
+
+def test_purge_session(store: Store) -> None:
+    g = root(store)
+    put(store, g, 0, b"secret\n")
+    sha = hashlib.sha256(b"plan").hexdigest()
+    store.put_blob(KEY, "plans/p.md", LAPTOP, b"plan", sha)
+    store.add_metadata(KEY, LAPTOP, {"title": "has a secret"})
+    result = store.purge_session(KEY, "leaked token")
+    assert result["generations"] == 1 and result["objects"] == 1
+    assert not store.session_exists(KEY)
+    assert not (store.logs_dir / f"{g}.zst").exists()
+    assert not store.objects.has(sha)
+    # The id is free again.
+    g2 = root(store)
+    put(store, g2, 0, b"clean\n")
+    assert store.read_log(KEY, g2, 0, None) == b"clean\n"
+    rows = store._db.execute("SELECT target, reason FROM purges").fetchall()
+    assert [tuple(r) for r in rows] == [("session acct/claude-code/s1", "leaked token")]
+
+
+def test_purge_generation_takes_its_forks(store: Store) -> None:
+    g = root(store)
+    put(store, g, 0, b"aaaa")
+    put(store, g, 4, b"bbbb")
+    r = store.create_generation(KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=4)
+    put(store, r["id"], 4, b"cccc")
+    other = store.create_generation(KEY, "subagents/a.jsonl", LAPTOP, "root")
+    info, _ = store.append(
+        KEY, other["id"], LAPTOP, 0, b"x\n", hashlib.sha256(b"x\n").hexdigest(), 0
+    )
+    assert info["length"] == 2
+    result = store.purge_generation(KEY, g, "secret in the root")
+    assert result["generations"] == 2
+    assert [f["path"] for f in store.manifest(KEY)["files"]] == ["subagents/a.jsonl"]
+    with pytest.raises(StoreError):
+        store.read_log(KEY, r["id"], 0, None)
+
+
+def test_purge_blob_version_keeps_shared_objects(store: Store) -> None:
+    sha = hashlib.sha256(b"same").hexdigest()
+    store.put_blob(KEY, "tool-results/a.txt", LAPTOP, b"same", sha)
+    store.put_blob(KEY, "tool-results/b.txt", LAPTOP, b"same", sha)
+    result = store.purge_blob_version(KEY, "tool-results/a.txt", 1, "test")
+    assert result["objects"] == 0
+    assert store.objects.has(sha)
+    assert store.read_blob(KEY, "tool-results/b.txt", None) == b"same"
+    store.purge_blob_version(KEY, "tool-results/b.txt", 1, "test")
+    assert not store.objects.has(sha)
