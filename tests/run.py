@@ -16,6 +16,7 @@ loopback.
 #     "pytest>=8",
 #     "zstandard",
 #     "starlette>=0.47",
+#     "httpx",
 #     "httpx2",
 #     "hyperspace-protocol",
 # ]

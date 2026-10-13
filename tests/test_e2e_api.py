@@ -19,7 +19,7 @@ from accounts import (
     dump_accounts,
     new_token,
 )
-from app import Settings, create_app
+from app import Settings, _Limiter, create_app
 from store import Store
 
 SID = "20e924a9-68b5-48d3-b1a4-15aa285980fd"
@@ -136,8 +136,18 @@ def test_failed_auth_is_rate_limited(env: Env) -> None:
     codes = [env.client.get("/v1/whoami", headers=bad).status_code for _ in range(7)]
     assert codes[:5] == [401] * 5
     assert codes[-1] == 429
-    # A valid credential from the same address is blocked too, for a minute.
-    assert env.client.get("/v1/whoami", headers=env.h("laptop")).status_code == 429
+    # A valid credential from the same address still works: failures from a
+    # shared address must not lock out valid clients.
+    assert env.client.get("/v1/whoami", headers=env.h("laptop")).status_code == 200
+
+
+def test_failure_table_is_bounded() -> None:
+
+    limiter = _Limiter(Settings(data_dir=Path("/nonexistent")), max_clients=100)
+    for i in range(1000):
+        limiter.failed_auth(f"10.0.{i // 256}.{i % 256}")
+    assert len(limiter._failures) == 100
+    assert not limiter.auth_blocked("10.0.0.0")  # evicted
 
 
 def test_missing_scope(env: Env) -> None:
