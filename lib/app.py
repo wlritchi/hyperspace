@@ -173,8 +173,23 @@ class _Limiter:
             self._trim(window, now)
             window.append(now)
             self._failures[key] = window
-            while len(self._failures) > self.max_entries:
-                self._failures.popitem(last=False)
+            if len(self._failures) > self.max_entries:
+                self._evict(now)
+
+    def _evict(self, now: float) -> None:
+        """Make room in the failure table. Drop entries that are not blocked
+        first, oldest first, so that new addresses cannot push a blocked
+        address out of the table."""
+        limit = self.settings.failed_auth_per_minute
+        for key in list(self._failures):
+            if len(self._failures) <= self.max_entries:
+                return
+            window = self._failures[key]
+            self._trim(window, now)
+            if len(window) < limit:
+                del self._failures[key]
+        while len(self._failures) > self.max_entries:
+            self._failures.popitem(last=False)
 
     def succeeded(self, client: str, credential: str) -> None:
         key = (self.address_key(client), credential)
@@ -214,6 +229,33 @@ class _Limiter:
             return True
 
 
+_warned_peers: set[str] = set()
+
+
+def _is_trusted(
+    address: str, trusted: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
+) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(ip in net for net in trusted)
+
+
+def _warn_untrusted_forwarding(peer: str) -> None:
+    """Log once for each peer that sends X-Forwarded-For but is not a
+    trusted proxy. Behind such a proxy, every client has the proxy's
+    address, so the failed-auth limit applies to all clients together."""
+    if peer in _warned_peers or len(_warned_peers) > 100:
+        return
+    _warned_peers.add(peer)
+    log.warning(
+        "%s sends X-Forwarded-For but is not in HYPERSPACE_TRUSTED_PROXIES; "
+        "all clients behind it share one address for rate limits",
+        peer,
+    )
+
+
 def client_address(
     request: Request,
     trusted: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
@@ -225,6 +267,8 @@ def client_address(
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         chain = [a.strip() for a in forwarded.split(",") if a.strip()] + [peer]
+        if not _is_trusted(peer, trusted):
+            _warn_untrusted_forwarding(peer)
     for address in reversed(chain):
         try:
             ip = ipaddress.ip_address(address)

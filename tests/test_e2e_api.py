@@ -155,6 +155,20 @@ def test_limiter_tables_are_bounded() -> None:
     assert len(limiter._known) == 100
 
 
+def test_blocked_entries_survive_a_flood() -> None:
+    limiter = _Limiter(
+        Settings(data_dir=Path("/nonexistent"), failed_auth_per_minute=3),
+        max_entries=50,
+    )
+    for _ in range(3):
+        limiter.failed_auth("192.0.2.1")
+    assert not limiter.may_check("192.0.2.1", None)
+    for i in range(500):
+        limiter.failed_auth(f"10.1.{i // 256}.{i % 256}")
+    assert len(limiter._failures) == 50
+    assert not limiter.may_check("192.0.2.1", None)
+
+
 def test_ipv6_addresses_count_by_prefix() -> None:
     limiter = _Limiter(
         Settings(data_dir=Path("/nonexistent"), failed_auth_per_minute=3)
