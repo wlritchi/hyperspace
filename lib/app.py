@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import zstandard
 from starlette.applications import Starlette
@@ -301,6 +302,20 @@ def client_address(
         if not any(ip in net for net in trusted):
             return address
     return chain[0]
+
+
+def blob_path(request: Request) -> str:
+    """The session file path of a blob route, decoded once from the raw
+    request path. Some ASGI layers decode `scope["path"]` more than once,
+    which would turn an encoded `%20` in a file name into a space."""
+    raw = request.scope.get("raw_path")
+    if isinstance(raw, bytes):
+        text = raw.decode("latin-1").split("?", 1)[0]
+        marker = "/blobs/"
+        index = text.find(marker)
+        if index >= 0:
+            return unquote(text[index + len(marker) :])
+    return str(request.path_params["path"])
 
 
 Handler = Callable[[Request, Principal], Awaitable[Response]]
@@ -666,7 +681,7 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
     async def put_blob(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
         await require_writable(key, principal)
-        path = validate_file_path(request.path_params["path"])
+        path = validate_file_path(blob_path(request))
         sha256 = validate_sha256(request.headers.get(HEADER_SHA256, ""))
         w = writer(request, principal)
         data = await read_data(request)
@@ -679,7 +694,7 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
     async def get_blob(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
         await require_readable(key, principal)
-        path = validate_file_path(request.path_params["path"])
+        path = validate_file_path(blob_path(request))
         version = int_param(request, "version", None)
         data = await run_in_threadpool(store.read_blob, key, path, version)
         await run_in_threadpool(store.audit_read, key, principal.host, f"blob:{path}")

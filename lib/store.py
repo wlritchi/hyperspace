@@ -616,7 +616,7 @@ class Store:
             )
             self._note_placement(session["id"], writer, gen.cause == "diverge")
             self._acquire_new_lease(session["id"], writer)
-            self._update_conflict(session["id"])
+            self._update_conflict(session["id"], gen.file)
             gen = self._gen(generation)
             state = self._session_state(session["id"])
         return self._gen_info(gen), state
@@ -1027,24 +1027,28 @@ class Store:
         ]
         return active, branches, conflicted
 
-    def _update_conflict(self, session: int) -> None:
+    def _update_conflict(self, session: int, file: int) -> None:
+        """Mark the session conflicted if the log `file` now has two branches
+        with meaningful activity. An append changes only its own file, and a
+        file with one generation has one branch, so most appends skip the
+        branch computation."""
         row = self._db.execute(
             "SELECT state FROM sessions WHERE id = ?", (session,)
         ).fetchone()
         if row["state"] == "conflicted":
             return
-        files = self._db.execute(
-            "SELECT id FROM files WHERE session = ? AND kind = 'log'", (session,)
-        ).fetchall()
-        for f in files:
-            _, _, conflicted = self._file_branches(f["id"])
-            if conflicted:
-                self._db.execute(
-                    "UPDATE sessions SET state = 'conflicted', conflicted_at = ? "
-                    "WHERE id = ?",
-                    (self.now(), session),
-                )
-                return
+        count = self._db.execute(
+            "SELECT COUNT(*) FROM generations WHERE file = ?", (file,)
+        ).fetchone()[0]
+        if count < 2:
+            return
+        _, _, conflicted = self._file_branches(file)
+        if conflicted:
+            self._db.execute(
+                "UPDATE sessions SET state = 'conflicted', conflicted_at = ? "
+                "WHERE id = ?",
+                (self.now(), session),
+            )
 
     def _session_state(self, session: int) -> SessionStateBody:
         row = self._db.execute(
