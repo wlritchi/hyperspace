@@ -299,7 +299,11 @@ state of agent-initiated teleport (see "Later").
   state checks. It first syncs the bytes that it did not upload yet. If the
   new holder already appended, these go to a `diverge` branch, so no data is
   lost. Then it moves its local copy aside, as in a surrender. Until then, its
-  prevention hook blocks a resume (see "Prevention").
+  prevention hook blocks a resume (see "Prevention"). The client moves a copy
+  aside only if it saw this host hold the lease, the session does not run
+  here, and the server has every local byte. Any other host that sees the same
+  file (a second host name on a shared config directory, or a copy of a
+  transcript) only gets a notice.
 - **Recover.** A host can hold a lease and have no local copy, for example a
   runner whose harness config directory did not persist across a restart.
   `hyperspace restore <sid>` works for a lease that the host already holds.

@@ -11,9 +11,11 @@ session teleport between hosts.
 - The server does not parse transcripts. Client adapters hold the harness
   knowledge. v1 has an adapter for Claude Code.
 
-Status: under construction. See the
-[design spec](docs/specs/2026-10-12-hyperspace.md) and the
-[v1 plan](docs/plans/2026-10-12-hyperspace-v1.md).
+Status: v1 is built and not yet released. See the
+[design spec](docs/specs/2026-10-12-hyperspace.md), the
+[v1 plan](docs/plans/2026-10-12-hyperspace-v1.md),
+[deploying Hyperspace](docs/deploy.md), and
+[Hyperspace on container runners](docs/runners.md).
 
 ## Layout
 
@@ -26,6 +28,8 @@ Status: under construction. See the
 | `scripts/`  | Admin scripts that run inside the server image   |
 | `tests/`    | Unit and end-to-end tests                        |
 | `docs/`     | Design specs and implementation plans            |
+| `charts/`   | The Helm chart                                   |
+| `plugin/`   | The Claude Code plugin (hooks that call the CLI) |
 
 ## Development
 
