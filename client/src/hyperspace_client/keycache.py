@@ -3,7 +3,8 @@ spec).
 
 The cache keeps the token in kernel memory, never on disk. All processes of
 the user can read it. A key goes away at reboot, or after `ttl` seconds with
-no read. On other systems and CPU architectures, the cache is always empty.
+no read. On other systems and CPU architectures, and in containers that block
+the kernel keyring, the cache is always empty.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ log = logging.getLogger("hyperspace")
 # (add_key, keyctl) system call numbers.
 _SYSCALLS = {"x86_64": (248, 250), "aarch64": (217, 219)}
 _KEY_SPEC_USER_KEYRING = -4
+_KEYCTL_GET_KEYRING_ID = 0
 _KEYCTL_SETPERM = 5
 _KEYCTL_SEARCH = 10
 _KEYCTL_READ = 11
@@ -56,6 +58,9 @@ class KernelCache:
         self._add_key, self._keyctl = numbers
         self._libc = ctypes.CDLL(None, use_errno=True)
         self._libc.syscall.restype = ctypes.c_long
+        # The default seccomp profile of container runtimes blocks these
+        # system calls.
+        self._call(self._keyctl, _KEYCTL_GET_KEYRING_ID, _KEY_SPEC_USER_KEYRING, 1)
 
     def _call(self, *args: object) -> int:
         result = int(self._libc.syscall(*args))
