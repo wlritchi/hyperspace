@@ -53,6 +53,15 @@ jobs:
             --set ingress.tls.secretName=tls --set persistence.existingClaim=data \
             --set 'server.trustedProxies={10.0.0.0/8}' > /tmp/full.yaml
           /tmp/kubeconform -strict -summary /tmp/default.yaml /tmp/full.yaml
+          # Flux sets the chart version of an OCI source to <version>+<digest>.
+          # A label value must not contain "+", and kubeconform does not check
+          # label values.
+          "$HELM" package charts/hyperspace --version 0.0.0+0123456789ab -d /tmp/pkg
+          "$HELM" template t /tmp/pkg/hyperspace-0.0.0+0123456789ab.tgz $SET > /tmp/buildmeta.yaml
+          if grep -n 'helm.sh/chart: .*+' /tmp/buildmeta.yaml; then
+            echo "ERROR: a label value contains '+'" >&2
+            exit 1
+          fi
 
       - name: Prettier
         run: npx --yes prettier@3.9.10 --check '**/*.md'
