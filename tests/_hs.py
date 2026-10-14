@@ -54,9 +54,12 @@ class Server:
 
 
 def make_server(
-    data: Path, hosts: dict[str, tuple[str, set[str], str]] | None = None
+    data: Path,
+    hosts: dict[str, tuple[str, set[str], str]] | None = None,
+    **settings: Any,
 ) -> Server:
-    """`hosts` maps a name to (host, scopes, read scope)."""
+    """`hosts` maps a name to (host, scopes, read scope). `settings` go to the
+    server's `Settings`."""
     hosts = hosts or {
         "laptop": ("laptop", {"append", "read", "grant"}, "all"),
         "agent": ("agent-1", {"append", "read", "grant"}, "granted"),
@@ -86,7 +89,7 @@ def make_server(
     app = create_app(
         store,
         AccountsFile(path),
-        Settings(data_dir=data, requests_per_minute=100_000),
+        Settings(**{"data_dir": data, "requests_per_minute": 100_000, **settings}),
     )
     return Server(store, app, tokens)
 

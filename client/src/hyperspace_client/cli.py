@@ -37,6 +37,9 @@ log.addHandler(logging.NullHandler())
 
 # Events where the hook's cwd is the session's workspace.
 _START_EVENTS = ("SessionStart",)
+# Errors that apply to the credential, not to one session, so that the next
+# session of a sweep gets the same error.
+CREDENTIAL_ERRORS = frozenset({"unauthorized", "forbidden", "rate_limited"})
 
 
 class Exit(Exception):
@@ -174,6 +177,9 @@ def _sweep(cfg: Config, ctx: Context, if_stale: float | None) -> int:
                 count += 1
             except ApiError as exc:
                 log.warning("%s: %s", session.session_id, exc)
+                if exc.code in CREDENTIAL_ERRORS:
+                    log.warning("sweep: stopped after %d sessions", count)
+                    raise
     if isinstance(ctx.adapter, ClaudeCode):
         refresh_states(ctx, ctx.adapter)
     log.info("sweep: %d sessions", count)

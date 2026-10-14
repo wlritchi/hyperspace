@@ -795,7 +795,10 @@ dialog.
 
 - `hyperspace sync --transcript <path>` syncs one session.
   `hyperspace sync --all` scans every adapter's sessions. The first `--all`
-  run is the backfill.
+  run is the backfill. An error for one session (for example a conflict) goes
+  to the log, and the scan continues. An error that applies to the credential
+  (`unauthorized`, `forbidden`, or `rate_limited`, which includes the daily
+  byte quota) stops the scan, and the command exits with an error.
 - State is in `$XDG_STATE_HOME/hyperspace/state.sqlite3`: cursors for each
   local file, the last known placement of each session, arrival records, and
   conflict and move notices.

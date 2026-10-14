@@ -23,7 +23,7 @@ from _hs import (
     tool_result,
 )
 from hyperspace_client.adapters import LocalSession
-from hyperspace_client.api import Api
+from hyperspace_client.api import Api, ApiError
 from hyperspace_client.checkpoint import checkpoint
 from hyperspace_client.cli import _sweep
 from hyperspace_client.config import Config
@@ -298,6 +298,30 @@ def test_backfill_many_sessions(
         "/home/wlritchi/p1",
         "/home/wlritchi/p2",
     }
+
+
+def test_a_sweep_stops_when_the_quota_is_used_up(
+    tmp_path: Path, fake: FakeClaude
+) -> None:
+    server = make_server(tmp_path / "data", bytes_per_day=2000)
+    try:
+        ctx = context(server.api("laptop"), tmp_path / "state", fake, "laptop")
+        refused: list[int] = []
+        server.clients[-1].event_hooks["response"].append(
+            lambda r: refused.append(1) if r.status_code == 429 else None
+        )
+        for i in range(10):
+            t = fake.transcript(f"/home/wlritchi/p{i}")
+            fake.write(t, prompt("x" * 500, cwd=f"/home/wlritchi/p{i}"))
+        cfg = Config(host="laptop", state_dir=tmp_path / "state")
+        with pytest.raises(ApiError, match="rate_limited"):
+            _sweep(cfg, ctx, None)
+        stored = len(server.store.list_sessions("default", "laptop", "all"))
+        assert 0 < stored < 10
+        # The sweep sent no more uploads after the first refusal.
+        assert refused == [1]
+    finally:
+        server.close()
 
 
 # --- Checkpoint scheduling ----------------------------------------------------
