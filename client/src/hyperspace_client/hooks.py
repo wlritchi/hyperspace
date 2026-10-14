@@ -6,7 +6,7 @@ client. See "Plugin" in the spec.
 
 | Event                      | Action                                        |
 | -------------------------- | --------------------------------------------- |
-| SessionStart               | Print notices (no network); start a checkpoint, and a sweep at most once an hour |
+| SessionStart               | Print notices (no network); start a checkpoint, and a sweep at most once an hour; at a start or resume, these can read the keyring |
 | UserPromptSubmit           | Start a checkpoint; at the first prompt after a resume, print a block decision if the session lives elsewhere |
 | SessionEnd                 | Start a checkpoint with no wait               |
 | Other events in `CHECKPOINT_EVENTS` | Start a checkpoint                   |
@@ -30,7 +30,7 @@ import httpx
 
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import Api, ApiError
-from hyperspace_client.config import Config
+from hyperspace_client.config import Config, ConfigError
 from hyperspace_client.notices import check_resume, session_start_notice
 from hyperspace_client.state import State
 from hyperspace_client.sync import Context
@@ -51,6 +51,7 @@ CHECKPOINT_EVENTS = frozenset(
     }
 )
 SWEEP_EVERY = "3600"
+UNLOCK_SOURCES = frozenset({"startup", "resume"})
 
 Detach = Callable[[list[str]], None]
 
@@ -87,16 +88,22 @@ def handle(payload: dict[str, Any], cfg: Config, start: Detach = detach) -> str:
     if session is None:
         return ""
 
+    # At a session start or resume, the user is there to answer a passphrase
+    # prompt, so these syncs can read the keyring (see "Credentials").
+    unlock = event == "SessionStart" and _str(payload, "source") in UNLOCK_SOURCES
     sync = ["--quiet", "sync", "--checkpoint", "--transcript", transcript]
     if cwd:
         sync += ["--cwd", cwd]
     sync += ["--event", event]
     if event == "SessionEnd":
         sync.append("--no-wait")
+    if unlock:
+        sync.append("--unlock")
     start(sync)
 
     if event == "SessionStart":
-        start(["--quiet", "sync", "--all", "--if-stale", SWEEP_EVERY])
+        sweep = ["--quiet", "sync", "--all", "--if-stale", SWEEP_EVERY]
+        start(sweep + ["--unlock"] if unlock else sweep)
         state = State(cfg.state_dir)
         try:
             return session_start_notice(
@@ -110,8 +117,12 @@ def handle(payload: dict[str, Any], cfg: Config, start: Detach = detach) -> str:
         try:
             notices = state.take_notices(session.harness, session.session_id)
             decision = None
-            if cfg.url and cfg.token:
-                api = Api(cfg.url, cfg.token, timeout=2.0)
+            try:
+                url, token = cfg.require_server()
+            except ConfigError as exc:
+                log.info("%s: no resume check: %s", session.session_id, exc)
+            else:
+                api = Api(url, token, timeout=2.0)
                 try:
                     ctx = Context(api=api, state=state, adapter=adapter, host=cfg.host)
                     decision = check_resume(ctx, session)

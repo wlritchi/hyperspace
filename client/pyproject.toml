@@ -7,7 +7,12 @@ name = "hyperspace-client"
 description = "Hyperspace client: transcript sync, teleport, and restore"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["httpx>=0.27", "zstandard>=0.23", "hyperspace-protocol"]
+dependencies = [
+    "httpx>=0.27",
+    "zstandard>=0.23",
+    "keyring>=25",
+    "hyperspace-protocol",
+]
 license = "CC0-1.0"
 dynamic = ["version"]
 

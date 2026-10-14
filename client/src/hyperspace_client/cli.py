@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import getpass
 import json
 import logging
 import os
@@ -16,11 +17,13 @@ from pathlib import Path
 import httpx
 
 from hyperspace_client import config as config_mod
+from hyperspace_client import credentials
 from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.checkpoint import checkpoint
 from hyperspace_client.config import Config, ConfigError
+from hyperspace_client.credentials import CredentialError
 from hyperspace_client.hooks import handle
 from hyperspace_client.notices import after_sync, refresh_states
 from hyperspace_client.state import State
@@ -181,6 +184,52 @@ def cmd_whoami(args: argparse.Namespace, cfg: Config) -> int:
     url, token = cfg.require_server()
     with Api(url, token) as api:
         print(json.dumps(api.whoami(), indent=2))
+    print(f"token from: {cfg.token_source}", file=sys.stderr)
+    return 0
+
+
+def cmd_login(args: argparse.Namespace, cfg: Config) -> int:
+    if not cfg.url:
+        raise Exit(2, "no server URL: set HYPERSPACE_URL or `url` in config.toml")
+    if args.stdin:
+        token = sys.stdin.read().strip()
+    elif sys.stdin.isatty():
+        token = getpass.getpass("Hyperspace token: ").strip()
+    else:
+        raise Exit(2, "no terminal: give the token on stdin with --stdin")
+    if not token:
+        raise Exit(2, "no token given")
+    with Api(cfg.url, token) as api:
+        who = api.whoami()
+    host = who.get("host")
+    if host and host != cfg.host:
+        print(
+            f"hyperspace: this credential is for host {host!r}, but this host is "
+            f"{cfg.host!r}; set `host = {json.dumps(host)}` in config.toml, or "
+            "create a credential for this host",
+            file=sys.stderr,
+        )
+    backend = credentials.store(cfg.url, token, cfg.state_dir, cfg.token_cache_ttl)
+    print(f"stored the token for {host or cfg.host} in the keyring ({backend})")
+    if cfg.token_source in ("environment", "file"):
+        print(
+            f"hyperspace: the token from the {cfg.token_source} comes first; "
+            "remove it to use the keyring",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_logout(args: argparse.Namespace, cfg: Config) -> int:
+    if not cfg.url:
+        raise Exit(2, "no server URL: set HYPERSPACE_URL or `url` in config.toml")
+    in_keyring, in_cache = credentials.forget(cfg.url)
+    places = [p for p, had in (("keyring", in_keyring), ("cache", in_cache)) if had]
+    print(
+        f"removed the token from the {' and the '.join(places)}"
+        if places
+        else "no token stored"
+    )
     return 0
 
 
@@ -408,7 +457,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="with --checkpoint: do not wait for the interval (session end)",
     )
+    p.add_argument(
+        "--unlock",
+        action="store_true",
+        help="with --quiet: the token can come from the keyring, which can ask "
+        "for a passphrase (session start)",
+    )
     p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("login", help="check a token and store it in the keyring")
+    p.add_argument("--stdin", action="store_true", help="read the token from stdin")
+    p.set_defaults(func=cmd_login)
+
+    p = sub.add_parser("logout", help="remove the token from the keyring and cache")
+    p.set_defaults(func=cmd_logout)
 
     p = sub.add_parser("ls", help="list sessions on the server")
     p.add_argument("--harness")
@@ -477,13 +539,17 @@ def main(argv: list[str] | None = None) -> int:
     quiet = args.quiet or args.command == "hook"
     try:
         cfg = config_mod.load()
+        if not quiet:
+            cfg.keyring_use = "interactive"
+        elif getattr(args, "unlock", False):
+            cfg.keyring_use = "once"
         _setup_logging(cfg, quiet)
         return func(args, cfg)
     except Exit as exc:
         if exc.message:
             print(f"hyperspace: {exc.message}", file=sys.stderr)
         return exc.code
-    except (ConfigError, ApiError, httpx.HTTPError, OSError) as exc:
+    except (ConfigError, CredentialError, ApiError, httpx.HTTPError, OSError) as exc:
         if quiet:
             log.warning("%s: %s", type(exc).__name__, exc)
             return 0

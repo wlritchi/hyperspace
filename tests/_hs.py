@@ -1,15 +1,18 @@
 # vim: filetype=python
-"""Test helpers: an in-process server, API clients, and a fake Claude Code
-config directory."""
+"""Test helpers: an in-process server, API clients, a fake Claude Code
+config directory, and a fake keyring and token cache."""
 
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from keyring.backend import KeyringBackend
+from keyring.errors import PasswordDeleteError
 from starlette.testclient import TestClient
 
 from accounts import (
@@ -157,3 +160,48 @@ def tool_result() -> dict[str, Any]:
 
 def context(api: Api, state_dir: Path, fake: FakeClaude, host: str) -> Context:
     return Context(api=api, state=State(state_dir), adapter=fake.adapter, host=host)
+
+
+class MemoryKeyring(KeyringBackend):
+    """A keyring in memory. `fail` makes reads raise (a dismissed prompt);
+    `gate` makes reads wait (a prompt that the user has not answered)."""
+
+    priority = 1  # type: ignore[assignment]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.items: dict[tuple[str, str], str] = {}
+        self.reads = 0
+        self.fail: Exception | None = None
+        self.gate: threading.Event | None = None
+
+    def get_password(self, service: str, username: str) -> str | None:
+        self.reads += 1
+        if self.gate is not None:
+            self.gate.wait(10)
+        if self.fail is not None:
+            raise self.fail
+        return self.items.get((service, username))
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.items[(service, username)] = password
+
+    def delete_password(self, service: str, username: str) -> None:
+        if self.items.pop((service, username), None) is None:
+            raise PasswordDeleteError("no such password")
+
+
+class MemoryCache:
+    """The token cache in memory."""
+
+    def __init__(self) -> None:
+        self.items: dict[str, str] = {}
+
+    def get(self, name: str, ttl: int) -> str | None:
+        return self.items.get(name)
+
+    def put(self, name: str, value: str, ttl: int) -> None:
+        self.items[name] = value
+
+    def delete(self, name: str) -> bool:
+        return self.items.pop(name, None) is not None

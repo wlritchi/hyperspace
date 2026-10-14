@@ -726,9 +726,12 @@ server is on the open internet from the first release.
   no browser UI, no CORS, and no admin API.
 - **Audit.** The server records each read of session content (credential,
   host, session, time) in the index. `scripts/stats.py` can show it.
-- **Secrets on hosts.** The client reads the token from a file with mode 0600,
-  or on runners from a Kubernetes Secret. The cwd exclusion list keeps chosen
-  projects off the server.
+- **Secrets on hosts.** On workstations, the token is in the system keyring,
+  and on Linux also in a cache in kernel memory (see "Credentials"). A file
+  with mode 0600 also works. On workstations, the token is not in the
+  environment of the harness or of the agent's commands. On runners, the token
+  comes from a Kubernetes Secret, through the environment. The cwd exclusion
+  list keeps chosen projects off the server.
 
 ## Client
 
@@ -738,7 +741,8 @@ server is on the open internet from the first release.
 
 ```toml
 url = "https://hyperspace.example.com"    # required; no default
-token_file = "~/.config/hyperspace/token"  # or HYPERSPACE_TOKEN
+token_file = "~/.config/hyperspace/token"  # optional; or HYPERSPACE_TOKEN
+token_cache_ttl = 86400                    # seconds with no read before the cache drops the token
 host = "laptop"                            # default: system hostname; required on runners
 host_kind = "workstation"                  # or "runner"
 exclude_cwd = ["/tmp/**"]
@@ -746,6 +750,46 @@ exclude_cwd = ["/tmp/**"]
 
 If the URL or the token is missing, `hyperspace` commands stop with a clear
 error, and the hooks do nothing and write one line to the log.
+
+### Credentials
+
+The client looks for the token in this order:
+
+1. `HYPERSPACE_TOKEN` (runners).
+2. The token file: `HYPERSPACE_TOKEN_FILE`, `token_file`, or
+   `$XDG_CONFIG_HOME/hyperspace/token`.
+3. The token cache: on Linux, a key in the kernel's user keyring. It is in
+   memory only, and goes away at reboot or after `token_cache_ttl` seconds
+   with no read. Each read restarts the time.
+4. The system keyring (the `keyring` package, with the user's default
+   backend), with the server's host and port as the user name. A read fills
+   the cache.
+
+`hyperspace login` checks a token with the server, then stores it in the
+keyring and the cache. `hyperspace logout` removes it from both.
+
+A keyring can ask for a passphrase, for example `pass` with a GPG key. A
+prompt during a turn interrupts the user, and many hooks fire in each turn. So
+the client reads the keyring only at these times:
+
+- Commands that the user runs: if needed.
+- Hooks: never, except at a session start or resume. There, the checkpoint and
+  the sweep that the SessionStart hook starts can read it. The hook itself
+  does not wait for the prompt.
+- One read at a time: a process reads the keyring with a lock held, and the
+  others wait and then use the cache. So many sessions that resume after a
+  reboot give one prompt.
+- After a failed or dismissed read, hooks do not read the keyring again for 10
+  minutes. A command that the user runs reads it again.
+
+Other hooks use only the cache. If the cache is empty, they do nothing and
+write one line to the log; the next session start or resume, or any
+`hyperspace` command, fills it.
+
+On macOS, the default keyring is the login Keychain, which is unlocked while
+the user is logged in. There is no cache, and all hooks read the Keychain
+directly, but only when it is unlocked, so that a hook never shows the unlock
+dialog.
 
 ### Sync engine
 
@@ -835,7 +879,7 @@ process, so the hook returns at once and the work outlives the session.
 
 | Event                                                                                    | Hook  | Action                                                                                                                                                                                                                                                   |
 | ---------------------------------------------------------------------------------------- | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| SessionStart                                                                             | sync  | Print the teleport, move, or conflict notice, if any (local state only). Start a checkpoint, and `sync --all` if the last sweep was more than one hour ago.                                                                                              |
+| SessionStart                                                                             | sync  | Print the teleport, move, or conflict notice, if any (local state only). Start a checkpoint, and `sync --all` if the last sweep was more than one hour ago. At a start or resume, these can read the keyring (see "Credentials").                        |
 | UserPromptSubmit                                                                         | sync  | Start a checkpoint. At the first prompt after a resume: block the prompt if the session moved or is conflicted (see "Prevention"). Otherwise print a new notice, if any. Network only when the saved state is older than the resume, with a 2 s timeout. |
 | PreToolUse, PostToolUse, PostToolUseFailure, SubagentStop, PreCompact, PostCompact, Stop | async | Start a checkpoint. PreToolUse records the tool call before a long tool runs.                                                                                                                                                                            |
 | SessionEnd                                                                               | async | Start a checkpoint with no wait for the interval.                                                                                                                                                                                                        |
@@ -993,6 +1037,9 @@ a schema validator.
   receive side.
 - Runners need a persistent workspace. A persistent harness config directory
   is optional.
+- Workstations keep the token in the system keyring, with a cache in kernel
+  memory on Linux. Hooks read the keyring only at a session start or resume,
+  so a passphrase prompt comes at most once per session start.
 
 ## Open questions
 

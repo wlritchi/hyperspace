@@ -71,20 +71,30 @@ Install the client:
 uv tool install 'hyperspace-client @ git+https://github.com/wlritchi/hyperspace@client-vX.Y.Z#subdirectory=client'
 ```
 
-Store the token in a file that only you can read, and write the client
-configuration:
+Write the client configuration, then store the token in the system keyring.
+`hyperspace login` checks the token with the server first.
 
 ```sh
 install -d -m 700 ~/.config/hyperspace
-umask 077 && printf '%s\n' '<token>' > ~/.config/hyperspace/token
 cat > ~/.config/hyperspace/config.toml <<'EOF'
 url = "https://hyperspace.example.com"
-token_file = "~/.config/hyperspace/token"
 # host = "laptop"           # default: the system hostname
 # exclude_cwd = ["/tmp/**"] # workspaces never to upload
 EOF
+hyperspace login
 hyperspace whoami
 ```
+
+The client uses your default `keyring` backend. If your `keyringrc.cfg` names
+a backend from another package, install that package with the client:
+`uv tool install --force --with <package> ...`, where `<package>` is the
+package name or a local path. On Linux, the client also keeps the token in a
+cache in kernel memory, so that hooks do not read the keyring during a turn.
+If the keyring asks for a passphrase, it asks when a session starts or
+resumes, at most once for many sessions (see "Credentials" in the spec).
+
+A token file also works, with no keyring:
+`token_file = "~/.config/hyperspace/token"` (mode 0600).
 
 Install the plugin from the marketplace, so that the hooks back up sessions as
 they run:

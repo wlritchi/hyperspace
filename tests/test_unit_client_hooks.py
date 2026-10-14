@@ -73,10 +73,24 @@ def test_session_start_sweeps_and_prints_the_arrival(cfg: Config) -> None:
     state.close()
     out, started = run(cfg, hook_event_name="SessionStart", source="resume")
     assert "This session was teleported" in out
-    assert ["--quiet", "sync", "--all", "--if-stale", "3600"] in started
+    assert ["--quiet", "sync", "--all", "--if-stale", "3600", "--unlock"] in started
     # The arrival is shown once.
     out, _ = run(cfg, hook_event_name="SessionStart", source="resume")
     assert "teleported" not in out
+
+
+@pytest.mark.parametrize(
+    ("source", "unlock"),
+    [("startup", True), ("resume", True), ("clear", False), ("compact", False)],
+)
+def test_only_a_start_or_resume_reads_the_keyring(
+    cfg: Config, source: str, unlock: bool
+) -> None:
+    _, started = run(cfg, hook_event_name="SessionStart", source=source)
+    assert len(started) == 2
+    assert all(("--unlock" in args) == unlock for args in started)
+    _, started = run(cfg, hook_event_name="UserPromptSubmit")
+    assert "--unlock" not in started[0]
 
 
 def test_user_prompt_prints_notices(cfg: Config) -> None:
