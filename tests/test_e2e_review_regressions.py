@@ -17,7 +17,7 @@ from hyperspace_client.adapters import LocalFile
 from hyperspace_client.adapters.claude_code import sanitize_path
 from hyperspace_client.api import ApiError
 from hyperspace_client.sync import Syncer
-from hyperspace_client.teleport import TeleportError, restore, send
+from hyperspace_client.teleport import SURRENDERED, TeleportError, restore, send
 from hyperspace_protocol import (
     HEADER_WORKSPACE_UTF8,
     decode_workspace,
@@ -45,6 +45,21 @@ def hosts(tmp_path):
     a.state.close()
     b.state.close()
     server.close()
+
+
+def test_restore_preserves_unsynced_content_unless_forced(hosts):
+    _, laptop, _, a, _, t = hosts
+    backup = t.read_bytes()
+    laptop.write(t, prompt("not uploaded"))
+    local = t.read_bytes()
+    before = a.api.manifest(H, t.stem)
+    with pytest.raises(TeleportError, match="--force"):
+        restore(a, laptop.adapter, t.stem, WS)
+    assert t.read_bytes() == local
+    assert a.api.manifest(H, t.stem)["teleports"] == before["teleports"]
+    restore(a, laptop.adapter, t.stem, WS, force=True)
+    assert t.read_bytes() == backup
+    assert next(t.parent.glob(t.name + SURRENDERED + "*")).read_bytes() == local
 
 
 def test_restore_refuses_live_target(hosts, monkeypatch):
@@ -340,6 +355,22 @@ def test_stale_lease_rejects_restore_even_with_steal(hosts):
     with pytest.raises(ApiError, match="stale_snapshot"):
         b.api.teleport(H, t.stem, WS, True, revision, "t_test")
     assert a.api.state(H, t.stem)["lease"]["state"] == "reserved"
+
+
+def test_force_restore_rejection_restores_divergent_local(hosts, monkeypatch):
+    _, laptop, _, a, _, t = hosts
+    laptop.write(t, prompt("local unsynced"))
+    before = t.read_bytes()
+    original = a.api.teleport
+
+    def changed(*args, **kwargs):
+        a.api.add_metadata(H, t.stem, WS, {"title": "changed"})
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(a.api, "teleport", changed)
+    with pytest.raises(ApiError, match="stale_snapshot"):
+        restore(a, laptop.adapter, t.stem, WS, force=True)
+    assert t.read_bytes() == before
 
 
 @pytest.mark.parametrize("retry_status", [401, 429, 504])

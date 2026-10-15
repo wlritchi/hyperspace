@@ -72,7 +72,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 def move_aside(transcript: Path, state: State) -> Path:
     """Rename a transcript so that `claude --resume` does not find it."""
-    target = transcript.with_name(f"{transcript.name}{SURRENDERED}{int(time.time())}")
+    target = transcript.with_name(f"{transcript.name}{SURRENDERED}{time.time_ns()}")
     os.rename(transcript, target)
     state.forget_cursor(transcript)
     return target
@@ -377,6 +377,10 @@ def _restore(
         if entry["kind"] == "log":
             active = _active(entry)
             data = _log_bytes(api, harness, session_id, active["id"], active["length"])
+            if local is not None and not data.startswith(local) and not force:
+                raise TeleportError(
+                    f"local {entry['path']} differs from the backup; use --force to preserve it and restore"
+                )
         else:
             latest = entry["versions"][-1]
             if (
