@@ -11,10 +11,12 @@ import zstandard
 
 from hyperspace_protocol import (
     API_PREFIX,
+    CAP_WORKSPACE_UTF8,
     HEADER_ACTIVITY,
     HEADER_BASE_LENGTH,
     HEADER_SHA256,
     HEADER_WORKSPACE,
+    HEADER_WORKSPACE_UTF8,
     AppendResponse,
     BlobVersion,
     ForkEvent,
@@ -26,6 +28,8 @@ from hyperspace_protocol import (
     SessionStateBody,
     SessionSummary,
     TeleportResponse,
+    encode_workspace,
+    validate_workspace,
 )
 
 
@@ -67,6 +71,7 @@ class Api:
             timeout=timeout,
         )
         self._zstd = zstandard.ZstdCompressor(level=3)
+        self._capabilities: set[str] | None = None
 
     def close(self) -> None:
         self._client.close()
@@ -105,7 +110,26 @@ class Api:
     # --- Identity and hosts ----------------------------------------------
 
     def whoami(self) -> dict[str, Any]:
-        return cast(dict[str, Any], self._json("GET", "/whoami"))
+        body = cast(dict[str, Any], self._json("GET", "/whoami"))
+        self._capabilities = set(body.get("capabilities", []))
+        return body
+
+    def require_capability(self, capability: str) -> None:
+        if self._capabilities is None:
+            self.whoami()
+        if capability not in (self._capabilities or set()):
+            raise ApiError(400, "upgrade_required", f"server must support {capability}")
+
+    def _workspace_headers(self, workspace: str) -> dict[str, str]:
+        validate_workspace(workspace)
+        if self._capabilities is None:
+            self.whoami()
+        if CAP_WORKSPACE_UTF8 in (self._capabilities or set()):
+            return {HEADER_WORKSPACE_UTF8: encode_workspace(workspace)}
+        if all(32 <= ord(c) < 127 for c in workspace):
+            return {HEADER_WORKSPACE: workspace}
+        self.require_capability(CAP_WORKSPACE_UTF8)
+        raise AssertionError("unreachable")
 
     def register_host(self, info: HostInfo) -> dict[str, Any]:
         return cast(dict[str, Any], self._json("PUT", "/hosts/self", json=info))
@@ -135,7 +159,7 @@ class Api:
             "POST",
             self._s(harness, sid) + "/meta",
             json=metadata,
-            headers={HEADER_WORKSPACE: workspace},
+            headers=self._workspace_headers(workspace),
         )
 
     # --- Logs --------------------------------------------------------------
@@ -160,7 +184,7 @@ class Api:
                 "POST",
                 self._s(harness, sid) + "/generations",
                 json=body,
-                headers={HEADER_WORKSPACE: workspace},
+                headers=self._workspace_headers(workspace),
             ),
         )
 
@@ -175,7 +199,7 @@ class Api:
         activity: int,
     ) -> AppendResponse:
         headers = {
-            HEADER_WORKSPACE: workspace,
+            **self._workspace_headers(workspace),
             HEADER_BASE_LENGTH: str(base_length),
             HEADER_SHA256: hashlib.sha256(data).hexdigest(),
             HEADER_ACTIVITY: str(activity),
@@ -208,7 +232,7 @@ class Api:
         self, harness: str, sid: str, workspace: str, path: str, data: bytes
     ) -> BlobVersion:
         headers = {
-            HEADER_WORKSPACE: workspace,
+            **self._workspace_headers(workspace),
             HEADER_SHA256: hashlib.sha256(data).hexdigest(),
             "Content-Encoding": "zstd",
             "Content-Type": "application/octet-stream",

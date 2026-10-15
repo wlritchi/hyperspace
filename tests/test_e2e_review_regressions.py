@@ -15,6 +15,11 @@ from hyperspace_client.adapters.claude_code import sanitize_path
 from hyperspace_client.api import ApiError
 from hyperspace_client.sync import Syncer
 from hyperspace_client.teleport import restore
+from hyperspace_protocol import (
+    HEADER_WORKSPACE_UTF8,
+    decode_workspace,
+    encode_workspace,
+)
 from store import SessionKey, Store, Writer
 
 H = "claude-code"
@@ -37,6 +42,27 @@ def hosts(tmp_path):
     a.state.close()
     b.state.close()
     server.close()
+
+
+def test_unicode_workspace_round_trip(hosts):
+    _, laptop, _, a, _, _ = hosts
+    workspace = "/work/projet-é/项目/😀"
+    t = laptop.transcript(workspace)
+    laptop.write(t, prompt("unicode", cwd=workspace))
+    Syncer(a, laptop.adapter.session_for_transcript(t), workspace).run()
+    assert a.api.manifest(H, t.stem)["placements"][-1]["workspace"] == workspace
+    assert decode_workspace(encode_workspace(workspace)) == workspace
+    a.api._capabilities = set()
+    with pytest.raises(ApiError, match="upgrade_required"):
+        a.api.add_metadata(H, t.stem, workspace, {})
+
+
+def test_invalid_workspace_encoding_is_rejected(hosts):
+    _, _, _, a, _, t = hosts
+    response = a.api._client.post(
+        f"/sessions/{H}/{t.stem}/meta", json={}, headers={HEADER_WORKSPACE_UTF8: "%%%"}
+    )
+    assert response.status_code == 400
 
 
 @pytest.mark.parametrize(

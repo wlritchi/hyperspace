@@ -641,6 +641,21 @@ uncompressed data. The client splits larger appends.
 | `GET /sessions/{harness}/{sid}/blobs/{path}?version=`         | `read`           | Read a blob version                                                                                                                                         |
 | `POST /sessions/{harness}/{sid}/grants`                       | `grant`          | Let another host read this session                                                                                                                          |
 
+### Compatible protocol extensions
+
+`GET /whoami` includes a `capabilities` list. This release advertises
+`workspace-utf8`:
+
+- `Hyperspace-Workspace-Utf8` carries standard base64 of the UTF-8 workspace.
+  It takes precedence over `Hyperspace-Workspace`. The server still accepts
+  the old raw header. New clients use the encoded header when supported; with
+  an older server they use the raw header only for printable ASCII paths, and
+  otherwise report that a server upgrade is required.
+
+Upgrade the server before the client. A subsequent release will remove support
+for old clients: the raw workspace header will no longer be accepted. This
+release retains it.
+
 Known metadata fields are type-checked before storage. Unknown fields remain
 available for extensions. Readers ignore malformed known fields in events
 written by older servers; the original events remain unchanged.

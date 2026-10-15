@@ -128,6 +128,7 @@ def test_auth(env: Env) -> None:
         "host": "agent-1",
         "scopes": ["append", "grant", "read"],
         "read_scope": "granted",
+        "capabilities": ["workspace-utf8"],
     }
 
 

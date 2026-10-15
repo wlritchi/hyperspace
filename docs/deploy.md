@@ -140,6 +140,13 @@ seconds. The plugin also runs this sweep at most once an hour.
 hyperspace sync --all
 ```
 
+### Upgrade order
+
+Upgrade the server before the client. The new server accepts old clients while
+advertising the `workspace-utf8` capability. Unicode workspace uploads require
+encoded-header support. A subsequent release will remove the legacy request
+forms.
+
 ## 4. Teleport a session
 
 On the host that has the session (the lease holder), stop the session, then:

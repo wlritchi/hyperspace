@@ -32,13 +32,16 @@ from starlette.routing import Route
 from accounts import AccountsFile, Principal, parse_token
 from hyperspace_protocol import (
     API_PREFIX,
+    CAPABILITIES,
     HEADER_ACTIVITY,
     HEADER_BASE_LENGTH,
     HEADER_SHA256,
     HEADER_WORKSPACE,
+    HEADER_WORKSPACE_UTF8,
     HOST_KINDS,
     MAX_BODY,
     ValidationError,
+    decode_workspace,
     validate_file_path,
     validate_harness,
     validate_host_name,
@@ -391,7 +394,12 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
         return SessionKey(principal.account, harness, sid)
 
     def writer(request: Request, principal: Principal) -> Writer:
-        workspace = request.headers.get(HEADER_WORKSPACE)
+        encoded = request.headers.get(HEADER_WORKSPACE_UTF8)
+        workspace = (
+            decode_workspace(encoded)
+            if encoded is not None
+            else request.headers.get(HEADER_WORKSPACE)
+        )
         if workspace is None:
             raise ApiError("bad_request", f"missing {HEADER_WORKSPACE} header")
         return Writer(principal.account, principal.host, validate_workspace(workspace))
@@ -480,6 +488,7 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
                 "host": principal.host,
                 "scopes": sorted(principal.scopes),
                 "read_scope": principal.read,
+                "capabilities": CAPABILITIES,
             }
         )
 

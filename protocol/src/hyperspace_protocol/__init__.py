@@ -8,6 +8,8 @@ suffix.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 from typing import Any, Literal, NotRequired, TypedDict, cast
 
@@ -18,6 +20,9 @@ HEADER_BASE_LENGTH = "Hyperspace-Base-Length"
 HEADER_SHA256 = "Hyperspace-Sha256"
 HEADER_ACTIVITY = "Hyperspace-Activity"
 HEADER_WORKSPACE = "Hyperspace-Workspace"
+HEADER_WORKSPACE_UTF8 = "Hyperspace-Workspace-Utf8"
+CAP_WORKSPACE_UTF8 = "workspace-utf8"
+CAPABILITIES = [CAP_WORKSPACE_UTF8]
 
 # One request carries at most this much uncompressed file data. The client
 # splits larger appends.
@@ -134,6 +139,18 @@ def validate_workspace(value: str) -> str:
     return value
 
 
+def encode_workspace(value: str) -> str:
+    return base64.b64encode(validate_workspace(value).encode("utf-8")).decode("ascii")
+
+
+def decode_workspace(value: str) -> str:
+    try:
+        decoded = base64.b64decode(value, validate=True).decode("utf-8")
+    except (ValueError, UnicodeError, binascii.Error):
+        raise ValidationError("invalid UTF-8 workspace header") from None
+    return validate_workspace(decoded)
+
+
 def validate_metadata(value: dict[str, Any]) -> SessionMetadata:
     """Check known fields. Unknown fields remain available for extensions."""
     for key in (
@@ -173,6 +190,7 @@ class WhoAmI(TypedDict):
     host: str
     scopes: list[Scope]
     read_scope: NotRequired[ReadScope]
+    capabilities: NotRequired[list[str]]
 
 
 class HostInfo(TypedDict):
