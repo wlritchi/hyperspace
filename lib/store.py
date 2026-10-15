@@ -1067,12 +1067,29 @@ class Store:
         exits = [e for e in (last_a.exit, last_b.exit) if e is not None]
         return min(exits) if exits else last_a.gen.length
 
+    def _rewrite_saw_parent(self, parent: _Gen, rewrite: _Gen) -> bool:
+        """Return True if the host of `rewrite` had all bytes of `parent`.
+
+        The host had them if it made the last append to `parent`, or if a
+        teleport to the host came after that append. A teleport confirms a
+        restore of a current snapshot.
+        """
+        if self._last_writer(parent) == rewrite.host:
+            return True
+        row = self._db.execute(
+            "SELECT 1 FROM teleports t JOIN files f ON f.session = t.session "
+            "WHERE f.id = ? AND t.target_host = ? AND t.created >= ? "
+            "AND t.created <= ? LIMIT 1",
+            (parent.file, rewrite.host, parent.last_append, rewrite.created),
+        ).fetchone()
+        return row is not None
+
     def _candidates(self, file: int) -> tuple[list[_Gen], dict[str, _Gen]]:
         """Return the branch tips of a log.
 
         A generation is a tip if it has bytes that no child inherits (or no
-        children). A tip whose tail a `rewrite` child replaced, with no
-        append after that child was created, is retired and is not a tip.
+        children). A `rewrite` child retires a tip only if its host had all
+        bytes of the tip and no append followed the child's creation.
         """
         gens = self._gens_of_file(file)
         by_id = {g.id: g for g in gens}
@@ -1086,7 +1103,10 @@ class Store:
             if kids and g.length <= max(k.fork_offset for k in kids):
                 continue
             retired = any(
-                k.cause == "rewrite" and k.created >= g.last_append for k in kids
+                k.cause == "rewrite"
+                and k.created >= g.last_append
+                and self._rewrite_saw_parent(g, k)
+                for k in kids
             )
             if not retired:
                 tips.append(g)

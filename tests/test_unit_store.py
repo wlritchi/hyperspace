@@ -248,6 +248,70 @@ def test_rewrite_never_conflicts(store: Store) -> None:
     assert active["kind"] == "log" and active["active"] == r["id"]
 
 
+@pytest.mark.parametrize("inherited", [False, True])
+def test_stale_rewrite_keeps_other_hosts_tail(store: Store, inherited: bool) -> None:
+    g = root(store)
+    n = put(store, g, 0, b"base\n", activity=1)
+    store.teleport(KEY, AGENT, steal=True)
+    end = put(store, g, n, b"agent work\n", writer=AGENT, activity=3)
+    if inherited:
+        g = store.create_generation(
+            KEY, PATH, AGENT, "rewrite", parent=g, fork_offset=end
+        )["id"]
+        put(store, g, end, b"more work\n", writer=AGENT, activity=1)
+    # The laptop did not see the agent's appends. Its rewrite forks from the
+    # last offset that it uploaded.
+    r = store.create_generation(KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=n)
+    put(store, r["id"], n, b"laptop work\n", activity=2)
+
+    state = store.session_state(KEY)
+    assert state["state"] == "conflicted"
+    assert state["lease"]["host"] == "agent-1"
+    assert {b["generation"] for b in state.get("branches", [])} == {g, r["id"]}
+    with pytest.raises(StoreError) as err:
+        store.teleport(KEY, OTHER, steal=True)
+    assert err.value.code == "conflicted"
+
+
+def test_rewrite_after_teleport_replaces_the_teleported_tail(store: Store) -> None:
+    g = root(store)
+    n = put(store, g, 0, b"one\n", activity=1)
+    put(store, g, n, b"failed\n", activity=1)
+    store.surrender(KEY, "laptop", "agent-1")
+    store.teleport(KEY, AGENT, steal=False)
+    # The restored file is one segment in the agent's cursor, so a change to
+    # the restored bytes forks at offset 0.
+    r = store.create_generation(KEY, PATH, AGENT, "rewrite", parent=g, fork_offset=0)
+    n = put(store, r["id"], 0, b"one\n", writer=AGENT, activity=1)
+    put(store, r["id"], n, b"two\n", writer=AGENT, activity=1)
+    assert store.session_state(KEY)["state"] == "normal"
+    active = next(f for f in store.manifest(KEY)["files"] if f["path"] == PATH)
+    assert active["kind"] == "log" and active["active"] == r["id"]
+
+
+def test_teleport_before_other_appends_does_not_cover_them(store: Store) -> None:
+    g = root(store)
+    n = put(store, g, 0, b"base\n", activity=1)
+    store.teleport(KEY, AGENT, steal=True)
+    store.teleport(KEY, LAPTOP, steal=True)
+    put(store, g, n, b"agent work\n", writer=AGENT, activity=1)
+    r = store.create_generation(KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=n)
+    put(store, r["id"], n, b"laptop work\n", activity=1)
+    assert store.session_state(KEY)["state"] == "conflicted"
+
+
+def test_rewrite_can_replace_own_tail_after_teleport(store: Store) -> None:
+    g = root(store)
+    n = put(store, g, 0, b"base\n", activity=1)
+    store.teleport(KEY, AGENT, steal=True)
+    put(store, g, n, b"agent work\n", writer=AGENT, activity=1)
+    r = store.create_generation(KEY, PATH, AGENT, "rewrite", parent=g, fork_offset=n)
+    put(store, r["id"], n, b"new work\n", writer=AGENT, activity=1)
+    assert store.session_state(KEY)["state"] == "normal"
+    active = next(f for f in store.manifest(KEY)["files"] if f["path"] == PATH)
+    assert active["kind"] == "log" and active["active"] == r["id"]
+
+
 def _diverge(store: Store, laptop_activity: int, agent_activity: int) -> str:
     g = root(store)
     n = put(store, g, 0, b"base\n", activity=1)

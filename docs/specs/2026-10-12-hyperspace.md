@@ -490,8 +490,15 @@ not count them. v1 counts every tool call.
 Each new generation has a cause:
 
 - `rewrite`: the same host changed its own file (Claude Code removed a failed
-  tail, or rewrote the file). The new generation replaces the old tail. The
-  old tail never causes a conflict.
+  tail, or rewrote the file). The new generation replaces the old tail of its
+  parent if the host had all bytes of the parent, and the parent has no append
+  after the rewrite was created. The host had all bytes if it made the last
+  append to the parent (or created the parent, if the parent has no appends),
+  or if a teleport to the host came after the last append to the parent. The
+  replaced tail does not cause a conflict. Otherwise the host had a stale
+  copy: the server keeps the parent branch and applies the same conflict rules
+  as for `diverge`. Thus a stale host cannot hide the work of a different host
+  with a rewrite.
 - `diverge`: the server refused an append with `409`, because a different
   append reached the same offset first.
 
@@ -500,9 +507,10 @@ Each new generation has a cause:
 - **Normal.** At most one branch has meaningful activity after the point where
   it separated from the other branches. That branch is the _active branch_.
   Restore and teleport use it.
-- **Conflicted.** Two or more `diverge` branches have meaningful activity
-  after their common fork point. The server records the time and the branches.
-  A conflicted session id stays conflicted.
+- **Conflicted.** Two or more branches (from `diverge`, or from a `rewrite`
+  that did not replace its parent's tail) have meaningful activity after their
+  common fork point. The server records the time and the branches. A
+  conflicted session id stays conflicted.
 
 For a conflicted session:
 
