@@ -168,11 +168,11 @@ def _sweep(cfg: Config, ctx: Context, if_stale: float | None) -> int:
     state.put("last_sweep", str(time.time()))
     count = 0
     for session in ctx.adapter.discover():
-        workspace = resolve_workspace(ctx, session, None, None)
         with state.try_lock(session.harness, session.session_id) as locked:
             if not locked:
                 continue
             try:
+                workspace = resolve_workspace(ctx, session, None, None)
                 _sync_one(cfg, ctx, session, workspace)
                 count += 1
             except ApiError as exc:
@@ -180,6 +180,14 @@ def _sweep(cfg: Config, ctx: Context, if_stale: float | None) -> int:
                 if exc.code in CREDENTIAL_ERRORS:
                     log.warning("sweep: stopped after %d sessions", count)
                     raise
+            except httpx.HTTPError:
+                # The server cannot be reached. The next session gets the
+                # same error, so stop.
+                raise
+            except Exception as exc:  # noqa: BLE001
+                # A local error (for example an unreadable file) applies
+                # to this session only. Log it and continue the sweep.
+                log.warning("%s: %s: %s", session.session_id, type(exc).__name__, exc)
     if isinstance(ctx.adapter, ClaudeCode):
         refresh_states(ctx, ctx.adapter)
     log.info("sweep: %d sessions", count)

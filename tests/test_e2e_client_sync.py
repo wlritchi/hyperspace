@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from _hs import (
     tool_result,
 )
 from hyperspace_client.adapters import LocalSession
+from hyperspace_client.adapters.claude_code import sanitize_path
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.checkpoint import checkpoint
 from hyperspace_client.cli import _sweep
@@ -366,6 +368,33 @@ def test_a_sweep_stops_when_the_quota_is_used_up(
         assert refused == [1]
     finally:
         server.close()
+
+
+def test_a_sweep_continues_after_a_local_error_in_one_session(
+    server: Server,
+    fake: FakeClaude,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = context(server.api("laptop"), tmp_path / "state", fake, "laptop")
+    sids = sorted(str(uuid.uuid4()) for _ in range(2))
+    for sid in sids:
+        fake.write(fake.transcript(WS, sid), prompt(f"session {sid}"))
+    # A file name that is not UTF-8 makes the first session fail locally.
+    side = fake.root / "projects" / sanitize_path(WS) / sids[0] / "tool-results"
+    side.mkdir(parents=True)
+    (side / os.fsdecode(b"bad\xff.txt")).write_text("x")
+    refreshed: list[int] = []
+    monkeypatch.setattr(
+        "hyperspace_client.cli.refresh_states", lambda *_: refreshed.append(1)
+    )
+    cfg = Config(host="laptop", state_dir=tmp_path / "state")
+    assert _sweep(cfg, ctx, None) == 0
+    stored = {
+        s["session_id"] for s in server.store.list_sessions("default", "laptop", "all")
+    }
+    assert sids[1] in stored
+    assert refreshed == [1]
 
 
 # --- Checkpoint scheduling ----------------------------------------------------
