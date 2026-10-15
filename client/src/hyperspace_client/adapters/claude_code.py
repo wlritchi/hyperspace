@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -358,12 +359,25 @@ class ClaudeCode:
             if record.get("sessionId") != session_id:
                 continue
             pid = record.get("pid")
-            if not isinstance(pid, int):
+            if not isinstance(pid, int) or pid <= 0:
                 continue
+            if sys.platform != "linux":
+                # The registry's procStart format is platform-specific.
+                # Until it can be compared, a live/reused pid must block a
+                # destructive move rather than be treated as stopped.
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                except OSError:
+                    return True
+                return True
             try:
                 stat = Path(f"/proc/{pid}/stat").read_text()
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except OSError:
+                return True
             # The process name (field 2) can contain spaces; the fields after
             # its closing parenthesis are fixed.
             fields = stat[stat.rfind(")") + 2 :].split()

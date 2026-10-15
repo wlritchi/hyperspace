@@ -278,7 +278,9 @@ state of agent-initiated teleport (see "Later").
   1. Check that the session does not run on this host. The Claude Code adapter
      reads the live-session registry (`~/.claude/sessions/<pid>.json`, which
      has `sessionId`, `pid` and `procStart`) and checks that each process is
-     alive and has the same start time. If the session runs, stop.
+     alive and has the same start time on Linux. On other systems, a live pid
+     conservatively blocks the move when its start time cannot be compared. If
+     the session runs, stop.
   2. Sync the session. If the server cannot be reached, stop: a surrender must
      not leave bytes that only this host has.
   3. Move the local transcript aside, to

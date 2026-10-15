@@ -112,6 +112,24 @@ def test_failed_transaction_entry_releases_store_lock(tmp_path):
     two.close()
 
 
+def test_macos_running_process_is_not_treated_as_stopped(hosts, monkeypatch):
+    import hyperspace_client.adapters.claude_code as adapter_module
+
+    _, laptop, _, _, _, t = hosts
+    sessions = laptop.root / "sessions"
+    sessions.mkdir()
+    (sessions / "123.json").write_text(
+        json.dumps({"sessionId": t.stem, "pid": 123, "procStart": "platform-specific"})
+    )
+    monkeypatch.setattr(adapter_module.sys, "platform", "darwin")
+    calls = []
+    monkeypatch.setattr(
+        adapter_module.os, "kill", lambda pid, sig: calls.append((pid, sig))
+    )
+    assert laptop.adapter.is_running(t.stem)
+    assert calls == [(123, 0)]
+
+
 def test_long_workspace_matches_harness_encoding():
     # Expected values from Claude Code 2.1.288's JavaScript implementation,
     # not from the Python encoder used by FakeClaude.
