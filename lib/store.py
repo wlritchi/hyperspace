@@ -1221,8 +1221,11 @@ class Store:
         # reader that gets here finds no row first.
         for gid in generations:
             self._framelog(gid).path.unlink(missing_ok=True)
-        for digest in digests:
-            self.objects.remove(digest)
+        # Another process can add a reference after the purge commits.
+        # Recheck under a database writer lock, and keep it through unlink.
+        with self._tx():
+            for digest in self._unreferenced(set(digests)):
+                self.objects.remove(digest)
 
     def purge_session(self, key: SessionKey, reason: str) -> dict[str, int]:
         """Remove a session and all its data. Its id is free again: a host

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
 
@@ -10,7 +11,7 @@ import pytest
 
 from _hs import FakeClaude, context, make_server, prompt
 from hyperspace_client.sync import Syncer
-from store import Store
+from store import SessionKey, Store, Writer
 
 H = "claude-code"
 WS = "/work/project"
@@ -32,6 +33,27 @@ def hosts(tmp_path):
     a.state.close()
     b.state.close()
     server.close()
+
+
+def test_purge_rechecks_objects_after_commit(tmp_path, monkeypatch):
+    one, two = Store(tmp_path / "store"), Store(tmp_path / "store")
+    key = SessionKey("a", H, "one")
+    other = SessionKey("a", H, "two")
+    writer = Writer("a", "laptop", WS)
+    data = b"shared"
+    digest = hashlib.sha256(data).hexdigest()
+    one.put_blob(key, "tool-results/x", writer, data, digest)
+    original = one._remove_files
+
+    def interleave(generations, digests):
+        two.put_blob(other, "tool-results/x", writer, data, digest)
+        original(generations, digests)
+
+    monkeypatch.setattr(one, "_remove_files", interleave)
+    one.purge_blob_version(key, "tool-results/x", 1, "test")
+    assert two.read_blob(other, "tool-results/x", None) == data
+    one.close()
+    two.close()
 
 
 def test_failed_transaction_entry_releases_store_lock(tmp_path):
