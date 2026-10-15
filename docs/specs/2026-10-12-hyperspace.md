@@ -239,6 +239,11 @@ generation contains the parent, the fork offset, and the cause (`rewrite` or
   client then creates a new generation that forks at its base length, and
   appends to that generation.
 
+After success, the client advances its cursor by the number of bytes in the
+request, not to the length in the response. A retry can return a generation
+length that includes later appends from another host. The client must compare
+those bytes with its local file before it adopts them.
+
 Each response also contains the session's lease holder and state, so the
 client learns when the session is active somewhere else (see "Branches and
 conflicts").

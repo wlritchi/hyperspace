@@ -219,6 +219,50 @@ def test_lost_cursor_save_is_adopted(
     assert active_bytes(server, t.stem) == t.read_bytes()
 
 
+def test_append_retry_does_not_adopt_another_hosts_bytes(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    laptop = context(server.api("laptop"), tmp_path / "s1", fake, "laptop")
+    t = fake.transcript(WS)
+    fake.write(t, prompt("one"))
+    sync(laptop, t)
+    saved = laptop.state.cursor(t, laptop.api.cache_identity)
+    assert saved is not None
+    fake.write(t, prompt("two"))
+    sync(laptop, t)
+    common = t.read_bytes()
+    # The append committed, but its response or cursor save was lost.
+    laptop.state.save_cursor(saved)
+
+    laptop.api.grant("claude-code", t.stem, "agent-1")
+    other = FakeClaude(tmp_path / "claude2")
+    t2 = other.transcript(WS, t.stem)
+    t2.write_bytes(common)
+    agent = context(server.api("agent"), tmp_path / "s2", other, "agent-1")
+    sync(agent, t2)
+    other.write(t2, prompt("agent work"))
+    sync(agent, t2)
+
+    # Retry the exact segment after another host extended the generation.
+    sync(laptop, t)
+    cursor = laptop.state.cursor(t, laptop.api.cache_identity)
+    assert cursor is not None
+    assert cursor.length == len(common)
+    assert cursor.segments[-1].offset + cursor.segments[-1].length == cursor.length
+
+    fake.write(t, prompt("E" * 1000), tool_call())
+    result = sync(laptop, t)
+    assert result.diverged
+    entry, manifest = log_entry(server, t.stem)
+    assert manifest["state"]["state"] == "conflicted"
+    root = next(g for g in entry["generations"] if g["cause"] == "root")
+    branch = next(g for g in entry["generations"] if g["cause"] == "diverge")
+    assert branch["fork_offset"] == len(common)
+    key = SessionKey("default", "claude-code", t.stem)
+    assert server.store.read_log(key, root["id"], 0, None) == t2.read_bytes()
+    assert server.store.read_log(key, branch["id"], 0, None) == t.read_bytes()
+
+
 def test_two_hosts_diverge(server: Server, fake: FakeClaude, tmp_path: Path) -> None:
     t = fake.transcript(WS)
     fake.write(t, prompt("one"))

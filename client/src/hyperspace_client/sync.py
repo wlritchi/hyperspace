@@ -322,7 +322,9 @@ class Syncer:
             self.result.diverged = True
             return
         cursor.segments.append(Segment(cursor.length, len(chunk), _sha(chunk)))
-        cursor.length = response["length"]
+        # A retry can return a length that includes another host's bytes.
+        # Advance only past the segment that this request confirmed.
+        cursor.length += len(chunk)
         self.ctx.state.save_cursor(cursor)
         self.result.uploaded += len(chunk)
         self.result.session = response["session"]
