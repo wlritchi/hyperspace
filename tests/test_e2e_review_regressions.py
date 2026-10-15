@@ -17,7 +17,7 @@ from hyperspace_client.adapters import LocalFile
 from hyperspace_client.adapters.claude_code import sanitize_path
 from hyperspace_client.api import ApiError
 from hyperspace_client.sync import Syncer
-from hyperspace_client.teleport import restore
+from hyperspace_client.teleport import TeleportError, restore, send
 from hyperspace_protocol import (
     HEADER_WORKSPACE_UTF8,
     decode_workspace,
@@ -45,6 +45,17 @@ def hosts(tmp_path):
     a.state.close()
     b.state.close()
     server.close()
+
+
+def test_send_refuses_partial_tail(hosts):
+    _, laptop, _, a, _, t = hosts
+    with t.open("ab") as f:
+        f.write(b'{"partial":')
+    local = t.read_bytes()
+    with pytest.raises(TeleportError, match="unuploaded bytes"):
+        send(a, laptop.adapter, t.stem, "agent-1")
+    assert t.read_bytes() == local
+    assert a.api.state(H, t.stem)["lease"]["host"] == "laptop"
 
 
 def test_blob_cache_is_scoped_by_session(hosts):

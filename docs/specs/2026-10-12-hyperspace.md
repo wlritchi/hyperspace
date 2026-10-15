@@ -282,7 +282,8 @@ state of agent-initiated teleport (see "Later").
      conservatively blocks the move when its start time cannot be compared. If
      the session runs, stop.
   2. Sync the session. If the server cannot be reached, stop: a surrender must
-     not leave bytes that only this host has.
+     not leave bytes that only this host has. This includes an incomplete last
+     JSONL record: surrender stops until that record can be backed up.
   3. Move the local transcript aside, to
      `<sid>.jsonl.hyperspace-surrendered-<time>`, so that `claude --resume` on
      this host does not find it. The side files stay; they do not make the

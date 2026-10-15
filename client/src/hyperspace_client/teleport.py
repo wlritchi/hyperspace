@@ -107,6 +107,16 @@ def send(
     to_host: str | None,
 ) -> str:
     """Surrender this host's lease. Return a message for the user."""
+    validate_session_id(session_id)
+    with ctx.state.try_lock(adapter.harness, session_id) as locked:
+        if not locked:
+            raise TeleportError("another sync of this session is running")
+        return _send(ctx, adapter, session_id, to_host)
+
+
+def _send(
+    ctx: Context, adapter: ClaudeCode, session_id: str, to_host: str | None
+) -> str:
     harness = adapter.harness
     if adapter.is_running(session_id):
         raise TeleportError(
@@ -118,14 +128,54 @@ def send(
         session = adapter.session_for_transcript(transcript)
         assert session is not None
         workspace = record.workspace or adapter.first_cwd(session) or str(Path.cwd())
-        with ctx.state.try_lock(harness, session_id) as locked:
-            if not locked:
-                raise TeleportError("another sync of this session is running")
-            Syncer(ctx, session, workspace).run()
+        result = Syncer(ctx, session, workspace).run()
+        if result.errors:
+            raise TeleportError("cannot surrender: " + "; ".join(result.errors))
+        metadata = ctx.state.session(harness, session_id).metadata
+        for f in adapter.files(session, metadata):
+            if not f.path.exists():
+                continue
+            data = f.path.read_bytes()
+            cursor = ctx.state.cursor(f.path, ctx.api.cache_identity)
+            if f.kind == "log" or cursor is not None:
+                if (cursor is None and data) or (
+                    cursor is not None
+                    and (
+                        cursor.length != len(data)
+                        or any(
+                            hashlib.sha256(
+                                data[s.offset : s.offset + s.length]
+                            ).hexdigest()
+                            != s.sha256
+                            for s in cursor.segments
+                        )
+                    )
+                ):
+                    raise TeleportError(
+                        f"cannot surrender: {f.rel_path} has unuploaded bytes"
+                    )
+            else:
+                known = ctx.state.blob(
+                    f.path, ctx.api.cache_identity, harness, session_id, f.rel_path
+                )
+                if known is None or known[2] != hashlib.sha256(data).hexdigest():
+                    raise TeleportError(
+                        f"cannot surrender: {f.rel_path} has unuploaded bytes"
+                    )
+    if adapter.is_running(session_id):
+        raise TeleportError("session started during sync; stop it before surrender")
     if to_host is not None and to_host != ctx.host:
         ctx.api.grant(harness, session_id, to_host)
-    state = ctx.api.surrender(harness, session_id, to_host)
-    moved = [move_aside(t, ctx.state) for t in local]
+    moved: list[Path] = []
+    try:
+        for transcript in local:
+            moved.append(move_aside(transcript, ctx.state))
+        state = ctx.api.surrender(harness, session_id, to_host)
+    except BaseException:
+        for transcript, backup in zip(local, moved, strict=False):
+            os.replace(backup, transcript)
+        raise
+    record = ctx.state.session(harness, session_id)
     _note_lease(record, state, ctx.host)
     ctx.state.save_session(record)
     where = f"on {to_host}" if to_host else "on the target host"
