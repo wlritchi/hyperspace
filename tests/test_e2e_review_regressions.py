@@ -169,3 +169,17 @@ def test_restore_into_long_workspace(hosts):
     result = restore(b, agent.adapter, t.stem, workspace, steal=True)
     assert result.transcript.read_bytes() == t.read_bytes()
     assert len(result.transcript.parent.name) <= 208
+
+
+def test_fork_creator_with_own_read_scope_can_upload(tmp_path):
+    server = make_server(
+        tmp_path / "server", {"own": ("runner", {"read", "append"}, "own")}
+    )
+    try:
+        api = server.api("own")
+        g = api.create_generation(H, "source", WS, "transcript.jsonl", "root")
+        api.append(H, "source", WS, g["id"], 0, b"record\n", 1)
+        event = api.fork(H, "source", g["id"], 7)
+        api.create_generation(H, event["session_id"], WS, "transcript.jsonl", "root")
+    finally:
+        server.close()

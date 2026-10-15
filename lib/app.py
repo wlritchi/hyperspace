@@ -610,7 +610,9 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
         offset = body.get("offset")
         if not isinstance(offset, int):
             raise ApiError("bad_request", "offset must be an integer")
-        event = await run_in_threadpool(store.create_fork, key, generation, offset)
+        event = await run_in_threadpool(
+            store.create_fork, key, generation, offset, principal.host
+        )
         return JSONResponse(event)
 
     @authed("grant")

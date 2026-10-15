@@ -1086,7 +1086,9 @@ class Store:
 
     # --- Forks ----------------------------------------------------------
 
-    def create_fork(self, key: SessionKey, generation: str, offset: int) -> ForkEvent:
+    def create_fork(
+        self, key: SessionKey, generation: str, offset: int, host: str | None = None
+    ) -> ForkEvent:
         """Record a recovery fork of `generation` up to `offset`.
 
         The new session has no files yet. The client uploads the forked copy
@@ -1118,6 +1120,13 @@ class Store:
                     offset,
                 ),
             )
+            if host is not None:
+                # A fork belongs to its creator even before its first upload.
+                self._db.execute(
+                    "UPDATE sessions SET lease_state = 'held', lease_host = ?, "
+                    "lease_since = ? WHERE account = ? AND harness = ? AND session_id = ?",
+                    (host, now, key.account, key.harness, new_id),
+                )
         return {
             "session_id": new_id,
             "source_generation": generation,
