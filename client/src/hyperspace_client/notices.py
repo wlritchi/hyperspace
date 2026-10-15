@@ -33,6 +33,9 @@ def session_start_notice(
     source: str | None,
 ) -> str:
     """The text for the SessionStart hook to print. Local state only."""
+    pending = pending_restore_decision(state, session)
+    if pending is not None:
+        return pending["reason"]
     parts: list[str] = []
     arrival = state.take_arrival(session.harness, session.session_id)
     record = state.session(session.harness, session.session_id)
@@ -79,12 +82,31 @@ def _problem(record: SessionRecord, host: str) -> str | None:
     return None
 
 
+def pending_restore_decision(
+    state: State, session: LocalSession
+) -> dict[str, str] | None:
+    if not state.get(f"restore_pending:{session.harness}:{session.session_id}"):
+        return None
+    return {
+        "decision": "block",
+        "reason": (
+            "[hyperspace] This session has an unfinished restore. Backup and resume "
+            "are blocked until its lease and files are reconciled. Stop this session, "
+            f"then run `hyperspace restore {session.session_id}` in the target workspace. "
+            "If it reports a conflict, use `hyperspace fork` to recover a branch."
+        ),
+    }
+
+
 def check_resume(ctx: Context, session: LocalSession) -> dict[str, str] | None:
     """For the UserPromptSubmit hook: at the first prompt after a resume,
     return a block decision if another host holds the lease or the session
     is conflicted. If the saved state is older than the resume, ask the
     server (with a short timeout). If the server cannot be reached, permit
     the prompt."""
+    pending = pending_restore_decision(ctx.state, session)
+    if pending is not None:
+        return pending
     key = _resumed_key(session)
     resumed = ctx.state.get(key)
     if resumed is None:
@@ -129,6 +151,7 @@ def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None
         record.held_lease
         and record.state != "conflicted"
         and record.lease_state == "held"
+        and not ctx.state.get(f"restore_pending:{session.harness}:{session.session_id}")
         and _fully_synced(ctx.state, session.transcript, ctx.api.cache_identity)
         and not adapter.is_running(session.session_id)
     )

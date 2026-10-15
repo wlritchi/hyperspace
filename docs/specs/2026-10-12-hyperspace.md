@@ -381,7 +381,9 @@ If a lease response is lost or returns a server error, the client retries with
 the same id. If confirmation remains unavailable, including an authentication
 or rate-limit failure on the retry, it keeps the complete files and the
 pending request (id, snapshot, and target). A later restore reconciles that
-same request. It does not guess whether the server committed.
+same request. It does not guess whether the server committed. While pending,
+every synchronous prompt check blocks, even without a credential or a fresh
+resume check, and sync does not upload the files.
 
 The session id stays the same. A session can teleport any number of times, and
 back to a host where it was before.

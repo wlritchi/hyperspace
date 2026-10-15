@@ -406,6 +406,10 @@ class Syncer:
 
     def run(self) -> SyncResult:
         state = self.ctx.state
+        if state.get(f"restore_pending:{self._h}:{self._sid}"):
+            raise ApiError(
+                409, "restore_pending", "retry restore before syncing this session"
+            )
         record = state.session(self._h, self._sid)
         record.workspace = self.workspace
         record.transcript = str(self.session.transcript)

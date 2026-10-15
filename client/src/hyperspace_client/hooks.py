@@ -31,7 +31,11 @@ import httpx
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.config import Config, ConfigError
-from hyperspace_client.notices import check_resume, session_start_notice
+from hyperspace_client.notices import (
+    check_resume,
+    pending_restore_decision,
+    session_start_notice,
+)
 from hyperspace_client.state import State
 from hyperspace_client.sync import Context
 
@@ -115,6 +119,9 @@ def handle(payload: dict[str, Any], cfg: Config, start: Detach = detach) -> str:
     if event == "UserPromptSubmit":
         state = State(cfg.state_dir)
         try:
+            pending = pending_restore_decision(state, session)
+            if pending is not None:
+                return json.dumps(pending)
             notices = state.take_notices(session.harness, session.session_id)
             decision = None
             try:

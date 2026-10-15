@@ -348,6 +348,29 @@ def test_restore_into_long_workspace(hosts):
     assert len(result.transcript.parent.name) <= 208
 
 
+def test_pending_restore_blocks_sync_and_held_retries(hosts, monkeypatch):
+    from hyperspace_client.cli import _restore_held
+
+    _, _, agent, _, b, t = hosts
+    original = b.api.teleport
+
+    def lost(*args, **kwargs):
+        original(*args, **kwargs)
+        raise httpx.ReadError("lost response")
+
+    monkeypatch.setattr(b.api, "teleport", lost)
+    with pytest.raises(TeleportError, match="confirmation"):
+        restore(b, agent.adapter, t.stem, WS, steal=True)
+    local = agent.adapter.project_dir(WS) / t.name
+    assert local.read_bytes() == t.read_bytes()
+    with pytest.raises(ApiError, match="restore_pending"):
+        Syncer(b, agent.adapter.session_for_transcript(local), WS).run()
+    monkeypatch.setattr(b.api, "teleport", original)
+    _restore_held(b, agent.adapter, WS)
+    assert not b.state.get(f"restore_pending:{H}:{t.stem}")
+    assert b.state.cursor(local, b.api.cache_identity) is not None
+
+
 def test_stale_lease_rejects_restore_even_with_steal(hosts):
     _, _, _, a, b, t = hosts
     revision = b.api.manifest(H, t.stem)["revision"]
@@ -405,6 +428,24 @@ def test_ambiguous_restore_preserves_files_and_reconciles_same_id(
     assert calls[-1] == calls[0]
     assert len(a.api.manifest(H, t.stem)["teleports"]) == 1
     assert not b.state.get(f"restore_pending:{H}:{t.stem}")
+
+
+def test_pending_restore_blocks_every_prompt_without_credentials(hosts):
+    from hyperspace_client.config import Config
+    from hyperspace_client.hooks import handle
+
+    _, _, agent, _, b, t = hosts
+    b.state.put(f"restore_pending:{H}:{t.stem}", WS)
+    cfg = Config(host="agent-1", state_dir=b.state.directory)
+    payload = {
+        "hook_event_name": "UserPromptSubmit",
+        "transcript_path": str(agent.adapter.project_dir(WS) / t.name),
+    }
+    for _ in range(2):
+        response = json.loads(handle(payload, cfg, start=lambda args: None))
+        assert response["decision"] == "block"
+        assert "unfinished restore" in response["reason"]
+        assert "hyperspace restore" in response["reason"]
 
 
 def test_log_cursors_do_not_cross_servers(hosts, tmp_path):
