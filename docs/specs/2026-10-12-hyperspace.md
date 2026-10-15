@@ -466,7 +466,11 @@ These are not activity:
 
 A resume that only opens the session and closes it again therefore adds no
 activity. A generation's _activity after offset X_ is the sum of the activity
-counts of its segments after X. One activity record is meaningful.
+counts of its segments that end after X. A fork offset can be inside a
+segment, and the server cannot tell where in a segment the activity is. Thus a
+segment that holds offset X counts in full. This can cause a false conflict,
+which a fork resolves, but it never hides a real conflict. One activity record
+is meaningful.
 
 If conflicts from harmless tool calls become a problem, a later version can
 classify some tool calls as free of side effects (for example, file reads) and

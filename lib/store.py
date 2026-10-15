@@ -1021,9 +1021,14 @@ class Store:
     # --- Branches and conflicts -----------------------------------------
 
     def _activity_after(self, gen: _Gen, offset: int, upto: int | None) -> int:
+        """Activity of the segments of `gen` that have bytes in the range
+        from `offset` to `upto`. A fork offset can be inside a segment, and
+        the server cannot tell where in a segment the activity is. Thus a
+        segment that crosses a limit of the range counts in full."""
         row = self._db.execute(
             "SELECT COALESCE(SUM(activity), 0) AS a FROM segments "
-            "WHERE generation = ? AND offset >= ? AND (? IS NULL OR offset < ?)",
+            "WHERE generation = ? AND offset + length > ? "
+            "AND (? IS NULL OR offset < ?)",
             (gen.id, offset, upto, upto),
         ).fetchone()
         return int(row["a"])

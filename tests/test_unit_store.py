@@ -260,6 +260,24 @@ def test_two_active_branches_conflict(store: Store) -> None:
     assert {b["host"] for b in state.get("branches", [])} == {"laptop", "agent-1"}
 
 
+def test_fork_inside_a_segment_counts_that_segment(store: Store) -> None:
+    # One append holds the shared prefix and the agent's new prompt. The
+    # laptop forks at a byte inside that segment (as `_adopt_remote` does at
+    # the first differing byte) and adds its own prompt. The server cannot
+    # tell where in the segment the agent's activity is, so it must count
+    # the full segment, and the session is conflicted.
+    g = root(store, writer=AGENT)
+    put(store, g, 0, b"common\nprompt A\n", writer=AGENT, activity=1)
+    fork = len(b"common\n")
+    d = store.create_generation(
+        KEY, PATH, LAPTOP, "diverge", parent=g, fork_offset=fork
+    )
+    put(store, d["id"], fork, b"prompt B\n", activity=1)
+    state = store.session_state(KEY)
+    assert state["state"] == "conflicted"
+    assert {b["host"] for b in state.get("branches", [])} == {"laptop", "agent-1"}
+
+
 def test_branch_with_only_metadata_does_not_conflict(store: Store) -> None:
     _diverge(store, laptop_activity=0, agent_activity=1)
     assert store.session_state(KEY)["state"] == "normal"
