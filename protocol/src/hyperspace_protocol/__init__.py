@@ -284,6 +284,7 @@ class LogManifest(TypedDict):
     generations: list[GenerationInfo]
     # The leaf of the active branch.
     active: str
+    versions: NotRequired[list[BlobVersion]]
 
 
 class BlobManifest(TypedDict):

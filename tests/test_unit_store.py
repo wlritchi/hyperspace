@@ -586,3 +586,20 @@ def test_existing_object_syncs_directories_before_commit(
     obj = store.objects._path(sha)
     for path in (obj.parent, store.objects.root, store.data_dir):
         assert _synced_before_commit(events, path), path
+
+
+def test_blob_promotion_keeps_latest_content(store: Store) -> None:
+    for data in (b"first", b"latest"):
+        store.put_blob(KEY, PATH, LAPTOP, data, hashlib.sha256(data).hexdigest())
+    gen = store.create_generation(KEY, PATH, LAPTOP, "root")
+    assert gen["length"] == len(b"latest")
+    assert store.read_log(KEY, gen["id"], 0, None) == b"latest"
+    assert store.read_blob(KEY, PATH, 1) == b"first"
+    assert store.read_blob(KEY, PATH, 2) == b"latest"
+    with pytest.raises(StoreError) as err:
+        store.create_generation(KEY, PATH, LAPTOP, "root")
+    assert err.value.code == "exists"
+    store.purge_generation(KEY, gen["id"], "test")
+    assert store.read_blob(KEY, PATH, 2) == b"latest"
+    assert store.manifest(KEY)["files"][0]["kind"] == "blob"
+    assert store.purge_session(KEY, "test")["blob_versions"] == 2

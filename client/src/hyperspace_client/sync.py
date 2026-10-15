@@ -364,9 +364,8 @@ class Syncer:
 
     def _as_log(self, f: LocalFile) -> bool:
         """A file of the blob kind that is too large for one request goes
-        up as a log, in chunks. Such files (tool results, file-history
-        snapshots) do not change after Claude Code writes them, so a log
-        keeps the same content. Once a file is a log, it stays a log."""
+        up as a log, in chunks. The server then keeps the path as a log, so
+        a file with a log cursor stays a log."""
         if self.ctx.state.cursor(f.path, self.ctx.api.cache_identity) is not None:
             return True
         try:
@@ -374,23 +373,32 @@ class Syncer:
         except FileNotFoundError:
             return False
 
-    def sync_blob(self, f: LocalFile) -> None:
+    def sync_blob(self, f: LocalFile) -> bool:
+        """Upload a changed blob. Return False if the server keeps the path
+        as a log, for example after a lost log cursor."""
         try:
             st = f.path.stat()
         except FileNotFoundError:
-            return
+            return True
         known = self.ctx.state.blob(
             f.path, self.ctx.api.cache_identity, self._h, self._sid, f.rel_path
         )
         if known is not None and known[:2] == (st.st_size, st.st_mtime_ns):
-            return
+            return True
         if st.st_size > MAX_BODY:
             self.result.errors.append(f"{f.rel_path}: larger than {MAX_BODY} bytes")
-            return
+            return True
         data = f.path.read_bytes()
         digest = _sha(data)
         if known is None or known[2] != digest:
-            self.ctx.api.put_blob(self._h, self._sid, self.workspace, f.rel_path, data)
+            try:
+                self.ctx.api.put_blob(
+                    self._h, self._sid, self.workspace, f.rel_path, data
+                )
+            except ApiError as exc:
+                if exc.code != "wrong_kind":
+                    raise
+                return False
             self.result.uploaded += len(data)
             self.result.files += 1
         self.ctx.state.save_blob(
@@ -403,6 +411,7 @@ class Syncer:
             self._sid,
             f.rel_path,
         )
+        return True
 
     # --- Session -------------------------------------------------------------------
 
@@ -425,10 +434,8 @@ class Syncer:
         for f in self.ctx.adapter.files(self.session, metadata):
             if f.kind != "blob":
                 continue
-            if self._as_log(f):
+            if self._as_log(f) or not self.sync_blob(f):
                 metadata = self.sync_log(LocalFile(f.rel_path, "log", f.path), metadata)
-            else:
-                self.sync_blob(f)
         server_meta = {"workspace": self.workspace, **_server_metadata(metadata)}
         if server_meta != record.sent_metadata and self.result.files:
             self.ctx.api.add_metadata(

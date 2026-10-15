@@ -205,7 +205,17 @@ than one session, and a session can leave its first workspace.
   - A **log** is a byte stream that grows at the end (JSONL transcripts).
   - A **blob** is a sequence of complete versions (tool results, meta files,
     plan files, file-history snapshots). The server stores a new version only
-    when the content hash changes.
+    when the content hash changes. A blob that exceeds the request body limit
+    becomes a log. A root-generation request makes this change in one
+    transaction and copies the latest blob version into the root with zero
+    activity. Thus an interrupted upload keeps the last complete version
+    available. Earlier blob versions remain readable through the blob endpoint
+    and appear in the log manifest's optional `versions` list. Only an admin
+    purge of all generations can change the kind back to blob. If the server
+    refuses a blob upload with `wrong_kind` because the path is a log, the
+    client sends the file as a log. Thus a lost log cursor does not stop the
+    backup of a small file. Later changes use the usual log rewrite and
+    divergence rules.
 - **Generation.** The server history of a log is a tree of generations. A
   generation has a parent generation, a fork offset in the parent, and its own
   bytes. The content of a generation is the first `fork offset` bytes of its

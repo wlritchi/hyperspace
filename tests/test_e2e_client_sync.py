@@ -504,3 +504,36 @@ def test_unchanged_files_are_not_hashed(
     monkeypatch.undo()
     fake.write(t, prompt("more"))
     assert sync(ctx, t).uploaded > 0
+
+
+def test_blob_growth_promotes_without_losing_history(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    ctx = context(server.api("laptop"), tmp_path / "state", fake, "laptop")
+    t = fake.transcript(WS)
+    fake.write(t, prompt("hi"))
+    side = t.with_suffix("") / "tool-results" / "growing.bin"
+    side.parent.mkdir(parents=True)
+    side.write_bytes(b"old")
+    sync(ctx, t)
+    path = "tool-results/growing.bin"
+    key = SessionKey("default", "claude-code", t.stem)
+    big = b"x" * (9 * 1024 * 1024)
+    side.write_bytes(big)
+    sync(ctx, t)
+    # A sync with cursors does not read the manifest for its blobs.
+    reads = server.store._db.execute(
+        "SELECT COUNT(*) FROM read_audit WHERE what = 'manifest'"
+    ).fetchone()[0]
+    assert reads == 0
+    assert active_bytes(server, t.stem, path) == big
+    entry, _ = log_entry(server, t.stem, path)
+    assert entry["versions"][0]["size"] == 3
+    assert server.store.read_blob(key, path, 1) == b"old"
+    # Lost cursors must not change a promoted file back to a blob.
+    ctx = context(server.api("laptop"), tmp_path / "fresh-state", fake, "laptop")
+    side.write_bytes(b"small again")
+    sync(ctx, t)
+    assert active_bytes(server, t.stem, path) == b"small again"
+    server.store.purge_blob_version(key, path, 1, "test")
+    assert active_bytes(server, t.stem, path) == b"small again"

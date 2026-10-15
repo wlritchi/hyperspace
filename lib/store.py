@@ -544,10 +544,20 @@ class Store:
         A file's first generation has no parent and the cause `root` (or
         `fork` for the first file of a recovery fork). A later generation
         needs a parent in the same file and a fork offset that is not more
-        than the parent's length.
+        than the parent's length. A first generation of a blob path changes
+        the path to a log, and starts with the latest blob version.
         """
         with self._tx():
             session = self._ensure_session(key)
+            previous = self._file_row(session["id"], path)
+            seed: bytes | None = None
+            if previous is not None and previous["kind"] == "blob":
+                if parent is not None or cause not in ("root", "fork"):
+                    raise StoreError("bad_request", "promotion needs a root")
+                seed = self.read_blob(key, path, None)
+                self._db.execute(
+                    "UPDATE files SET kind = 'log' WHERE id = ?", (previous["id"],)
+                )
             file = self._ensure_file(session["id"], path, "log")
             existing = self._gens_of_file(file)
             if parent is None:
@@ -597,6 +607,19 @@ class Store:
                     gen.last_append,
                 ),
             )
+            if seed:
+                # Keep the latest complete version active if the client stops
+                # before it sends the larger file. Older versions stay blobs.
+                self.append(
+                    key,
+                    gen.id,
+                    writer,
+                    0,
+                    seed,
+                    hashlib.sha256(seed).hexdigest(),
+                    0,
+                )
+                gen = self._gen(gen.id)
         return self._gen_info(gen)
 
     def append(
@@ -745,7 +768,7 @@ class Store:
     def read_blob(self, key: SessionKey, path: str, version: int | None) -> bytes:
         session = self._require_session(key)
         file = self._file_row(session["id"], path)
-        if file is None or file["kind"] != "blob":
+        if file is None:
             raise NotFound("file")
         if version is None:
             row = self._db.execute(
@@ -1442,7 +1465,15 @@ class Store:
                 "SELECT COUNT(*) FROM generations WHERE file = ?", (gen.file,)
             ).fetchone()[0]
             if left == 0:
-                self._db.execute("DELETE FROM files WHERE id = ?", (gen.file,))
+                versions = self._db.execute(
+                    "SELECT COUNT(*) FROM blob_versions WHERE file = ?", (gen.file,)
+                ).fetchone()[0]
+                if versions:
+                    self._db.execute(
+                        "UPDATE files SET kind = 'blob' WHERE id = ?", (gen.file,)
+                    )
+                else:
+                    self._db.execute("DELETE FROM files WHERE id = ?", (gen.file,))
             self._record_purge(
                 f"generation {key.account}/{key.harness}/{key.session_id}/"
                 f"{generation} (+{len(generations) - 1} forked)",
@@ -1457,7 +1488,7 @@ class Store:
         with self._tx():
             session = self._require_session(key)
             file = self._file_row(session["id"], path)
-            if file is None or file["kind"] != "blob":
+            if file is None:
                 raise NotFound("file")
             row = self._db.execute(
                 "SELECT sha256 FROM blob_versions WHERE file = ? AND version = ?",
@@ -1472,7 +1503,7 @@ class Store:
             left = self._db.execute(
                 "SELECT COUNT(*) FROM blob_versions WHERE file = ?", (file["id"],)
             ).fetchone()[0]
-            if left == 0:
+            if left == 0 and file["kind"] == "blob":
                 self._db.execute("DELETE FROM files WHERE id = ?", (file["id"],))
             orphans = self._unreferenced({row["sha256"]})
             self._record_purge(
@@ -1502,6 +1533,14 @@ class Store:
                         "kind": "log",
                         "generations": [self._gen_info(g) for g in gens],
                         "active": active.id,
+                        "versions": [
+                            self._blob_version(v)
+                            for v in self._db.execute(
+                                "SELECT * FROM blob_versions WHERE file = ? "
+                                "ORDER BY version",
+                                (f["id"],),
+                            ).fetchall()
+                        ],
                     }
                 )
             else:
