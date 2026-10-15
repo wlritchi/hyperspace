@@ -434,6 +434,16 @@ class Store:
     def session_exists(self, key: SessionKey) -> bool:
         return self._session_row(key) is not None
 
+    def write_authorized[T](
+        self, key: SessionKey, host: str, scope: ReadScope, operation: Callable[[], T]
+    ) -> T:
+        """Check access and write in the same database transaction."""
+        with self._tx():
+            session = self._session_row(key)
+            if session is not None and not self._can_read_row(session, host, scope):
+                raise NotFound("session")
+            return operation()
+
     # --- Files ----------------------------------------------------------
 
     def _file_row(self, session: int, path: str) -> sqlite3.Row | None:

@@ -573,7 +573,13 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
         await require_writable(key, principal)
         body = await read_json(request)
         w = writer(request, principal)
-        await run_in_threadpool(store.add_metadata, key, w, body)  # type: ignore[arg-type]
+        await run_in_threadpool(
+            store.write_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.add_metadata(key, w, body),
+        )
         return JSONResponse({"ok": True})
 
     @authed("append")
@@ -639,13 +645,11 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
             raise ApiError("bad_request", "fork_offset must be an integer")
         w = writer(request, principal)
         info = await run_in_threadpool(
-            store.create_generation,
+            store.write_authorized,
             key,
-            path,
-            w,
-            cause,
-            parent,
-            fork_offset,  # type: ignore[arg-type]
+            principal.host,
+            principal.read,
+            lambda: store.create_generation(key, path, w, cause, parent, fork_offset),
         )
         return JSONResponse(info)
 
@@ -667,7 +671,13 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
         if not limiter.add_bytes(principal.credential, len(data)):
             raise ApiError("rate_limited", "daily byte quota is used up")
         info, state = await run_in_threadpool(
-            store.append, key, generation, w, base_length, data, sha256, activity
+            store.write_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.append(
+                key, generation, w, base_length, data, sha256, activity
+            ),
         )
         return JSONResponse(
             {"generation": info["id"], "length": info["length"], "session": state}
@@ -698,7 +708,13 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
         data = await read_data(request)
         if not limiter.add_bytes(principal.credential, len(data)):
             raise ApiError("rate_limited", "daily byte quota is used up")
-        version = await run_in_threadpool(store.put_blob, key, path, w, data, sha256)
+        version = await run_in_threadpool(
+            store.write_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.put_blob(key, path, w, data, sha256),
+        )
         return JSONResponse(version)
 
     @authed("read")

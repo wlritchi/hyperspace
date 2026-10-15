@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
 import threading
 
+import httpx
 import pytest
 
 from _hs import FakeClaude, context, make_server, prompt
@@ -94,6 +96,45 @@ def test_old_invalid_metadata_is_safe_after_upgrade(hosts):
     g = a.api.manifest(H, t.stem)["files"][0]["generations"][0]
     a.api.append(H, t.stem, "/new", g["id"], g["length"], b"new\n", 0)
     assert a.api.manifest(H, t.stem)["metadata"] == {"custom": "keep"}
+
+
+def test_generation_authorization_is_rechecked_after_body(hosts):
+    server, _, _, _, _, _ = hosts
+
+    async def exercise():
+        ready, finish = asyncio.Event(), asyncio.Event()
+        transport = httpx.ASGITransport(app=server.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as c:
+            path = f"/v1/sessions/{H}/new-raced-session"
+
+            def headers(who):
+                return {
+                    "Authorization": f"Bearer {server.tokens[who]}",
+                    "Hyperspace-Workspace": WS,
+                }
+
+            async def body():
+                ready.set()
+                await finish.wait()
+                yield b'{"path":"runner.jsonl","cause":"root"}'
+
+            pending = asyncio.create_task(
+                c.post(path + "/generations", headers=headers("agent"), content=body())
+            )
+            await ready.wait()
+            response = await c.post(
+                path + "/generations",
+                headers=headers("laptop"),
+                json={"path": "transcript.jsonl", "cause": "root"},
+            )
+            assert response.status_code == 200
+            finish.set()
+            assert (await pending).status_code == 404
+            assert (await c.get(path, headers=headers("agent"))).status_code == 404
+
+    asyncio.run(exercise())
 
 
 def test_purge_rechecks_objects_after_commit(tmp_path, monkeypatch):
