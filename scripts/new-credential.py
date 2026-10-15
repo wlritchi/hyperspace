@@ -16,9 +16,12 @@ changes. Only the sha256 of the secret is stored.
 # ///
 
 import argparse
+import fcntl
 import os
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -43,6 +46,18 @@ def data_dir() -> Path:
         return Path(os.environ["HYPERSPACE_DATA_DIR"])
     base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
     return Path(base) / "hyperspace"
+
+
+@contextmanager
+def locked_accounts(path: Path) -> Iterator[None]:
+    """Lock a stable sidecar: the accounts file itself is replaced on write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path.with_suffix(".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def write_accounts(path: Path, accounts: Accounts) -> None:
@@ -97,12 +112,13 @@ def main() -> int:
         label=args.label,
     )
     try:
-        accounts = load_accounts(path)
-        account = accounts.accounts.get(args.account, Account(id=args.account))
-        accounts.accounts[args.account] = replace(
-            account, credentials=(*account.credentials, credential)
-        )
-        write_accounts(path, accounts)
+        with locked_accounts(path):
+            accounts = load_accounts(path)
+            account = accounts.accounts.get(args.account, Account(id=args.account))
+            accounts.accounts[args.account] = replace(
+                account, credentials=(*account.credentials, credential)
+            )
+            write_accounts(path, accounts)
     except AccountsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

@@ -39,17 +39,20 @@ def main() -> int:
     args = parser.parse_args()
     path = (args.data_dir or _new.data_dir()) / "accounts.toml"
     try:
-        accounts = _new.load_accounts(path)
-        found = False
-        for account_id, account in list(accounts.accounts.items()):
-            kept = tuple(c for c in account.credentials if c.id != args.credential_id)
-            if len(kept) != len(account.credentials):
-                found = True
-                accounts.accounts[account_id] = replace(account, credentials=kept)
-        if not found:
-            print(f"error: no credential {args.credential_id}", file=sys.stderr)
-            return 1
-        _new.write_accounts(path, accounts)
+        with _new.locked_accounts(path):
+            accounts = _new.load_accounts(path)
+            found = False
+            for account_id, account in list(accounts.accounts.items()):
+                kept = tuple(
+                    c for c in account.credentials if c.id != args.credential_id
+                )
+                if len(kept) != len(account.credentials):
+                    found = True
+                    accounts.accounts[account_id] = replace(account, credentials=kept)
+            if not found:
+                print(f"error: no credential {args.credential_id}", file=sys.stderr)
+                return 1
+            _new.write_accounts(path, accounts)
     except AccountsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
