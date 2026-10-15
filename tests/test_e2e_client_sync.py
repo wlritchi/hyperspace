@@ -177,7 +177,7 @@ def test_unreachable_server_then_recovery(
     )
     with pytest.raises(httpx.HTTPError):
         sync(down, t)
-    assert down.state.cursor(t) is None
+    assert down.state.cursor(t, down.api.cache_identity) is None
     fake.write(t, prompt("two"))
     ctx = context(server.api("laptop"), state_dir, fake, "laptop")
     sync(ctx, t)
@@ -205,7 +205,7 @@ def test_lost_cursor_save_is_adopted(
     t = fake.transcript(WS)
     fake.write(t, prompt("one"))
     sync(ctx, t)
-    saved = ctx.state.cursor(t)
+    saved = ctx.state.cursor(t, ctx.api.cache_identity)
     assert saved is not None
     fake.write(t, prompt("two"), prompt("three"))
     sync(ctx, t)

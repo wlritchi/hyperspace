@@ -19,8 +19,9 @@ from pathlib import Path
 from typing import Any
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS cursors (
-    local_path TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS remote_cursors (
+    server TEXT NOT NULL,
+    local_path TEXT NOT NULL,
     harness TEXT NOT NULL,
     session_id TEXT NOT NULL,
     rel_path TEXT NOT NULL,
@@ -28,7 +29,10 @@ CREATE TABLE IF NOT EXISTS cursors (
     length INTEGER NOT NULL,
     dev INTEGER NOT NULL,
     ino INTEGER NOT NULL,
-    segments TEXT NOT NULL
+    segments TEXT NOT NULL,
+    size INTEGER NOT NULL DEFAULT -1,
+    mtime_ns INTEGER NOT NULL DEFAULT -1,
+    PRIMARY KEY (server, local_path)
 );
 CREATE TABLE IF NOT EXISTS session_blobs (
     server TEXT NOT NULL,
@@ -106,6 +110,7 @@ class Cursor:
     # it to the end. If they and the inode are the same, nothing changed.
     size: int = -1
     mtime_ns: int = -1
+    server: str = ""
 
 
 @dataclass
@@ -139,12 +144,8 @@ class State:
         # adopts the server copy.
         self._db.execute("PRAGMA synchronous = NORMAL")
         self._db.executescript(_SCHEMA)
-        columns = {r[1] for r in self._db.execute("PRAGMA table_info(cursors)")}
-        for column in ("size", "mtime_ns"):
-            if column not in columns:
-                self._db.execute(
-                    f"ALTER TABLE cursors ADD COLUMN {column} INTEGER NOT NULL DEFAULT -1"
-                )
+        # Legacy cursors have no trustworthy server identity. Leave their
+        # table untouched, but never reuse them: sync adopts remote bytes.
         columns = {r[1] for r in self._db.execute("PRAGMA table_info(sessions)")}
         if "held_lease" not in columns:
             self._db.execute(
@@ -179,9 +180,10 @@ class State:
 
     # --- Cursors -------------------------------------------------------------
 
-    def cursor(self, local_path: Path) -> Cursor | None:
+    def cursor(self, local_path: Path, server: str) -> Cursor | None:
         row = self._db.execute(
-            "SELECT * FROM cursors WHERE local_path = ?", (str(local_path),)
+            "SELECT * FROM remote_cursors WHERE server = ? AND local_path = ?",
+            (server, str(local_path)),
         ).fetchone()
         if row is None:
             return None
@@ -197,16 +199,18 @@ class State:
             segments=[Segment(*s) for s in json.loads(row["segments"])],
             size=row["size"],
             mtime_ns=row["mtime_ns"],
+            server=row["server"],
         )
 
     def save_cursor(self, cursor: Cursor) -> None:
         segments = json.dumps([[s.offset, s.length, s.sha256] for s in cursor.segments])
         with self._db:
             self._db.execute(
-                "INSERT OR REPLACE INTO cursors (local_path, harness, session_id, "
+                "INSERT OR REPLACE INTO remote_cursors (server, local_path, harness, session_id, "
                 "rel_path, generation, length, dev, ino, segments, size, mtime_ns) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
+                    cursor.server,
                     cursor.local_path,
                     cursor.harness,
                     cursor.session_id,
@@ -224,13 +228,13 @@ class State:
     def forget_cursor(self, local_path: Path) -> None:
         with self._db:
             self._db.execute(
-                "DELETE FROM cursors WHERE local_path = ?", (str(local_path),)
+                "DELETE FROM remote_cursors WHERE local_path = ?", (str(local_path),)
             )
 
     def move_cursor(self, old: Path, new: Path) -> None:
         with self._db:
             self._db.execute(
-                "UPDATE cursors SET local_path = ? WHERE local_path = ?",
+                "UPDATE remote_cursors SET local_path = ? WHERE local_path = ?",
                 (str(new), str(old)),
             )
 

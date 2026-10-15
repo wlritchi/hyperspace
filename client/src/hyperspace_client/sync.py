@@ -133,6 +133,7 @@ class Syncer:
     def _new_cursor(self, f: LocalFile, generation: str, st: os.stat_result) -> Cursor:
         return Cursor(
             local_path=str(f.path),
+            server=self.ctx.api.cache_identity,
             harness=self._h,
             session_id=self._sid,
             rel_path=f.rel_path,
@@ -203,8 +204,12 @@ class Syncer:
 
     def _prepare_cursor(self, f: LocalFile, st: os.stat_result) -> Cursor | None:
         state = self.ctx.state
-        cursor = state.cursor(f.path)
-        if cursor is None:
+        cursor = state.cursor(f.path, self.ctx.api.cache_identity)
+        if cursor is None or (cursor.harness, cursor.session_id, cursor.rel_path) != (
+            self._h,
+            self._sid,
+            f.rel_path,
+        ):
             return None
         if _unchanged(cursor, st):
             return cursor
@@ -360,7 +365,7 @@ class Syncer:
         up as a log, in chunks. Such files (tool results, file-history
         snapshots) do not change after Claude Code writes them, so a log
         keeps the same content. Once a file is a log, it stays a log."""
-        if self.ctx.state.cursor(f.path) is not None:
+        if self.ctx.state.cursor(f.path, self.ctx.api.cache_identity) is not None:
             return True
         try:
             return f.path.stat().st_size > MAX_BODY

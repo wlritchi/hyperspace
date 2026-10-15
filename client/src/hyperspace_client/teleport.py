@@ -296,6 +296,7 @@ def _restore_log(
     ctx.state.save_cursor(
         Cursor(
             local_path=str(path),
+            server=ctx.api.cache_identity,
             harness=harness,
             session_id=sid,
             rel_path=entry["path"],

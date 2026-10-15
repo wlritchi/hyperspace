@@ -824,7 +824,9 @@ dialog.
   byte quota) stops the scan, and the command exits with an error.
 - State is in `$XDG_STATE_HOME/hyperspace/state.sqlite3`: cursors for each
   local file, the last known placement of each session, arrival records, and
-  conflict and move notices.
+  conflict and move notices. Log cursors and blob caches are scoped to the
+  server and credential identity. Legacy log cursors without that identity are
+  not reused; the next sync compares and adopts the remote content.
 - If the server cannot be reached, the client keeps its cursors and exits with
   no error. The local files are the queue, so the next sync uploads the
   difference.

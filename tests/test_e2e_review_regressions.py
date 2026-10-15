@@ -231,6 +231,52 @@ def test_restore_into_long_workspace(hosts):
     assert len(result.transcript.parent.name) <= 208
 
 
+def test_log_cursors_do_not_cross_servers(hosts, tmp_path):
+    _, laptop, _, a, _, t = hosts
+    other = make_server(tmp_path / "other-server")
+    try:
+        api = other.api("laptop")
+        from hyperspace_client.sync import Context
+
+        ctx = Context(api, a.state, laptop.adapter, "laptop")
+        session = laptop.adapter.session_for_transcript(t)
+        Syncer(ctx, session, WS).run()
+        m = api.manifest(H, t.stem)
+        g = next(f for f in m["files"] if f["path"] == "transcript.jsonl")[
+            "generations"
+        ][0]
+        assert api.read_log(H, t.stem, g["id"], 0, g["length"]) == t.read_bytes()
+        laptop.write(t, prompt("new bytes"))
+        Syncer(ctx, session, WS).run()
+        Syncer(a, session, WS).run()
+        assert (
+            a.state.cursor(t, a.api.cache_identity).generation
+            != a.state.cursor(t, api.cache_identity).generation
+        )
+    finally:
+        other.close()
+
+
+def test_legacy_cursor_is_ignored_and_remote_copy_adopted(hosts):
+    _, laptop, _, a, _, t = hosts
+    a.state._db.execute(
+        "CREATE TABLE cursors (local_path TEXT PRIMARY KEY, generation TEXT)"
+    )
+    a.state._db.execute(
+        "INSERT INTO cursors VALUES (?, ?)", (str(t), "wrong-server-generation")
+    )
+    a.state._db.execute("DELETE FROM remote_cursors")
+    a.state._db.commit()
+    Syncer(a, laptop.adapter.session_for_transcript(t), WS).run()
+    assert (
+        a.state.cursor(t, a.api.cache_identity).generation != "wrong-server-generation"
+    )
+    entry = next(
+        f for f in a.api.manifest(H, t.stem)["files"] if f["path"] == "transcript.jsonl"
+    )
+    assert len(entry["generations"]) == 1
+
+
 def test_fork_creator_with_own_read_scope_can_upload(tmp_path):
     server = make_server(
         tmp_path / "server", {"own": ("runner", {"read", "append"}, "own")}

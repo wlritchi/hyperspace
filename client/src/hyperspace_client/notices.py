@@ -129,7 +129,7 @@ def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None
         record.held_lease
         and record.state != "conflicted"
         and record.lease_state == "held"
-        and _fully_synced(ctx.state, session.transcript)
+        and _fully_synced(ctx.state, session.transcript, ctx.api.cache_identity)
         and not adapter.is_running(session.session_id)
     )
     if not movable:
@@ -148,9 +148,9 @@ def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None
         )
 
 
-def _fully_synced(state: State, transcript: Path) -> bool:
+def _fully_synced(state: State, transcript: Path, server: str) -> bool:
     """True if the server has every byte of the local transcript."""
-    cursor = state.cursor(transcript)
+    cursor = state.cursor(transcript, server)
     if cursor is None:
         return False
     try:
