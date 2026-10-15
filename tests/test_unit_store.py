@@ -290,6 +290,46 @@ def test_rewrite_after_teleport_replaces_the_teleported_tail(store: Store) -> No
     assert active["kind"] == "log" and active["active"] == r["id"]
 
 
+@pytest.mark.parametrize("leftover_first", [True, False])
+def test_rewrite_after_steal_ignores_leftover_with_no_activity(
+    store: Store, leftover_first: bool
+) -> None:
+    g = root(store)
+    n = put(store, g, 0, b"one\n", activity=1)
+    n = put(store, g, n, b"failed\n", activity=1)
+    store.teleport(KEY, AGENT, steal=True)
+
+    def leftover() -> None:
+        # The laptop uploads bytes that it wrote before the steal. They have
+        # no activity, and the agent never saw them.
+        put(store, g, n, b"meta\n", activity=0)
+
+    if leftover_first:
+        leftover()
+    # The agent restored the file as one cursor segment, so its change to the
+    # restored bytes forks at offset 0.
+    r = store.create_generation(KEY, PATH, AGENT, "rewrite", parent=g, fork_offset=0)
+    m = put(store, r["id"], 0, b"one\n", writer=AGENT, activity=1)
+    put(store, r["id"], m, b"two\n", writer=AGENT, activity=1)
+    if not leftover_first:
+        leftover()
+    assert store.session_state(KEY)["state"] == "normal"
+    active = next(f for f in store.manifest(KEY)["files"] if f["path"] == PATH)
+    assert active["kind"] == "log" and active["active"] == r["id"]
+
+
+def test_rewrite_after_steal_keeps_leftover_with_activity(store: Store) -> None:
+    g = root(store)
+    n = put(store, g, 0, b"one\n", activity=1)
+    store.teleport(KEY, AGENT, steal=True)
+    put(store, g, n, b"laptop work\n", activity=1)
+    r = store.create_generation(KEY, PATH, AGENT, "rewrite", parent=g, fork_offset=0)
+    put(store, r["id"], 0, b"agent work\n", writer=AGENT, activity=1)
+    state = store.session_state(KEY)
+    assert state["state"] == "conflicted"
+    assert {b["generation"] for b in state.get("branches", [])} == {g, r["id"]}
+
+
 def test_teleport_before_other_appends_does_not_cover_them(store: Store) -> None:
     g = root(store)
     n = put(store, g, 0, b"base\n", activity=1)

@@ -514,7 +514,14 @@ Each new generation has a cause:
   replaced tail does not cause a conflict. Otherwise the host had a stale
   copy: the server keeps the parent branch and applies the same conflict rules
   as for `diverge`. Thus a stale host cannot hide the work of a different host
-  with a rewrite.
+  with a rewrite. When the server compares a rewrite branch with a different
+  branch, the activity of the different branch in the parent counts only after
+  the length of the parent that the host had. That length is the end of the
+  host's last append to the parent, or the length of the parent at the latest
+  teleport to the host, whichever is larger. The host saw the bytes before
+  that length and replaced them. Thus, after a steal, late bytes with no
+  activity from the old host do not make a rewrite of the restored bytes a
+  conflict, if they arrive before or after the rewrite.
 - `diverge`: the server refused an append with `409`, because a different
   append reached the same offset first.
 

@@ -1106,21 +1106,35 @@ class Store:
         path.reverse()
         return path
 
-    def _branch_activity(self, lineage: list[_Step], after: int) -> int:
-        """Activity in a lineage at offsets at or after `after`."""
+    def _branch_activity(
+        self, lineage: list[_Step], after: int, seen: tuple[str, int] | None = None
+    ) -> int:
+        """Activity in a lineage at offsets at or after `after`. If `seen`
+        is (generation, offset), the activity of that generation counts only
+        at offsets at or after the larger of `after` and `offset`."""
         total = 0
         for step in lineage:
-            if step.exit is not None and step.exit <= after:
+            start = after
+            if seen is not None and step.gen.id == seen[0]:
+                start = max(after, seen[1])
+            if step.exit is not None and step.exit <= start:
                 continue
-            total += self._activity_after(step.gen, after, step.exit)
+            total += self._activity_after(step.gen, start, step.exit)
         return total
 
     @staticmethod
-    def _divergence(a: list[_Step], b: list[_Step]) -> int:
-        """The offset where two lineages stop sharing bytes."""
+    def _shared_steps(a: list[_Step], b: list[_Step]) -> int:
+        """The number of generations at the start of two lineages that are
+        the same."""
         i = 0
         while i < min(len(a), len(b)) and a[i].gen.id == b[i].gen.id:
             i += 1
+        return i
+
+    @classmethod
+    def _divergence(cls, a: list[_Step], b: list[_Step]) -> int:
+        """The offset where two lineages stop sharing bytes."""
+        i = cls._shared_steps(a, b)
         last_a, last_b = a[i - 1], b[i - 1]
         exits = [e for e in (last_a.exit, last_b.exit) if e is not None]
         return min(exits) if exits else last_a.gen.length
@@ -1141,6 +1155,44 @@ class Store:
             (parent.file, rewrite.host, parent.last_append, rewrite.created),
         ).fetchone()
         return row is not None
+
+    def _rewrite_seen_length(self, parent: _Gen, rewrite: _Gen) -> int:
+        """Return the length of `parent` that the host of `rewrite` is known
+        to have had when it created `rewrite`.
+
+        The host had the bytes up to the end of its last append to `parent`.
+        It also had all bytes of `parent` that the server received before
+        the latest teleport to the host, because a teleport confirms a
+        restore of a current snapshot.
+        """
+        teleport = self._db.execute(
+            "SELECT MAX(t.created) AS created FROM teleports t "
+            "JOIN files f ON f.session = t.session "
+            "WHERE f.id = ? AND t.target_host = ? AND t.created <= ?",
+            (parent.file, rewrite.host, rewrite.created),
+        ).fetchone()["created"]
+        row = self._db.execute(
+            "SELECT COALESCE(MAX(offset + length), 0) AS seen FROM segments "
+            "WHERE generation = ? AND received <= ? "
+            "AND (host = ? OR received <= ?)",
+            (parent.id, rewrite.created, rewrite.host, teleport),
+        ).fetchone()
+        return max(int(row["seen"]), rewrite.fork_offset)
+
+    def _pair_activity(self, a: list[_Step], b: list[_Step]) -> int:
+        """Activity of lineage `a` after it separates from lineage `b`.
+
+        If `b` leaves the last shared generation through a `rewrite` child,
+        the bytes of that generation that the host of the rewrite had do not
+        count. That host saw these bytes and replaced them. Only the bytes
+        that it did not see can hold work that the rewrite hides.
+        """
+        i = self._shared_steps(a, b)
+        seen: tuple[str, int] | None = None
+        if i < len(b) and b[i].gen.cause == "rewrite":
+            parent = b[i - 1].gen
+            seen = (parent.id, self._rewrite_seen_length(parent, b[i].gen))
+        return self._branch_activity(a, self._divergence(a, b), seen)
 
     def _candidates(self, file: int) -> tuple[list[_Gen], dict[str, _Gen]]:
         """Return the branch tips of a log.
@@ -1190,13 +1242,14 @@ class Store:
         meaningful: list[tuple[_Gen, int]] = []
         scored: list[tuple[int, str, _Gen]] = []
         for t in tips:
-            others = [o for o in tips if o.id != t.id]
-            activity = 0
-            if others:
-                after = min(
-                    self._divergence(lineages[t.id], lineages[o.id]) for o in others
-                )
-                activity = self._branch_activity(lineages[t.id], after)
+            activity = max(
+                (
+                    self._pair_activity(lineages[t.id], lineages[o.id])
+                    for o in tips
+                    if o.id != t.id
+                ),
+                default=0,
+            )
             is_meaningful = activity >= MEANINGFUL_ACTIVITY
             if is_meaningful:
                 meaningful.append((t, activity))
@@ -1206,10 +1259,10 @@ class Store:
         conflicted = False
         for i, (a, _) in enumerate(meaningful):
             for b, _ in meaningful[i + 1 :]:
-                d = self._divergence(lineages[a.id], lineages[b.id])
+                la, lb = lineages[a.id], lineages[b.id]
                 if (
-                    self._branch_activity(lineages[a.id], d) >= MEANINGFUL_ACTIVITY
-                    and self._branch_activity(lineages[b.id], d) >= MEANINGFUL_ACTIVITY
+                    self._pair_activity(la, lb) >= MEANINGFUL_ACTIVITY
+                    and self._pair_activity(lb, la) >= MEANINGFUL_ACTIVITY
                 ):
                     conflicted = True
         branches: list[Branch] = [

@@ -15,7 +15,15 @@ from pathlib import Path
 
 import pytest
 
-from _hs import FakeClaude, Server, context, make_server, prompt, tool_call
+from _hs import (
+    FakeClaude,
+    Server,
+    context,
+    make_server,
+    prompt,
+    text_reply,
+    tool_call,
+)
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import Api
 from hyperspace_client.notices import (
@@ -318,6 +326,32 @@ def test_conflict_then_fork(
     m = manifest(server, result.new_id)
     assert m["forked_from"]["session_id"] == sid
     assert m["state"]["lease"]["host"] == "laptop"
+
+
+def test_rewrite_after_steal_ignores_late_bytes_with_no_activity(
+    server: Server, laptop: Host, agent: Host
+) -> None:
+    t = start_session(laptop, LAPTOP_WS)
+    sid = t.stem
+    laptop.ctx.api.grant("claude-code", sid, "agent-1")
+    restore(agent.ctx, agent.adapter, sid, AGENT_WS, steal=True)
+    # The laptop crashed before the steal, with bytes that it did not upload.
+    # They have no activity.
+    laptop.fake.write(t, text_reply("done"))
+    sync(laptop, t, LAPTOP_WS)
+    assert manifest(server, sid)["state"]["state"] == "normal"
+    # Claude Code on the agent removes a failed tail from the restored copy.
+    restored = agent.adapter.project_dir(AGENT_WS) / f"{sid}.jsonl"
+    lines = restored.read_bytes().splitlines(keepends=True)
+    restored.write_bytes(b"".join(lines[:-1]))
+    agent.fake.write(restored, prompt("agent work", cwd=AGENT_WS))
+    sync(agent, restored, AGENT_WS)
+
+    m = manifest(server, sid)
+    assert m["state"]["state"] == "normal"
+    entry = next(f for f in m["files"] if f["path"] == "transcript.jsonl")
+    assert [g["cause"] for g in entry["generations"]] == ["root", "rewrite"]
+    assert entry["active"] == entry["generations"][1]["id"]
 
 
 def test_fork_matches_claude_code_format() -> None:
