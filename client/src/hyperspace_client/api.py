@@ -11,6 +11,7 @@ import zstandard
 
 from hyperspace_protocol import (
     API_PREFIX,
+    CAP_RESTORE_PRECONDITION,
     CAP_WORKSPACE_UTF8,
     HEADER_ACTIVITY,
     HEADER_BASE_LENGTH,
@@ -272,14 +273,26 @@ class Api:
         )
 
     def teleport(
-        self, harness: str, sid: str, workspace: str, steal: bool
+        self,
+        harness: str,
+        sid: str,
+        workspace: str,
+        steal: bool,
+        expected_revision: str | None = None,
+        teleport_id: str | None = None,
     ) -> TeleportResponse:
+        body: dict[str, Any] = {"workspace": workspace, "steal": steal}
+        if expected_revision is not None:
+            self.require_capability(CAP_RESTORE_PRECONDITION)
+            body["expected_revision"] = expected_revision
+        if teleport_id is not None:
+            body["teleport_id"] = teleport_id
         return cast(
             TeleportResponse,
             self._json(
                 "POST",
                 self._s(harness, sid) + "/teleports",
-                json={"workspace": workspace, "steal": steal},
+                json=body,
             ),
         )
 

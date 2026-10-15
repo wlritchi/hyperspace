@@ -10,12 +10,14 @@ files with the server's bytes, and records an arrival for the notice.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -24,12 +26,14 @@ from hyperspace_client.api import Api, ApiError
 from hyperspace_client.state import Cursor, Segment, SessionRecord, State
 from hyperspace_client.sync import CHUNK, Context, Syncer
 from hyperspace_protocol import (
+    CAP_RESTORE_PRECONDITION,
     BlobManifest,
     GenerationInfo,
     LogManifest,
     Manifest,
     Placement,
     SessionStateBody,
+    TeleportResponse,
     validate_file_path,
     validate_session_id,
 )
@@ -79,7 +83,10 @@ def _log_bytes(api: Api, harness: str, sid: str, generation: str, length: int) -
     offset = 0
     while offset < length:
         end = min(offset + CHUNK, length)
-        parts.append(api.read_log(harness, sid, generation, offset, end))
+        part = api.read_log(harness, sid, generation, offset, end)
+        if len(part) != end - offset:
+            raise TeleportError("incomplete log download")
+        parts.append(part)
         offset = end
     return b"".join(parts)
 
@@ -192,6 +199,51 @@ def _send(
 # --- Receive ----------------------------------------------------------------------
 
 
+class _UnconfirmedRestore(TeleportError):
+    """The request may have committed. Do not remove its local files."""
+
+
+def _confirm_teleport(
+    api: Api,
+    harness: str,
+    sid: str,
+    workspace: str,
+    steal: bool,
+    revision: str,
+    teleport_id: str,
+    already_sent: bool = False,
+) -> TeleportResponse:
+    uncertain = already_sent
+    for attempt in range(2):
+        try:
+            return api.teleport(harness, sid, workspace, steal, revision, teleport_id)
+        except (httpx.HTTPError, ApiError) as exc:
+            ambiguous = isinstance(exc, httpx.HTTPError) or (
+                isinstance(exc, ApiError) and (exc.status >= 500 or exc.status == 408)
+            )
+            # These server-side transaction rejections establish that this
+            # id did not commit. Authentication/rate-limit failures do not.
+            definite = (
+                isinstance(exc, ApiError)
+                and exc.status in (400, 409)
+                and exc.code
+                in {
+                    "stale_snapshot",
+                    "lease_held",
+                    "conflicted",
+                    "bad_request",
+                }
+            )
+            if definite or (not uncertain and not ambiguous):
+                raise
+            uncertain = True
+            if attempt:
+                raise _UnconfirmedRestore(
+                    "restore files are complete, but lease confirmation is unavailable; retry restore before resume"
+                ) from exc
+    raise AssertionError("unreachable")
+
+
 def _check_lease(manifest: Manifest, host: str, steal: bool) -> None:
     state = manifest["state"]
     if state["state"] == "conflicted":
@@ -241,12 +293,52 @@ def restore(
     tool_results: bool = True,
     held_only: bool = False,
 ) -> RestoreResult:
+    validate_session_id(session_id)
+    with ctx.state.try_lock(adapter.harness, session_id) as locked:
+        if not locked:
+            raise TeleportError("another sync or restore of this session is running")
+        return _restore(
+            ctx, adapter, session_id, workspace, steal, force, tool_results, held_only
+        )
+
+
+def _restore(
+    ctx: Context,
+    adapter: ClaudeCode,
+    session_id: str,
+    workspace: str,
+    steal: bool,
+    force: bool,
+    tool_results: bool,
+    held_only: bool,
+) -> RestoreResult:
     harness = adapter.harness
     api = ctx.api
+    api.require_capability(CAP_RESTORE_PRECONDITION)
+    if adapter.is_running(session_id):
+        raise TeleportError("session is running on this host; stop it before restore")
     # The id names local files, and can come from the server.
     validate_session_id(session_id)
-    manifest = api.manifest(harness, session_id)
-    if held_only:
+    pending_key = f"restore_pending:{harness}:{session_id}"
+    pending_text = ctx.state.get(pending_key)
+    pending: dict[str, Any] = {}
+    if pending_text and pending_text.startswith("{"):
+        pending = json.loads(pending_text)
+    replay = pending.get("phase") == "sent"
+    if replay:
+        if (
+            pending.get("server") != api.cache_identity
+            or pending.get("workspace") != workspace
+        ):
+            raise TeleportError(
+                "retry the pending restore with its original server, credential, and workspace"
+            )
+        manifest = cast(Manifest, pending["manifest"])
+        steal = bool(pending["steal"])
+        tool_results = bool(pending["tool_results"])
+    else:
+        manifest = api.manifest(harness, session_id)
+    if held_only and not replay:
         lease = manifest["state"]["lease"]
         if lease["state"] != "held" or lease.get("host") != ctx.host:
             raise TeleportError("this host does not hold the lease")
@@ -262,15 +354,13 @@ def restore(
             "Use --force to move it aside."
         )
 
-    response = api.teleport(harness, session_id, workspace, steal)
-    # Read the manifest again: the source may have sent its last bytes
-    # before it surrendered.
-    manifest = api.manifest(harness, session_id)
-    for other in others:
-        move_aside(other, ctx.state)
-
+    revision = manifest.get("revision")
+    if revision is None:
+        raise TeleportError("server did not provide a restore revision")
     result = RestoreResult(session_id, workspace, target)
     session_dir = target.with_suffix("")
+    prepared: list[tuple[LogManifest | BlobManifest, Path, bytes]] = []
+    originals: dict[Path, bytes | None] = {}
     for entry in manifest["files"]:
         try:
             validate_file_path(entry["path"])
@@ -278,16 +368,115 @@ def restore(
             result.skipped.append(entry["path"])
             continue
         path = adapter.local_path(session_dir, entry["path"])
-        if path is None:
+        if path is None or (
+            not tool_results and entry["path"].startswith("tool-results/")
+        ):
             result.skipped.append(entry["path"])
             continue
-        if not tool_results and entry["path"].startswith("tool-results/"):
-            result.skipped.append(entry["path"])
-            continue
+        local = path.read_bytes() if path.exists() else None
         if entry["kind"] == "log":
-            _restore_log(ctx, harness, session_id, entry, path, result)
+            active = _active(entry)
+            data = _log_bytes(api, harness, session_id, active["id"], active["length"])
         else:
-            _restore_blob(ctx, harness, session_id, entry, path, result)
+            latest = entry["versions"][-1]
+            if (
+                local is not None
+                and hashlib.sha256(local).hexdigest() != latest["sha256"]
+            ):
+                result.skipped.append(entry["path"])
+                continue
+            data = api.read_blob(harness, session_id, entry["path"], latest["version"])
+            if (
+                len(data) != latest["size"]
+                or hashlib.sha256(data).hexdigest() != latest["sha256"]
+            ):
+                raise TeleportError(f"invalid download for {entry['path']}")
+        originals[path] = local
+        prepared.append((entry, path, data))
+    if target not in originals:
+        raise TeleportError("the session has no restorable transcript")
+
+    # Download everything before touching local files. Keep rollback copies
+    # until the conditional lease request succeeds. Cursors save afterward.
+    changed: list[Path] = []
+    moved: list[tuple[Path, Path]] = []
+    teleport_id = str(pending["teleport_id"]) if replay else "t_" + uuid.uuid4().hex
+    pending = {
+        "server": api.cache_identity,
+        "workspace": workspace,
+        "steal": steal,
+        "tool_results": tool_results,
+        "teleport_id": teleport_id,
+        "manifest": manifest,
+        "phase": "sent" if replay else "prepared",
+    }
+    ctx.state.put(pending_key, json.dumps(pending))
+    uncertain = replay
+    try:
+        if adapter.is_running(session_id):
+            raise TeleportError("session started during restore")
+        for path, local in originals.items():
+            if (path.read_bytes() if path.exists() else None) != local:
+                raise TeleportError(f"{path} changed during restore")
+        for other in others:
+            moved.append((other, move_aside(other, ctx.state)))
+        for entry, path, data in prepared:
+            local = originals[path]
+            if local is not None and data != local and not data.startswith(local):
+                moved.append((path, move_aside(path, ctx.state)))
+            changed.append(path)
+            if path.exists() and entry["kind"] == "log":
+                with open(path, "ab") as f:
+                    f.write(data[len(local or b"") :])
+                    f.flush()
+                    os.fsync(f.fileno())
+                if path == target:
+                    result.fast_forward = True
+            elif local != data or not path.exists():
+                _atomic_write(path, data)
+        pending["phase"] = "sent"
+        ctx.state.put(pending_key, json.dumps(pending))
+        response = _confirm_teleport(
+            api, harness, session_id, workspace, steal, revision, teleport_id, replay
+        )
+    except BaseException as exc:
+        if isinstance(exc, _UnconfirmedRestore) or replay:
+            uncertain = True
+            changed.clear()
+            moved.clear()
+            if replay and isinstance(exc, ApiError) and exc.code == "stale_snapshot":
+                # This id did not commit. Keep files blocked, but a later
+                # retry can download a fresh snapshot and allocate a new id.
+                pending["phase"] = "prepared"
+                ctx.state.put(pending_key, json.dumps(pending))
+        moved_paths = {old for old, _ in moved}
+        for path in reversed(changed):
+            if path in moved_paths or originals[path] is None:
+                path.unlink(missing_ok=True)
+            else:
+                with open(path, "r+b") as f:
+                    f.truncate(len(originals[path] or b""))
+        for old, backup in reversed(moved):
+            os.replace(backup, old)
+        if not uncertain:
+            ctx.state.put(pending_key, "")
+        raise
+    for entry, path, data in prepared:
+        if entry["kind"] == "log":
+            _save_log_cursor(ctx, harness, session_id, entry, path, data)
+        else:
+            st = path.stat()
+            ctx.state.save_blob(
+                path,
+                st.st_size,
+                st.st_mtime_ns,
+                entry["versions"][-1]["sha256"],
+                api.cache_identity,
+                harness,
+                session_id,
+                entry["path"],
+            )
+        result.files += 1
 
     record = ctx.state.session(harness, session_id)
     record.workspace = workspace
@@ -314,34 +503,19 @@ def restore(
         if old is not None:
             arrival["source_tool_results"] = old
         ctx.state.add_arrival(harness, session_id, arrival)
+    ctx.state.put(pending_key, "")
     return result
 
 
-def _restore_log(
+def _save_log_cursor(
     ctx: Context,
     harness: str,
     sid: str,
-    entry: LogManifest | BlobManifest,
+    entry: LogManifest,
     path: Path,
-    result: RestoreResult,
+    data: bytes,
 ) -> None:
-    assert entry["kind"] == "log"
     active = _active(entry)
-    data = _log_bytes(ctx.api, harness, sid, active["id"], active["length"])
-    if path.exists():
-        local = path.read_bytes()
-        if data.startswith(local):
-            # The session was here before: append what is missing.
-            with open(path, "ab") as f:
-                f.write(data[len(local) :])
-                f.flush()
-                os.fsync(f.fileno())
-            if entry["path"] == TRANSCRIPT:
-                result.fast_forward = True
-        else:
-            _atomic_write(path, data)
-    else:
-        _atomic_write(path, data)
     st = path.stat()
     ctx.state.save_cursor(
         Cursor(
@@ -359,41 +533,6 @@ def _restore_log(
             else [],
         )
     )
-    result.files += 1
-
-
-def _restore_blob(
-    ctx: Context,
-    harness: str,
-    sid: str,
-    entry: LogManifest | BlobManifest,
-    path: Path,
-    result: RestoreResult,
-) -> None:
-    assert entry["kind"] == "blob"
-    latest = entry["versions"][-1]
-    if path.exists():
-        data = path.read_bytes()
-        if hashlib.sha256(data).hexdigest() != latest["sha256"]:
-            # A local file with other content (for example, a plan file with
-            # the same name). Keep it.
-            result.skipped.append(entry["path"])
-            return
-    else:
-        data = ctx.api.read_blob(harness, sid, entry["path"])
-        _atomic_write(path, data)
-    st = path.stat()
-    ctx.state.save_blob(
-        path,
-        st.st_size,
-        st.st_mtime_ns,
-        latest["sha256"],
-        ctx.api.cache_identity,
-        harness,
-        sid,
-        entry["path"],
-    )
-    result.files += 1
 
 
 # --- Fork ----------------------------------------------------------------------------

@@ -143,9 +143,10 @@ hyperspace sync --all
 ### Upgrade order
 
 Upgrade the server before the client. The new server accepts old clients while
-advertising the `workspace-utf8` capability. Unicode workspace uploads require
-encoded-header support. A subsequent release will remove the legacy request
-forms.
+advertising `workspace-utf8` and `restore-precondition` capabilities. The new
+client requires restore preconditions before it changes local files or takes a
+lease. Unicode workspace uploads require encoded-header support. A subsequent
+release will remove the legacy request forms.
 
 ## 4. Teleport a session
 

@@ -864,11 +864,48 @@ class Store:
             return self._session_state(session["id"])
 
     def teleport(
-        self, key: SessionKey, writer: Writer, steal: bool
+        self,
+        key: SessionKey,
+        writer: Writer,
+        steal: bool,
+        expected_revision: str | None = None,
+        teleport_id: str | None = None,
     ) -> tuple[TeleportEvent, SessionStateBody]:
-        """Take the lease for the writer's host and record a teleport."""
+        """Take the lease only if the downloaded snapshot is still current.
+
+        Legacy callers can omit the precondition during the transition.
+        A supplied teleport id makes a retry after a lost response safe.
+        """
         with self._tx():
             session = self._require_session(key)
+            if teleport_id is not None:
+                previous = self._db.execute(
+                    "SELECT * FROM teleports WHERE id = ?", (teleport_id,)
+                ).fetchone()
+                if previous is not None:
+                    if (
+                        previous["session"] != session["id"]
+                        or previous["target_host"] != writer.host
+                        or previous["target_workspace"] != writer.workspace
+                    ):
+                        raise StoreError("bad_request", "teleport id is already in use")
+                    event: TeleportEvent = {
+                        "id": teleport_id,
+                        "target_host": writer.host,
+                        "target_workspace": writer.workspace,
+                        "steal": bool(previous["steal"]),
+                        "created": previous["created"],
+                    }
+                    if previous["source"] is not None:
+                        event["source"] = json.loads(previous["source"])
+                    return event, self._session_state(session["id"])
+            if (
+                expected_revision is not None
+                and self.manifest(key)["revision"] != expected_revision
+            ):
+                raise StoreError(
+                    "stale_snapshot", "the session changed during restore; retry"
+                )
             if session["state"] == "conflicted":
                 raise StoreError("conflicted", "the session is conflicted; fork it")
             lease_state = session["lease_state"]
@@ -892,7 +929,7 @@ class Store:
             if latest is not None:
                 source = self._placements(session["id"])[-1]
             event: TeleportEvent = {
-                "id": _new_id("t"),
+                "id": teleport_id or _new_id("t"),
                 "target_host": writer.host,
                 "target_workspace": writer.workspace,
                 "steal": stolen,
@@ -1420,6 +1457,9 @@ class Store:
                 "source_offset": session["forked_from_offset"],
                 "created": session["created"],
             }
+        manifest["revision"] = hashlib.sha256(
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         return manifest
 
     @_locked

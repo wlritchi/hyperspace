@@ -47,6 +47,97 @@ def hosts(tmp_path):
     server.close()
 
 
+def test_restore_refuses_live_target(hosts, monkeypatch):
+    _, laptop, _, a, _, t = hosts
+    monkeypatch.setattr(laptop.adapter, "is_running", lambda sid: True)
+    with pytest.raises(TeleportError, match="running"):
+        restore(a, laptop.adapter, t.stem, WS, force=True)
+
+
+def test_restore_download_failure_does_not_take_lease(hosts, monkeypatch):
+    _, _, agent, a, b, t = hosts
+
+    def fail(*args):
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(b.api, "read_log", fail)
+    with pytest.raises(httpx.ConnectError):
+        restore(b, agent.adapter, t.stem, WS, steal=True)
+    assert a.api.state(H, t.stem)["lease"]["host"] == "laptop"
+    assert agent.adapter.find_transcripts(t.stem) == []
+
+
+def test_restore_disk_failure_rolls_back_and_keeps_lease(hosts, monkeypatch):
+    from hyperspace_client import teleport
+
+    _, _, agent, a, b, t = hosts
+    original = teleport._atomic_write
+
+    def fail(path, data):
+        original(path, data)
+        raise OSError("disk full")
+
+    monkeypatch.setattr(teleport, "_atomic_write", fail)
+    with pytest.raises(OSError, match="disk full"):
+        restore(b, agent.adapter, t.stem, WS, steal=True)
+    assert not (agent.adapter.project_dir(WS) / t.name).exists()
+    assert a.api.state(H, t.stem)["lease"]["host"] == "laptop"
+
+
+def test_restore_changed_snapshot_rolls_back(hosts, monkeypatch):
+    _, _, agent, a, b, t = hosts
+    original = b.api.teleport
+
+    def changed(*args, **kwargs):
+        a.api.add_metadata(H, t.stem, WS, {"title": "changed during download"})
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(b.api, "teleport", changed)
+    with pytest.raises(ApiError, match="stale_snapshot"):
+        restore(b, agent.adapter, t.stem, WS, steal=True)
+    assert not (agent.adapter.project_dir(WS) / t.name).exists()
+    assert a.api.state(H, t.stem)["lease"]["host"] == "laptop"
+    assert (
+        b.state.cursor(agent.adapter.project_dir(WS) / t.name, b.api.cache_identity)
+        is None
+    )
+
+
+def test_restore_lost_response_retries_same_teleport(hosts, monkeypatch):
+    _, _, agent, a, b, t = hosts
+    original = b.api.teleport
+    calls = []
+
+    def lost(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append(args[-1])
+        if len(calls) == 1:
+            raise httpx.ReadError("lost response")
+        return result
+
+    monkeypatch.setattr(b.api, "teleport", lost)
+    result = restore(b, agent.adapter, t.stem, WS, steal=True)
+    assert result.transcript.read_bytes() == t.read_bytes()
+    assert len(calls) == 2 and calls[0] == calls[1]
+    assert len(a.api.manifest(H, t.stem)["teleports"]) == 1
+
+
+def test_restore_old_server_is_refused_before_local_changes(hosts):
+    _, _, agent, _, b, t = hosts
+    b.api._capabilities = set()
+    with pytest.raises(ApiError, match="upgrade_required"):
+        restore(b, agent.adapter, t.stem, WS, steal=True)
+    assert agent.adapter.find_transcripts(t.stem) == []
+
+
+def test_legacy_teleport_and_workspace_remain_supported(hosts):
+    _, _, _, a, b, t = hosts
+    b.api.teleport(H, t.stem, WS, True)
+    a.api._capabilities = set()
+    a.api.add_metadata(H, t.stem, WS, {"title": "legacy"})
+    assert a.api.manifest(H, t.stem)["metadata"]["title"] == "legacy"
+
+
 def test_send_refuses_partial_tail(hosts):
     _, laptop, _, a, _, t = hosts
     with t.open("ab") as f:
@@ -240,6 +331,49 @@ def test_restore_into_long_workspace(hosts):
     result = restore(b, agent.adapter, t.stem, workspace, steal=True)
     assert result.transcript.read_bytes() == t.read_bytes()
     assert len(result.transcript.parent.name) <= 208
+
+
+def test_stale_lease_rejects_restore_even_with_steal(hosts):
+    _, _, _, a, b, t = hosts
+    revision = b.api.manifest(H, t.stem)["revision"]
+    a.api.surrender(H, t.stem, "agent-1")
+    with pytest.raises(ApiError, match="stale_snapshot"):
+        b.api.teleport(H, t.stem, WS, True, revision, "t_test")
+    assert a.api.state(H, t.stem)["lease"]["state"] == "reserved"
+
+
+@pytest.mark.parametrize("retry_status", [401, 429, 504])
+def test_ambiguous_restore_preserves_files_and_reconciles_same_id(
+    hosts, monkeypatch, retry_status
+):
+    _, _, agent, a, b, t = hosts
+    original = b.api.teleport
+    calls = []
+
+    def failures(*args, **kwargs):
+        calls.append(args[-1])
+        if len(calls) == 1:
+            original(*args, **kwargs)
+            raise ApiError(504, "error", "gateway timeout after commit")
+        raise ApiError(retry_status, "rate_limited" if retry_status == 429 else "error")
+
+    monkeypatch.setattr(b.api, "teleport", failures)
+    with pytest.raises(TeleportError, match="confirmation"):
+        restore(b, agent.adapter, t.stem, WS, steal=True)
+    path = agent.adapter.project_dir(WS) / t.name
+    assert path.read_bytes() == t.read_bytes()
+    pending = json.loads(b.state.get(f"restore_pending:{H}:{t.stem}"))
+    assert pending["teleport_id"] == calls[0] == calls[1]
+
+    def recovered(*args, **kwargs):
+        calls.append(args[-1])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(b.api, "teleport", recovered)
+    restore(b, agent.adapter, t.stem, WS)
+    assert calls[-1] == calls[0]
+    assert len(a.api.manifest(H, t.stem)["teleports"]) == 1
+    assert not b.state.get(f"restore_pending:{H}:{t.stem}")
 
 
 def test_log_cursors_do_not_cross_servers(hosts, tmp_path):

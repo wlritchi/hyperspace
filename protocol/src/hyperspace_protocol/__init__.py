@@ -22,7 +22,8 @@ HEADER_ACTIVITY = "Hyperspace-Activity"
 HEADER_WORKSPACE = "Hyperspace-Workspace"
 HEADER_WORKSPACE_UTF8 = "Hyperspace-Workspace-Utf8"
 CAP_WORKSPACE_UTF8 = "workspace-utf8"
-CAPABILITIES = [CAP_WORKSPACE_UTF8]
+CAP_RESTORE_PRECONDITION = "restore-precondition"
+CAPABILITIES = [CAP_WORKSPACE_UTF8, CAP_RESTORE_PRECONDITION]
 
 # One request carries at most this much uncompressed file data. The client
 # splits larger appends.
@@ -328,6 +329,8 @@ class Manifest(TypedDict):
     teleports: list[TeleportEvent]
     files: list[LogManifest | BlobManifest]
     forked_from: NotRequired[ForkEvent]
+    # Opaque snapshot token for conditional restore finalization.
+    revision: NotRequired[str]
 
 
 class SessionSummary(TypedDict):
@@ -349,6 +352,8 @@ class SurrenderRequest(TypedDict):
 class TeleportRequest(TypedDict):
     workspace: str
     steal: NotRequired[bool]
+    expected_revision: NotRequired[str]
+    teleport_id: NotRequired[str]
 
 
 class TeleportResponse(TypedDict):

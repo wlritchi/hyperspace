@@ -399,12 +399,17 @@ def _restore_held(ctx: Context, adapter: ClaudeCode, workspace: str) -> int:
     """Restore each session whose lease this host holds and that has no
     local copy, each in its own last workspace on this host."""
     restored = 0
-    for summary in ctx.api.sessions(harness=adapter.harness, host=ctx.host):
+    # A completed lease transfer can precede the destination's first append,
+    # so placement-based host filtering would hide a pending restore. Ask
+    # for the server's maximum. The list is not filtered by host.
+    for summary in ctx.api.sessions(harness=adapter.harness, limit="1000"):
         lease = summary["state"]["lease"]
         sid = summary["session_id"]
         if lease["state"] != "held" or lease.get("host") != ctx.host:
             continue
-        if adapter.find_transcripts(sid):
+        if adapter.find_transcripts(sid) and not ctx.state.get(
+            f"restore_pending:{adapter.harness}:{sid}"
+        ):
             continue
         target = lease.get("workspace") or workspace
         try:

@@ -360,18 +360,28 @@ runs on the target host, in the directory where the session must continue:
      its cursor stays valid.
    - Any other resumable copy: stop. A second copy would make
      `claude --resume` fail. `--force` moves the old copy aside.
-4. Write the files into the harness layout for the target workspace, with the
-   bytes from the server and no changes. For Claude Code, that is the project
-   directory of the target workspace, so `claude --resume <sid>` in that
-   directory finds the session first.
-5. Write cursors for the restored files, so that new appends on this host
-   continue the same generation.
-6. Write an _arrival record_ in the client state: the teleport id and the
-   source and target placements.
-7. In one request to the server: take the lease, and record a `teleport` event
-   with the teleport id and the placements. If the lease changed after step 1,
-   the request fails, and the client removes the files that it wrote.
-8. Print `claude --resume <sid>`, or run it if `--resume` is given.
+4. Download all selected files before changing local files. Refuse a restore
+   while the session runs locally. Hold the session's sync lock through the
+   restore. Write the files into the harness layout with the server's bytes
+   and no changes. Keep rollback copies until the lease request succeeds.
+5. In one request to the server: take the lease and record a `teleport` event.
+   Send the manifest's opaque `revision` as `expected_revision`, and a new
+   `teleport_id`. The server checks the snapshot and changes the lease in one
+   transaction. A changed lease, file, metadata event, or placement causes
+   `409 stale_snapshot`. The client rolls back local changes on rejection. A
+   retry with the same teleport id returns the original event, so a lost
+   response cannot create a second teleport.
+6. Write cursors for the restored files and an _arrival record_ in local
+   state. The arrival holds the teleport id and source and target placements.
+   A pending-restore marker makes `restore --held` retry an interrupted
+   restore instead of skipping its incomplete local state.
+7. Print `claude --resume <sid>`, or run it if `--resume` is given.
+
+If a lease response is lost or returns a server error, the client retries with
+the same id. If confirmation remains unavailable, including an authentication
+or rate-limit failure on the retry, it keeps the complete files and the
+pending request (id, snapshot, and target). A later restore reconciles that
+same request. It does not guess whether the server committed.
 
 The session id stays the same. A session can teleport any number of times, and
 back to a host where it was before.
@@ -645,17 +655,21 @@ uncompressed data. The client splits larger appends.
 ### Compatible protocol extensions
 
 `GET /whoami` includes a `capabilities` list. This release advertises
-`workspace-utf8`:
+`workspace-utf8` and `restore-precondition`:
 
 - `Hyperspace-Workspace-Utf8` carries standard base64 of the UTF-8 workspace.
   It takes precedence over `Hyperspace-Workspace`. The server still accepts
   the old raw header. New clients use the encoded header when supported; with
   an older server they use the raw header only for printable ASCII paths, and
   otherwise report that a server upgrade is required.
+- Manifests include an opaque `revision`. Teleport accepts optional
+  `expected_revision` and `teleport_id` fields. Old clients can omit them
+  during this transition. New restore clients require the advertised
+  capability and never silently fall back to an unconditional lease change.
 
 Upgrade the server before the client. A subsequent release will remove support
-for old clients: the raw workspace header will no longer be accepted. This
-release retains it.
+for old clients: the raw workspace header and unconditional teleport requests
+will no longer be accepted. This release retains both forms.
 
 Known metadata fields are type-checked before storage. Unknown fields remain
 available for extensions. Readers ignore malformed known fields in events

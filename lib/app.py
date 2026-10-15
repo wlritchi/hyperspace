@@ -63,6 +63,7 @@ _STATUS = {
     "lease_held": 409,
     "conflicted": 409,
     "not_holder": 409,
+    "stale_snapshot": 409,
     "bad_request": 400,
     "bad_range": 400,
     "bad_digest": 400,
@@ -602,8 +603,23 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
         body = await read_json(request)
         workspace = validate_workspace(str(body.get("workspace", "")))
         w = Writer(principal.account, principal.host, workspace)
+        revision = body.get("expected_revision")
+        if revision is not None:
+            if not isinstance(revision, str):
+                raise ApiError("bad_request", "expected_revision must be a string")
+            validate_sha256(revision)
+        teleport_id = body.get("teleport_id")
+        if teleport_id is not None:
+            if not isinstance(teleport_id, str):
+                raise ApiError("bad_request", "teleport_id must be a string")
+            validate_id(teleport_id)
         event, state = await run_in_threadpool(
-            store.teleport, key, w, bool(body.get("steal", False))
+            store.teleport,
+            key,
+            w,
+            bool(body.get("steal", False)),
+            revision,
+            teleport_id,
         )
         return JSONResponse({"teleport": event, "session": state})
 
