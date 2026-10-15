@@ -632,7 +632,9 @@ class Store:
                 if retry is not None:
                     return self._gen_info(gen), self._session_state(session["id"])
                 raise Conflict(generation, gen.length)
-            frame_offset, frame_length = self._framelog(generation).append(data)
+            frame_offset, frame_length = self._framelog(generation).append(
+                data, first_frame=gen.length == gen.fork_offset
+            )
             now = self.now()
             self._db.execute(
                 """

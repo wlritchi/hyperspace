@@ -32,15 +32,31 @@ def decompress(frame: bytes, max_size: int) -> bytes:
     return zstandard.ZstdDecompressor().decompress(frame, max_output_size=max_size)
 
 
+def sync_dir(path: Path) -> None:
+    """Fsync the directory `path`. This makes its entries durable: a file
+    that was created in it, or renamed into it, then survives power loss."""
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class FrameLog:
     """One generation file: `<dir>/<generation id>.zst`."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
 
-    def append(self, data: bytes) -> tuple[int, int]:
+    def append(self, data: bytes, first_frame: bool) -> tuple[int, int]:
         """Append `data` as one frame and fsync. Return (offset, length) of
-        the frame in the file."""
+        the frame in the file.
+
+        Set `first_frame` when no committed index row refers to this file
+        yet. The file and its directory can then be new, so this also fsyncs
+        the directory and its parent. Without this step, power loss can
+        remove the file name although the index commit refers to it.
+        """
         frame = compress(data)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
@@ -52,6 +68,9 @@ class FrameLog:
             os.fsync(fd)
         finally:
             os.close(fd)
+        if first_frame:
+            sync_dir(self.path.parent)
+            sync_dir(self.path.parent.parent)
         return offset, len(frame)
 
     def read_frame(self, offset: int, length: int, max_size: int) -> bytes:

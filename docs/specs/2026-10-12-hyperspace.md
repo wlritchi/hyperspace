@@ -641,6 +641,13 @@ $HYPERSPACE_DATA_DIR/
 - Write order: append the frame, `fsync`, then commit the index row. At
   startup, the server truncates each generation file to the end of its last
   committed frame. This removes only bytes that no index row refers to.
+- A new file name must be durable before an index row refers to it. For the
+  first frame of a generation, the server also does an `fsync` of `logs/` and
+  of the data directory. For a blob object, the server writes a temporary
+  file, does an `fsync`, and renames it. It then does an `fsync` of the shard
+  directory, of `objects/`, and of the data directory. It does this also when
+  the object exists already, because an earlier write can stop before the
+  directory `fsync`.
 - Content-addressed objects deduplicate identical tool results and snapshots.
 - The data directory only grows, so backups of it are cheap and incremental.
 - The data is readable on the server (compressed, not encrypted). Protection

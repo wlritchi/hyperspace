@@ -2,6 +2,7 @@
 """The storage core: generations, blobs, placements, leases, and conflicts."""
 
 import hashlib
+import os
 from collections.abc import Iterator
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import store as store_module
 from hyperspace_protocol import ReadScope
 from store import Conflict, SessionKey, Store, StoreError, Writer
 
@@ -435,3 +437,88 @@ def test_purge_blob_version_keeps_shared_objects(store: Store) -> None:
     assert store.read_blob(KEY, "tool-results/b.txt", None) == b"same"
     store.purge_blob_version(KEY, "tool-results/b.txt", 1, "test")
     assert not store.objects.has(sha)
+
+
+def _record_syncs(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record each fsync (as the (st_dev, st_ino) of its target) and each
+    index commit, in order."""
+    events: list[object] = []
+    real_fsync = os.fsync
+    real_exit = store_module._Transaction.__exit__
+
+    def fsync(fd: int) -> None:
+        st = os.fstat(fd)
+        events.append((st.st_dev, st.st_ino))
+        real_fsync(fd)
+
+    def exit_(
+        self: store_module._Transaction, exc_type: object, exc: object, tb: object
+    ) -> None:
+        if self._depth_owner and exc_type is None:
+            events.append("commit")
+        real_exit(self, exc_type, exc, tb)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(store_module._Transaction, "__exit__", exit_)
+    return events
+
+
+def _ident(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return (st.st_dev, st.st_ino)
+
+
+def _synced_before_commit(events: list[object], path: Path) -> bool:
+    commit = events.index("commit")
+    return _ident(path) in events[:commit]
+
+
+def test_first_append_syncs_directories_before_commit(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    g = root(store)
+    events = _record_syncs(monkeypatch)
+    put(store, g, 0, b"first\n")
+    log = store.logs_dir / f"{g}.zst"
+    # The file, its new directory, and the entry of that directory must be
+    # durable before the index refers to the file.
+    for path in (log, store.logs_dir, store.data_dir):
+        assert _synced_before_commit(events, path), path
+
+
+def test_first_append_to_fork_syncs_directories(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    g = root(store)
+    put(store, g, 0, b"aaaa")
+    fork = store.create_generation(
+        KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=4
+    )
+    events = _record_syncs(monkeypatch)
+    put(store, fork["id"], 4, b"bbbb")
+    assert _synced_before_commit(events, store.logs_dir)
+
+
+def test_new_object_syncs_directories_before_commit(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events = _record_syncs(monkeypatch)
+    sha = hashlib.sha256(b"plan").hexdigest()
+    store.put_blob(KEY, "plans/p.md", LAPTOP, b"plan", sha)
+    obj = store.objects._path(sha)
+    for path in (obj, obj.parent, store.objects.root, store.data_dir):
+        assert _synced_before_commit(events, path), path
+
+
+def test_existing_object_syncs_directories_before_commit(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A crash after the rename and before the directory fsync leaves the
+    # object name in the page cache only. The next put must make it durable.
+    sha = hashlib.sha256(b"same").hexdigest()
+    store.objects.put(b"same")
+    events = _record_syncs(monkeypatch)
+    store.put_blob(KEY, "tool-results/a.txt", LAPTOP, b"same", sha)
+    obj = store.objects._path(sha)
+    for path in (obj.parent, store.objects.root, store.data_dir):
+        assert _synced_before_commit(events, path), path
