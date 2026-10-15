@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import threading
 
 import pytest
 
 from _hs import FakeClaude, context, make_server, prompt
+from hyperspace_client.api import ApiError
 from hyperspace_client.sync import Syncer
 from store import SessionKey, Store, Writer
 
@@ -33,6 +35,37 @@ def hosts(tmp_path):
     a.state.close()
     b.state.close()
     server.close()
+
+
+@pytest.mark.parametrize(
+    "metadata", [{"title": 123}, {"cwd": {}}, {"record_count": True}, {"links": []}]
+)
+def test_metadata_validation(hosts, metadata):
+    _, _, _, a, _, t = hosts
+    with pytest.raises(ApiError) as error:
+        a.api.add_metadata(H, t.stem, WS, metadata)
+    assert error.value.status == 400
+    assert a.api.sessions(title="backed") == []
+
+
+def test_old_invalid_metadata_is_safe_after_upgrade(hosts):
+    server, _, _, a, _, t = hosts
+    key = SessionKey("default", H, t.stem)
+    with server.store._tx():
+        sid = server.store._require_session(key)["id"]
+        server.store._db.execute(
+            "INSERT INTO metadata_events(session, host, received, body) VALUES (?, ?, ?, ?)",
+            (
+                sid,
+                "laptop",
+                "now",
+                json.dumps({"title": 123, "cwd": {}, "custom": "keep"}),
+            ),
+        )
+    assert a.api.sessions(title="anything") == []
+    g = a.api.manifest(H, t.stem)["files"][0]["generations"][0]
+    a.api.append(H, t.stem, "/new", g["id"], g["length"], b"new\n", 0)
+    assert a.api.manifest(H, t.stem)["metadata"] == {"custom": "keep"}
 
 
 def test_purge_rechecks_objects_after_commit(tmp_path, monkeypatch):

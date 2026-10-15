@@ -9,7 +9,7 @@ suffix.
 from __future__ import annotations
 
 import re
-from typing import Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict, cast
 
 API_PREFIX = "/v1"
 
@@ -132,6 +132,32 @@ def validate_workspace(value: str) -> str:
     if not value.startswith("/") or "\x00" in value:
         raise ValidationError(f"invalid workspace: {value!r}")
     return value
+
+
+def validate_metadata(value: dict[str, Any]) -> SessionMetadata:
+    """Check known fields. Unknown fields remain available for extensions."""
+    for key in (
+        "workspace",
+        "cwd",
+        "title",
+        "first_timestamp",
+        "last_timestamp",
+        "harness_version",
+    ):
+        if key in value and not isinstance(value[key], str):
+            raise ValidationError(f"metadata {key} must be a string")
+    if "record_count" in value and (
+        type(value["record_count"]) is not int or value["record_count"] < 0
+    ):
+        raise ValidationError("metadata record_count must be a nonnegative integer")
+    if "links" in value and (
+        not isinstance(value["links"], dict)
+        or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in value["links"].items()
+        )
+    ):
+        raise ValidationError("metadata links must map strings to strings")
+    return cast(SessionMetadata, value)
 
 
 # --- Bodies -----------------------------------------------------------------

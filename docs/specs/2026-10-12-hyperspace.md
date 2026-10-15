@@ -637,6 +637,10 @@ uncompressed data. The client splits larger appends.
 | `GET /sessions/{harness}/{sid}/blobs/{path}?version=`         | `read`           | Read a blob version                                                                                                                                         |
 | `POST /sessions/{harness}/{sid}/grants`                       | `grant`          | Let another host read this session                                                                                                                          |
 
+Known metadata fields are type-checked before storage. Unknown fields remain
+available for extensions. Readers ignore malformed known fields in events
+written by older servers; the original events remain unchanged.
+
 There is no delete route and no admin route. Admin operations are scripts that
 run inside the server container, so they need shell access to the pod
 (`kubectl exec`), which needs admin access to the cluster:

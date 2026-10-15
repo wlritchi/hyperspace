@@ -45,6 +45,8 @@ from hyperspace_protocol import (
     SessionStateBody,
     SessionSummary,
     TeleportEvent,
+    ValidationError,
+    validate_metadata,
 )
 from objects import ObjectStore
 
@@ -730,6 +732,7 @@ class Store:
     def add_metadata(
         self, key: SessionKey, writer: Writer, metadata: SessionMetadata
     ) -> None:
+        validate_metadata(dict(metadata))
         with self._tx():
             session = self._ensure_session(key)
             self._db.execute(
@@ -746,8 +749,17 @@ class Store:
         ).fetchone()
         if row is None:
             return {}
-        metadata: SessionMetadata = json.loads(row["body"])
-        return metadata
+        metadata: dict[str, Any] = json.loads(row["body"])
+        # Old servers accepted malformed fields. Keep their events, but do
+        # not let them break readers or new placements after an upgrade.
+        clean: dict[str, Any] = {}
+        for name, value in metadata.items():
+            try:
+                validate_metadata({name: value})
+            except ValidationError:
+                continue
+            clean[name] = value
+        return validate_metadata(clean)
 
     # --- Placements -----------------------------------------------------
 
