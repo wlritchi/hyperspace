@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from _hs import FakeClaude, context, make_server, prompt
+from hyperspace_client.adapters import LocalFile
 from hyperspace_client.adapters.claude_code import sanitize_path
 from hyperspace_client.api import ApiError
 from hyperspace_client.sync import Syncer
@@ -44,6 +45,24 @@ def hosts(tmp_path):
     a.state.close()
     b.state.close()
     server.close()
+
+
+def test_blob_cache_is_scoped_by_session(hosts):
+    _, laptop, _, a, _, t = hosts
+    plan = laptop.root / "plans" / "shared.md"
+    plan.parent.mkdir()
+    plan.write_text("plan")
+    f = LocalFile("plans/shared.md", "blob", plan)
+    first = laptop.adapter.session_for_transcript(t)
+    Syncer(a, first, WS).sync_blob(f)
+    second_path = laptop.transcript(WS)
+    laptop.write(second_path, prompt("second"))
+    second = laptop.adapter.session_for_transcript(second_path)
+    syncer = Syncer(a, second, WS)
+    syncer.run()
+    syncer.sync_blob(f)
+    assert a.api.read_blob(H, t.stem, f.rel_path) == b"plan"
+    assert a.api.read_blob(H, second_path.stem, f.rel_path) == b"plan"
 
 
 def test_unicode_workspace_round_trip(hosts):

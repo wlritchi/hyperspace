@@ -72,6 +72,9 @@ class Api:
         )
         self._zstd = zstandard.ZstdCompressor(level=3)
         self._capabilities: set[str] | None = None
+        # Do not put a credential in the state database. A rotation causes
+        # safe cache misses, and cannot reuse another account's cache.
+        self.cache_identity = hashlib.sha256((url + "\n" + token).encode()).hexdigest()
 
     def close(self) -> None:
         self._client.close()

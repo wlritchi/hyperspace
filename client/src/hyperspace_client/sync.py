@@ -372,7 +372,9 @@ class Syncer:
             st = f.path.stat()
         except FileNotFoundError:
             return
-        known = self.ctx.state.blob(f.path)
+        known = self.ctx.state.blob(
+            f.path, self.ctx.api.cache_identity, self._h, self._sid, f.rel_path
+        )
         if known is not None and known[:2] == (st.st_size, st.st_mtime_ns):
             return
         if st.st_size > MAX_BODY:
@@ -384,7 +386,16 @@ class Syncer:
             self.ctx.api.put_blob(self._h, self._sid, self.workspace, f.rel_path, data)
             self.result.uploaded += len(data)
             self.result.files += 1
-        self.ctx.state.save_blob(f.path, st.st_size, st.st_mtime_ns, digest)
+        self.ctx.state.save_blob(
+            f.path,
+            st.st_size,
+            st.st_mtime_ns,
+            digest,
+            self.ctx.api.cache_identity,
+            self._h,
+            self._sid,
+            f.rel_path,
+        )
 
     # --- Session -------------------------------------------------------------------
 

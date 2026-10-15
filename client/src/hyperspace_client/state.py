@@ -30,11 +30,16 @@ CREATE TABLE IF NOT EXISTS cursors (
     ino INTEGER NOT NULL,
     segments TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS blobs (
-    local_path TEXT PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS session_blobs (
+    server TEXT NOT NULL,
+    harness TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    local_path TEXT NOT NULL,
     size INTEGER NOT NULL,
     mtime_ns INTEGER NOT NULL,
-    sha256 TEXT NOT NULL
+    sha256 TEXT NOT NULL,
+    PRIMARY KEY (server, harness, session_id, rel_path, local_path)
 );
 CREATE TABLE IF NOT EXISTS sessions (
     harness TEXT NOT NULL,
@@ -231,20 +236,40 @@ class State:
 
     # --- Blobs ---------------------------------------------------------------
 
-    def blob(self, local_path: Path) -> tuple[int, int, str] | None:
+    def blob(
+        self, local_path: Path, server: str, harness: str, sid: str, rel_path: str
+    ) -> tuple[int, int, str] | None:
         row = self._db.execute(
-            "SELECT size, mtime_ns, sha256 FROM blobs WHERE local_path = ?",
-            (str(local_path),),
+            "SELECT size, mtime_ns, sha256 FROM session_blobs WHERE "
+            "server = ? AND harness = ? AND session_id = ? AND rel_path = ? AND local_path = ?",
+            (server, harness, sid, rel_path, str(local_path)),
         ).fetchone()
         return (row[0], row[1], row[2]) if row else None
 
     def save_blob(
-        self, local_path: Path, size: int, mtime_ns: int, sha256: str
+        self,
+        local_path: Path,
+        size: int,
+        mtime_ns: int,
+        sha256: str,
+        server: str,
+        harness: str,
+        sid: str,
+        rel_path: str,
     ) -> None:
         with self._db:
             self._db.execute(
-                "INSERT OR REPLACE INTO blobs VALUES (?, ?, ?, ?)",
-                (str(local_path), size, mtime_ns, sha256),
+                "INSERT OR REPLACE INTO session_blobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    server,
+                    harness,
+                    sid,
+                    rel_path,
+                    str(local_path),
+                    size,
+                    mtime_ns,
+                    sha256,
+                ),
             )
 
     # --- Sessions ------------------------------------------------------------

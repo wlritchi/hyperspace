@@ -332,7 +332,16 @@ def _restore_blob(
         data = ctx.api.read_blob(harness, sid, entry["path"])
         _atomic_write(path, data)
     st = path.stat()
-    ctx.state.save_blob(path, st.st_size, st.st_mtime_ns, latest["sha256"])
+    ctx.state.save_blob(
+        path,
+        st.st_size,
+        st.st_mtime_ns,
+        latest["sha256"],
+        ctx.api.cache_identity,
+        harness,
+        sid,
+        entry["path"],
+    )
     result.files += 1
 
 
