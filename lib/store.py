@@ -1273,6 +1273,21 @@ class Store:
         ).fetchone()
         if wrote is not None:
             return True
+        # Metadata and blobs can arrive before the first generation. Their
+        # stored authors give access without a placement or an early lease.
+        metadata = self._db.execute(
+            "SELECT 1 FROM metadata_events WHERE session = ? AND host = ? LIMIT 1",
+            (session["id"], host),
+        ).fetchone()
+        if metadata is not None:
+            return True
+        blob = self._db.execute(
+            "SELECT 1 FROM blob_versions b JOIN files f ON f.id = b.file "
+            "WHERE f.session = ? AND b.host = ? LIMIT 1",
+            (session["id"], host),
+        ).fetchone()
+        if blob is not None:
+            return True
         if scope == "granted":
             granted = self._db.execute(
                 "SELECT 1 FROM grants WHERE session = ? AND host = ?",

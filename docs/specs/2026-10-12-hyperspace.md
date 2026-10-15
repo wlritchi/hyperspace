@@ -758,8 +758,12 @@ server is on the open internet from the first release.
     different host, and the protocol cannot change or remove data. A stolen
     `append` credential can add data, but it cannot destroy history.
   - `read: own | granted | all`: `own` permits reads of sessions with a
-    placement on this host. `granted` also permits sessions with a grant to
-    this host. `all` permits every session in the account.
+    placement on this host, a lease held by this host, or a generation,
+    metadata event, or blob version written by this host. These writes record
+    the author in the same transaction that creates the session. Metadata and
+    blob uploads do not acquire the lease. A reserved lease alone does not
+    permit reads. `granted` also permits sessions with a grant to this host.
+    `all` permits every session in the account.
   - `grant`: permit another host to read one session. A credential can grant
     only a session that it can read, so `grant` never widens the reads of the
     credential itself.

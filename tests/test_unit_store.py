@@ -3,11 +3,13 @@
 
 import hashlib
 from collections.abc import Iterator
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from hyperspace_protocol import ReadScope
 from store import Conflict, SessionKey, Store, StoreError, Writer
 
 KEY = SessionKey("acct", "claude-code", "s1")
@@ -325,6 +327,43 @@ def test_read_scopes(store: Store) -> None:
     assert store.can_read(KEY, "agent-1", "granted")
     assert not store.can_read(KEY, "agent-1", "own")
     assert not store.can_read(SessionKey("acct", "claude-code", "nope"), "x", "all")
+
+
+@pytest.mark.parametrize("first", ["metadata", "blob"])
+@pytest.mark.parametrize("scope", ["own", "granted"])
+def test_restricted_host_can_continue_new_session(
+    tmp_path: Path, first: str, scope: ReadScope
+) -> None:
+    data_dir = tmp_path / "data"
+
+    def upload(store: Store) -> None:
+        if first == "metadata":
+            store.add_metadata(KEY, AGENT, {"title": "New session"})
+        else:
+            store.put_blob(
+                KEY,
+                "result.txt",
+                AGENT,
+                b"result",
+                hashlib.sha256(b"result").hexdigest(),
+            )
+
+    with closing(Store(data_dir)) as store:
+        store.write_authorized(KEY, AGENT.host, scope, lambda: upload(store))
+
+    # Access must survive a restart before the first transcript upload.
+    with closing(Store(data_dir)) as store:
+        store.write_authorized(KEY, AGENT.host, scope, lambda: upload(store))
+        assert store.can_read(KEY, AGENT.host, scope)
+        assert store.session_state(KEY)["lease"]["state"] == "free"
+        assert not store.can_read(KEY, OTHER.host, scope)
+        with pytest.raises(StoreError, match="session"):
+            store.write_authorized(KEY, OTHER.host, scope, lambda: root(store, OTHER))
+        gen = store.write_authorized(KEY, AGENT.host, scope, lambda: root(store, AGENT))
+        store.existing_authorized(
+            KEY, AGENT.host, scope, lambda: put(store, gen, 0, b"prompt\n", AGENT)
+        )
+        assert store.session_state(KEY)["lease"]["host"] == AGENT.host
 
 
 def test_list_sessions_filters(store: Store) -> None:
