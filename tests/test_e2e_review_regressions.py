@@ -564,6 +564,163 @@ def test_conflict_after_commit_blocks_replay_and_preserves_files(hosts, monkeypa
     assert a.api.state(H, t.stem)["state"] == "conflicted"
 
 
+@pytest.mark.parametrize(
+    "endpoint,body",
+    [
+        ("grants", {"host": "agent-1"}),
+        ("teleports", {"workspace": WS, "steal": True}),
+        ("lease/surrender", {}),
+        ("forks", {"generation": "g_removed", "offset": 0}),
+    ],
+)
+def test_existing_mutations_reauthorize_after_delayed_body(hosts, endpoint, body):
+    server, _, _, a, _, t = hosts
+    admin = Store(server.store.data_dir)
+    key = SessionKey("default", H, t.stem)
+
+    async def exercise():
+        ready, finish = asyncio.Event(), asyncio.Event()
+
+        async def delayed():
+            ready.set()
+            await finish.wait()
+            yield json.dumps(body).encode()
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=server.app), base_url="http://testserver"
+        ) as client:
+            path = f"/v1/sessions/{H}/{t.stem}"
+            pending = asyncio.create_task(
+                client.post(
+                    path + "/" + endpoint,
+                    headers={"Authorization": f"Bearer {server.tokens['agent']}"},
+                    content=delayed(),
+                )
+            )
+            await ready.wait()
+            admin.purge_session(key, "test replacement")
+            writer = Writer("default", "laptop", WS)
+            g = admin.create_generation(key, "transcript.jsonl", writer, "root")
+            data = b"private replacement\n"
+            admin.append(
+                key, g["id"], writer, 0, data, hashlib.sha256(data).hexdigest(), 1
+            )
+            finish.set()
+            response = await pending
+            assert response.status_code == 404
+            assert response.json() == {"error": "not_found", "detail": "session"}
+            response = await client.get(
+                path, headers={"Authorization": f"Bearer {server.tokens['agent']}"}
+            )
+            assert response.status_code == 404
+
+    try:
+        asyncio.run(exercise())
+        assert a.api.manifest(H, t.stem)["state"]["lease"]["host"] == "laptop"
+    finally:
+        admin.close()
+
+
+@pytest.mark.parametrize(
+    "suffix", ["", "/state", "/blobs/tool-results/private", "/generations/g_removed"]
+)
+def test_existing_reads_reauthorize_at_transaction_entry(hosts, monkeypatch, suffix):
+    server, _, _, _, b, t = hosts
+    admin = Store(server.store.data_dir)
+    key = SessionKey("default", H, t.stem)
+    original = server.store.existing_authorized
+
+    def interleave(*args, **kwargs):
+        admin.purge_session(key, "test replacement")
+        writer = Writer("default", "laptop", WS)
+        g = admin.create_generation(key, "transcript.jsonl", writer, "root")
+        data = b"private replacement\n"
+        admin.append(key, g["id"], writer, 0, data, hashlib.sha256(data).hexdigest(), 1)
+        admin.put_blob(
+            key, "tool-results/private", writer, data, hashlib.sha256(data).hexdigest()
+        )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(server.store, "existing_authorized", interleave)
+    try:
+        response = b.api._client.get(f"/sessions/{H}/{t.stem}" + suffix)
+        assert response.status_code == 404
+        assert response.json() == {"error": "not_found", "detail": "session"}
+        assert (
+            admin._db.execute(
+                "SELECT COUNT(*) FROM read_audit WHERE what = 'manifest' AND host = 'agent-1'"
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        admin.close()
+
+
+def test_existing_authorization_holds_cross_process_lock_through_use(hosts):
+    server, _, _, _, _, t = hosts
+    admin = Store(server.store.data_dir)
+    key = SessionKey("default", H, t.stem)
+    admin._db.execute("PRAGMA busy_timeout = 1")
+
+    def use():
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            admin.purge_session(key, "must not interleave")
+        return server.store.manifest(key)
+
+    try:
+        result = server.store.existing_authorized(
+            key, "agent-1", "granted", use, "manifest"
+        )
+        assert result["session_id"] == t.stem
+        assert admin.session_exists(key)
+    finally:
+        admin.close()
+
+
+def test_conflict_response_uses_authorized_snapshot(hosts, monkeypatch):
+    from store import Conflict
+
+    server, _, _, a, b, t = hosts
+    key = SessionKey("default", H, t.stem)
+    admin = Store(server.store.data_dir)
+    entry = next(
+        f for f in a.api.manifest(H, t.stem)["files"] if f["path"] == "transcript.jsonl"
+    )
+    original = server.store.existing_authorized
+
+    def interleave(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except Conflict:
+            admin.purge_session(key, "test replacement after conflict")
+            writer = Writer("default", "private-host", "/private/workspace")
+            g = admin.create_generation(key, "transcript.jsonl", writer, "root")
+            data = b"private\n"
+            admin.append(
+                key, g["id"], writer, 0, data, hashlib.sha256(data).hexdigest(), 1
+            )
+            raise
+
+    monkeypatch.setattr(server.store, "existing_authorized", interleave)
+    try:
+        data = b"conflicting\n"
+        response = b.api._client.post(
+            f"/sessions/{H}/{t.stem}/generations/{entry['active']}/append",
+            headers={
+                "Hyperspace-Workspace": WS,
+                "Hyperspace-Base-Length": "0",
+                "Hyperspace-Sha256": hashlib.sha256(data).hexdigest(),
+            },
+            content=data,
+        )
+        assert response.status_code == 409
+        assert response.json()["session"]["lease"]["host"] == "laptop"
+        assert "private-host" not in response.text
+        assert "/private/workspace" not in response.text
+    finally:
+        admin.close()
+
+
 def test_fork_creator_with_own_read_scope_can_upload(tmp_path):
     server = make_server(
         tmp_path / "server", {"own": ("runner", {"read", "append"}, "own")}

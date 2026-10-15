@@ -197,6 +197,7 @@ class Conflict(StoreError):
         super().__init__("conflict", f"generation {generation} has length {length}")
         self.generation = generation
         self.length = length
+        self.session: SessionStateBody | None = None
 
 
 @dataclass(frozen=True)
@@ -442,6 +443,38 @@ class Store:
             session = self._session_row(key)
             if session is not None and not self._can_read_row(session, host, scope):
                 raise NotFound("session")
+            return operation()
+
+    def existing_authorized[T](
+        self,
+        key: SessionKey,
+        host: str,
+        scope: ReadScope,
+        operation: Callable[[], T],
+        audit: str | None = None,
+    ) -> T:
+        """Authorize and use an existing session without a purge/recreate gap.
+
+        The database write lock also excludes admin processes. The process
+        RLock alone cannot protect the identity of a session row.
+        """
+        with self._tx():
+            session = self._require_session(key)
+            if not self._can_read_row(session, host, scope):
+                raise NotFound("session")
+            try:
+                result = operation()
+            except Conflict as exc:
+                # Capture the response state before releasing authorization.
+                exc.session = self._session_state(session["id"])
+                raise
+            if audit is not None:
+                self.audit_read(key, host, audit)
+            return result
+
+    def snapshot[T](self, operation: Callable[[], T]) -> T:
+        """Keep filtered collection reads in one cross-process snapshot."""
+        with self._tx():
             return operation()
 
     # --- Files ----------------------------------------------------------

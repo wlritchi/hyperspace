@@ -368,16 +368,18 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
                 try:
                     return await handler(request, principal)
                 except Conflict as exc:
-                    state = await run_in_threadpool(
-                        store.session_state, session_key(request, principal)
-                    )
+                    # The authorized append captured this state before it
+                    # released its transaction. Never look the session up
+                    # again here: an admin may have purged and replaced it.
+                    if exc.session is None:
+                        return error("not_found", "session")
                     return error(
                         "conflict",
                         exc.detail,
                         {
                             "generation": exc.generation,
                             "length": exc.length,
-                            "session": state,
+                            "session": exc.session,
                         },
                     )
                 except StoreError as exc:
@@ -449,23 +451,6 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
             raise ApiError("bad_request", "the body must be a JSON object")
         return value  # type: ignore[return-value]
 
-    async def require_readable(key: SessionKey, principal: Principal) -> None:
-        readable = await run_in_threadpool(
-            store.can_read,
-            key,
-            principal.host,
-            principal.read,  # type: ignore[arg-type]
-        )
-        if not readable:
-            raise StoreError("not_found", "session")
-
-    async def require_writable(key: SessionKey, principal: Principal) -> None:
-        """Writes to an existing session need read access to it, so that a
-        host cannot add branches to sessions that it cannot see."""
-        exists = await run_in_threadpool(store.session_exists, key)
-        if exists:
-            await require_readable(key, principal)
-
     def int_param(request: Request, name: str, default: int | None) -> int | None:
         value = request.query_params.get(name)
         if value is None:
@@ -524,10 +509,10 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
     @authed("read")
     async def get_workspaces(request: Request, principal: Principal) -> Response:
         rows = await run_in_threadpool(
-            store.list_workspaces,
-            principal.account,
-            principal.host,
-            principal.read,  # type: ignore[arg-type]
+            store.snapshot,
+            lambda: store.list_workspaces(
+                principal.account, principal.host, principal.read
+            ),
         )
         return JSONResponse({"workspaces": rows})
 
@@ -542,6 +527,7 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
             validate_host_name(on_host)
         limit = int_param(request, "limit", 200) or 200
         sessions = await run_in_threadpool(
+            store.snapshot,
             lambda: store.list_sessions(
                 principal.account,
                 principal.host,
@@ -552,28 +538,39 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
                 since=q.get("since"),
                 title=q.get("title"),
                 limit=min(limit, 1000),
-            )
+            ),
         )
         return JSONResponse({"sessions": sessions})
 
     @authed("read")
     async def get_manifest(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_readable(key, principal)
-        manifest = await run_in_threadpool(store.manifest, key)
-        await run_in_threadpool(store.audit_read, key, principal.host, "manifest")
+        manifest = await run_in_threadpool(
+            store.existing_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.manifest(key),
+            "manifest",
+        )
         return JSONResponse(manifest)
 
     @authed("read")
     async def get_state(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_readable(key, principal)
-        return JSONResponse(await run_in_threadpool(store.session_state, key))
+        return JSONResponse(
+            await run_in_threadpool(
+                store.existing_authorized,
+                key,
+                principal.host,
+                principal.read,
+                lambda: store.session_state(key),
+            )
+        )
 
     @authed("append")
     async def post_meta(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_writable(key, principal)
         body = await read_json(request)
         w = writer(request, principal)
         await run_in_threadpool(
@@ -588,20 +585,22 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
     @authed("append")
     async def post_surrender(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_readable(key, principal)
         body = await read_json(request)
         reserved_for = body.get("reserved_for")
         if reserved_for is not None:
             validate_host_name(str(reserved_for))
         state = await run_in_threadpool(
-            store.surrender, key, principal.host, reserved_for
+            store.existing_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.surrender(key, principal.host, reserved_for),
         )
         return JSONResponse(state)
 
     @authed("read", "append")
     async def post_teleport(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_readable(key, principal)
         body = await read_json(request)
         workspace = validate_workspace(str(body.get("workspace", "")))
         w = Writer(principal.account, principal.host, workspace)
@@ -616,42 +615,50 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
                 raise ApiError("bad_request", "teleport_id must be a string")
             validate_id(teleport_id)
         event, state = await run_in_threadpool(
-            store.teleport,
+            store.existing_authorized,
             key,
-            w,
-            bool(body.get("steal", False)),
-            revision,
-            teleport_id,
+            principal.host,
+            principal.read,
+            lambda: store.teleport(
+                key, w, bool(body.get("steal", False)), revision, teleport_id
+            ),
         )
         return JSONResponse({"teleport": event, "session": state})
 
     @authed("read", "append")
     async def post_fork(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_readable(key, principal)
         body = await read_json(request)
         generation = validate_id(str(body.get("generation", "")))
         offset = body.get("offset")
         if not isinstance(offset, int):
             raise ApiError("bad_request", "offset must be an integer")
         event = await run_in_threadpool(
-            store.create_fork, key, generation, offset, principal.host
+            store.existing_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.create_fork(key, generation, offset, principal.host),
         )
         return JSONResponse(event)
 
     @authed("grant")
     async def post_grant(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_readable(key, principal)
         body = await read_json(request)
         host = validate_host_name(str(body.get("host", "")))
-        await run_in_threadpool(store.grant, key, host, principal.host)
+        await run_in_threadpool(
+            store.existing_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.grant(key, host, principal.host),
+        )
         return JSONResponse({"ok": True})
 
     @authed("append")
     async def post_generation(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_writable(key, principal)
         body = await read_json(request)
         path = validate_file_path(str(body.get("path", "")))
         cause = body.get("cause")
@@ -674,7 +681,6 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
     @authed("append")
     async def post_append(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_writable(key, principal)
         generation = validate_id(request.path_params["gen"])
         try:
             base_length = int(request.headers[HEADER_BASE_LENGTH])
@@ -689,7 +695,7 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
         if not limiter.add_bytes(principal.credential, len(data)):
             raise ApiError("rate_limited", "daily byte quota is used up")
         info, state = await run_in_threadpool(
-            store.write_authorized,
+            store.existing_authorized,
             key,
             principal.host,
             principal.read,
@@ -704,22 +710,24 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
     @authed("read")
     async def get_generation(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_readable(key, principal)
         generation = validate_id(request.path_params["gen"])
         start = int_param(request, "start", 0) or 0
         end = int_param(request, "end", None)
         if end is None or end - start > settings.max_body:
             end = start + settings.max_body
-        data = await run_in_threadpool(store.read_log, key, generation, start, end)
-        await run_in_threadpool(
-            store.audit_read, key, principal.host, f"log:{generation}"
+        data = await run_in_threadpool(
+            store.existing_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.read_log(key, generation, start, end),
+            f"log:{generation}",
         )
         return Response(data, media_type="application/octet-stream")
 
     @authed("append")
     async def put_blob(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_writable(key, principal)
         path = validate_file_path(blob_path(request))
         sha256 = validate_sha256(request.headers.get(HEADER_SHA256, ""))
         w = writer(request, principal)
@@ -738,11 +746,16 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
     @authed("read")
     async def get_blob(request: Request, principal: Principal) -> Response:
         key = session_key(request, principal)
-        await require_readable(key, principal)
         path = validate_file_path(blob_path(request))
         version = int_param(request, "version", None)
-        data = await run_in_threadpool(store.read_blob, key, path, version)
-        await run_in_threadpool(store.audit_read, key, principal.host, f"blob:{path}")
+        data = await run_in_threadpool(
+            store.existing_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.read_blob(key, path, version),
+            f"blob:{path}",
+        )
         return Response(data, media_type="application/octet-stream")
 
     s = f"{API_PREFIX}/sessions/{{harness}}/{{sid}}"
