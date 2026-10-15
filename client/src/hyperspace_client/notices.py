@@ -4,7 +4,9 @@ resume. See "The teleport notice" and "Prevention" in the spec.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -14,7 +16,7 @@ from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import ApiError
 from hyperspace_client.state import SessionRecord, State
-from hyperspace_client.sync import Context
+from hyperspace_client.sync import Context, _matching_prefix
 from hyperspace_client.teleport import move_aside
 
 log = logging.getLogger("hyperspace")
@@ -133,7 +135,7 @@ def check_resume(ctx: Context, session: LocalSession) -> dict[str, str] | None:
 
 
 def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None:
-    """Act on the lease state that the last sync saw.
+    """Act on the lease state that the last sync saw, with the session lock held.
 
     A host that held the lease and lost it (another host now holds it)
     moves its local copy aside, so that `claude --resume` does not find a
@@ -152,8 +154,8 @@ def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None
         and record.state != "conflicted"
         and record.lease_state == "held"
         and not ctx.state.get(f"restore_pending:{session.harness}:{session.session_id}")
-        and _fully_synced(ctx.state, session.transcript, ctx.api.cache_identity)
         and not adapter.is_running(session.session_id)
+        and _fully_synced(ctx, adapter, session)
     )
     if not movable:
         ctx.state.add_notice(session.harness, session.session_id, "lease", problem)
@@ -171,13 +173,45 @@ def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None
         )
 
 
-def _fully_synced(state: State, transcript: Path, server: str) -> bool:
-    """True if the server has every byte of the local transcript."""
-    cursor = state.cursor(transcript, server)
-    if cursor is None:
-        return False
+def _identity(st: os.stat_result) -> tuple[int, ...]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _fully_synced(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> bool:
+    """Check every local file against the bytes acknowledged by this server."""
+    state, server = ctx.state, ctx.api.cache_identity
+    metadata = state.session(session.harness, session.session_id).metadata
     try:
-        return transcript.stat().st_size == cursor.length
+        files = adapter.files(session, metadata)
+        stats: dict[Path, tuple[int, ...]] = {}
+        for f in files:
+            before = f.path.stat()
+            cursor = state.cursor(f.path, server)
+            if f.kind == "log" or cursor is not None:
+                if cursor is None or (
+                    cursor.harness,
+                    cursor.session_id,
+                    cursor.rel_path,
+                ) != (session.harness, session.session_id, f.rel_path):
+                    return False
+                end, _ = _matching_prefix(f.path, cursor.segments)
+                if end != cursor.length or end != before.st_size:
+                    return False
+            else:
+                known = state.blob(
+                    f.path, server, session.harness, session.session_id, f.rel_path
+                )
+                if known is None:
+                    return False
+                with f.path.open("rb") as stream:
+                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                if digest != known[2]:
+                    return False
+            stats[f.path] = _identity(before)
+        # Refuse a file change during validation, including new side files.
+        return files == adapter.files(session, metadata) and all(
+            _identity(path.stat()) == before for path, before in stats.items()
+        )
     except OSError:
         return False
 
@@ -193,20 +227,23 @@ def refresh_states(ctx: Context, adapter: ClaudeCode) -> int:
         harness=adapter.harness, host=ctx.host, limit="1000"
     ):
         sid = summary["session_id"]
-        record = ctx.state.session(adapter.harness, sid)
-        lease = summary["state"]["lease"]
-        new = (lease["state"], lease.get("host"), summary["state"]["state"])
-        if new != (record.lease_state, record.lease_host, record.state):
-            changed += 1
-            record.lease_state, record.lease_host, record.state = new
-            record.state_updated = time.time()
-            ctx.state.save_session(record)
-        if _problem(record, ctx.host) is None:
-            continue
-        # Also for a state that did not change: a session that ran during an
-        # earlier refresh can be stopped now.
-        for transcript in index.get(sid, []):
-            session = adapter.session_for_transcript(transcript)
-            if session is not None:
-                after_sync(ctx, adapter, session)
+        with ctx.state.try_lock(adapter.harness, sid) as locked:
+            if not locked:
+                continue
+            record = ctx.state.session(adapter.harness, sid)
+            lease = summary["state"]["lease"]
+            new = (lease["state"], lease.get("host"), summary["state"]["state"])
+            if new != (record.lease_state, record.lease_host, record.state):
+                changed += 1
+                record.lease_state, record.lease_host, record.state = new
+                record.state_updated = time.time()
+                ctx.state.save_session(record)
+            if _problem(record, ctx.host) is None:
+                continue
+            # Also for a state that did not change: a session that ran during an
+            # earlier refresh can be stopped now.
+            for transcript in index.get(sid, []):
+                session = adapter.session_for_transcript(transcript)
+                if session is not None:
+                    after_sync(ctx, adapter, session)
     return changed

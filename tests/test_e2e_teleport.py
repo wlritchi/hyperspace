@@ -465,3 +465,37 @@ def test_unsynced_bytes_keep_the_file_in_place(laptop: Host, agent: Host) -> Non
     assert laptop.adapter.find_transcripts(sid) == [t]
     notices = laptop.ctx.state.take_notices("claude-code", sid)
     assert notices and "agent-1 holds the lease" in notices[0]
+
+
+@pytest.mark.parametrize("change", ["transcript", "blob", "new_blob", "subagent"])
+def test_lease_loss_keeps_unuploaded_files(
+    laptop: Host, agent: Host, change: str
+) -> None:
+    t = start_session(laptop, LAPTOP_WS)
+    laptop.ctx.api.grant("claude-code", t.stem, "agent-1")
+    restore(agent.ctx, agent.adapter, t.stem, AGENT_WS, steal=True)
+    if change == "transcript":
+        t.write_bytes(t.read_bytes().replace(b"hello", b"world"))
+    elif change == "blob":
+        (t.with_suffix("") / "tool-results" / "out.txt").write_text("other output")
+    elif change == "new_blob":
+        (t.with_suffix("") / "tool-results" / "new.txt").write_text("new output")
+    else:
+        sub = t.with_suffix("") / "subagents" / "agent-test.jsonl"
+        sub.parent.mkdir()
+        sub.write_text("{}\n")
+    refresh_states(laptop.ctx, laptop.adapter)
+    assert t.exists()
+    assert laptop.ctx.state.cursor(t, laptop.ctx.api.cache_identity) is not None
+
+
+def test_lease_loss_refresh_skips_locked_session(laptop: Host, agent: Host) -> None:
+    t = start_session(laptop, LAPTOP_WS)
+    laptop.ctx.api.grant("claude-code", t.stem, "agent-1")
+    restore(agent.ctx, agent.adapter, t.stem, AGENT_WS, steal=True)
+    with laptop.ctx.state.try_lock("claude-code", t.stem) as locked:
+        assert locked
+        refresh_states(laptop.ctx, laptop.adapter)
+        assert t.exists()
+    refresh_states(laptop.ctx, laptop.adapter)
+    assert not t.exists()
