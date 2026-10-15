@@ -385,6 +385,12 @@ same request. It does not guess whether the server committed. While pending,
 every synchronous prompt check blocks, even without a credential or a fresh
 resume check, and sync does not upload the files.
 
+A replay of a committed teleport is refused if the session is now conflicted
+(`409 teleport_committed_conflict`) or its lease moved again
+(`409 teleport_committed_moved`). These responses mean that the earlier
+request committed: the client preserves the files and pending state, and never
+starts resume. Conflict recovery needs a fork.
+
 The session id stays the same. A session can teleport any number of times, and
 back to a host where it was before.
 

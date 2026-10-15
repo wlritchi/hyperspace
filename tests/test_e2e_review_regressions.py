@@ -494,6 +494,42 @@ def test_legacy_cursor_is_ignored_and_remote_copy_adopted(hosts):
     assert len(entry["generations"]) == 1
 
 
+def test_conflict_after_commit_blocks_replay_and_preserves_files(hosts, monkeypatch):
+    _, _, agent, a, b, t = hosts
+    original = b.api.teleport
+    calls = []
+
+    def conflict(*args, **kwargs):
+        calls.append(args[-1])
+        result = original(*args, **kwargs)
+        if len(calls) == 1:
+            entry = next(
+                f
+                for f in a.api.manifest(H, t.stem)["files"]
+                if f["path"] == "transcript.jsonl"
+            )
+            root = entry["generations"][0]
+            a.api.append(
+                H, t.stem, WS, root["id"], root["length"], b"activity one\n", 1
+            )
+            branch = a.api.create_generation(
+                H, t.stem, WS, "transcript.jsonl", "diverge", root["id"], root["length"]
+            )
+            a.api.append(
+                H, t.stem, WS, branch["id"], root["length"], b"activity two\n", 1
+            )
+            raise httpx.ReadError("lost first response")
+        return result
+
+    monkeypatch.setattr(b.api, "teleport", conflict)
+    with pytest.raises(TeleportError, match="conflicted"):
+        restore(b, agent.adapter, t.stem, WS, steal=True)
+    assert calls[0] == calls[1]
+    assert (agent.adapter.project_dir(WS) / t.name).read_bytes() == t.read_bytes()
+    assert b.state.get(f"restore_pending:{H}:{t.stem}")
+    assert a.api.state(H, t.stem)["state"] == "conflicted"
+
+
 def test_fork_creator_with_own_read_scope_can_upload(tmp_path):
     server = make_server(
         tmp_path / "server", {"own": ("runner", {"read", "append"}, "own")}

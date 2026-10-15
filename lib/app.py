@@ -64,6 +64,8 @@ _STATUS = {
     "conflicted": 409,
     "not_holder": 409,
     "stale_snapshot": 409,
+    "teleport_committed_conflict": 409,
+    "teleport_committed_moved": 409,
     "bad_request": 400,
     "bad_range": 400,
     "bad_digest": 400,

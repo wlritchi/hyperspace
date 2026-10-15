@@ -889,6 +889,21 @@ class Store:
                         or previous["target_workspace"] != writer.workspace
                     ):
                         raise StoreError("bad_request", "teleport id is already in use")
+                    if session["state"] == "conflicted":
+                        raise StoreError(
+                            "teleport_committed_conflict",
+                            "this teleport committed, but the session is now conflicted; fork it",
+                        )
+                    if (
+                        session["lease_state"] != "held"
+                        or session["lease_host"] != writer.host
+                        or session["lease_workspace"] != writer.workspace
+                        or session["lease_since"] != previous["created"]
+                    ):
+                        raise StoreError(
+                            "teleport_committed_moved",
+                            "the lease changed after this teleport",
+                        )
                     event: TeleportEvent = {
                         "id": teleport_id,
                         "target_host": writer.host,

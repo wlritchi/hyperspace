@@ -216,11 +216,26 @@ def _confirm_teleport(
     uncertain = already_sent
     for attempt in range(2):
         try:
-            return api.teleport(harness, sid, workspace, steal, revision, teleport_id)
+            response = api.teleport(
+                harness, sid, workspace, steal, revision, teleport_id
+            )
+            if response["session"]["state"] == "conflicted":
+                raise _UnconfirmedRestore(
+                    "restore committed, but the session is conflicted; use hyperspace fork"
+                )
+            return response
         except (httpx.HTTPError, ApiError) as exc:
+            committed = isinstance(exc, ApiError) and exc.code.startswith(
+                "teleport_committed_"
+            )
             ambiguous = isinstance(exc, httpx.HTTPError) or (
                 isinstance(exc, ApiError) and (exc.status >= 500 or exc.status == 408)
             )
+            if committed:
+                assert isinstance(exc, ApiError)
+                raise _UnconfirmedRestore(
+                    f"restore committed but cannot resume: {exc.detail}; use hyperspace show or fork"
+                ) from exc
             # These server-side transaction rejections establish that this
             # id did not commit. Authentication/rate-limit failures do not.
             definite = (
