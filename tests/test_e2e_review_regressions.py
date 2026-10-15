@@ -17,7 +17,7 @@ from hyperspace_client.adapters import LocalFile
 from hyperspace_client.adapters.claude_code import sanitize_path
 from hyperspace_client.api import ApiError
 from hyperspace_client.sync import Syncer
-from hyperspace_client.teleport import SURRENDERED, TeleportError, restore, send
+from hyperspace_client.teleport import SURRENDERED, TeleportError, fork, restore, send
 from hyperspace_protocol import (
     HEADER_WORKSPACE_UTF8,
     decode_workspace,
@@ -162,6 +162,40 @@ def test_send_refuses_partial_tail(hosts):
         send(a, laptop.adapter, t.stem, "agent-1")
     assert t.read_bytes() == local
     assert a.api.state(H, t.stem)["lease"]["host"] == "laptop"
+
+
+def test_runner_fork_copies_all_side_files(hosts):
+    _, _, agent, a, b, t = hosts
+    side_log = json.dumps({"sessionId": t.stem, "type": "user"}).encode() + b"\n"
+    g = a.api.create_generation(H, t.stem, WS, "subagents/agent-a.jsonl", "root")
+    a.api.append(H, t.stem, WS, g["id"], 0, side_log, 0)
+    files = {
+        "tool-results/out.txt": b"tool result",
+        "file-history/snapshot": b"old file",
+        "workflows/run.json": b"{}",
+        "plans/shared.md": b"source plan",
+        "subagents/agent-a.meta.json": b"{}",
+    }
+    for name, data in files.items():
+        a.api.put_blob(H, t.stem, WS, name, data)
+    result = fork(b, agent.adapter, t.stem, WS)
+    m = b.api.manifest(H, result.new_id)
+    assert {f["path"] for f in m["files"]} == set(files) | {
+        "transcript.jsonl",
+        "subagents/agent-a.jsonl",
+    }
+    for name, data in files.items():
+        assert b.api.read_blob(H, result.new_id, name) == data
+        assert (
+            agent.adapter.local_path(
+                result.transcript.with_suffix(""), name
+            ).read_bytes()
+            == data
+        )
+    assert (
+        result.new_id.encode()
+        in (result.transcript.with_suffix("") / "subagents/agent-a.jsonl").read_bytes()
+    )
 
 
 def test_blob_cache_is_scoped_by_session(hosts):

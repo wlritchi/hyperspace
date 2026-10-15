@@ -21,6 +21,7 @@ from typing import Any, cast
 
 import httpx
 
+from hyperspace_client.adapters import LocalFile
 from hyperspace_client.adapters.claude_code import TRANSCRIPT, ClaudeCode, sanitize_path
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.state import Cursor, Segment, SessionRecord, State
@@ -35,6 +36,7 @@ from hyperspace_protocol import (
     SessionStateBody,
     TeleportResponse,
     validate_file_path,
+    validate_metadata,
     validate_session_id,
 )
 
@@ -599,16 +601,45 @@ def fork(
     length = generations[branch]["length"]
     event = ctx.api.fork(harness, session_id, branch, length)
     new_id = validate_session_id(event["session_id"])
-    data = _log_bytes(ctx.api, harness, session_id, branch, length)
-    target = adapter.project_dir(workspace) / f"{new_id}.jsonl"
-    _atomic_write(target, adapter.fork_records(data, session_id, new_id))
-    session = adapter.session_for_transcript(target)
-    assert session is not None
-    record = ctx.state.session(harness, new_id)
-    record.workspace = workspace
-    record.transcript = str(target)
-    ctx.state.save_session(record)
-    with ctx.state.try_lock(harness, new_id) as locked:
-        if locked:
-            Syncer(ctx, session, workspace).run()
-    return ForkResult(session_id, new_id, branch, target)
+    # Copy every remote file, not only files discoverable on this host.
+    # Upload from a private staging directory so a shared local plan cannot
+    # replace the source plan before its backup is complete.
+    with tempfile.TemporaryDirectory(prefix="fork-", dir=ctx.state.directory) as temp:
+        target = Path(temp) / f"{new_id}.jsonl"
+        session = adapter.session_for_transcript(target)
+        assert session is not None
+        syncer = Syncer(ctx, session, workspace)
+        metadata: dict[str, Any] = {}
+        for index, item in enumerate(manifest["files"]):
+            validate_file_path(item["path"])
+            if item["kind"] == "log":
+                gen = (
+                    generations[branch] if item["path"] == TRANSCRIPT else _active(item)
+                )
+                data = _log_bytes(
+                    ctx.api, harness, session_id, gen["id"], gen["length"]
+                )
+                if item["path"].endswith(".jsonl"):
+                    data = adapter.fork_records(data, session_id, new_id)
+            else:
+                version = item["versions"][-1]
+                data = ctx.api.read_blob(
+                    harness, session_id, item["path"], version["version"]
+                )
+                if hashlib.sha256(data).hexdigest() != version["sha256"]:
+                    raise TeleportError(f"invalid download for {item['path']}")
+            path = Path(temp) / str(index)
+            path.write_bytes(data)
+            local = LocalFile(item["path"], item["kind"], path)
+            if item["kind"] == "log" or len(data) > CHUNK * 2:
+                metadata = syncer.sync_log(local, metadata)
+            else:
+                syncer.sync_blob(local)
+        ctx.api.add_metadata(
+            harness,
+            new_id,
+            workspace,
+            validate_metadata(adapter.server_metadata(metadata)),
+        )
+    restored = restore(ctx, adapter, new_id, workspace)
+    return ForkResult(session_id, new_id, branch, restored.transcript)
