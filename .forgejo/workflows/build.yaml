@@ -92,9 +92,11 @@ jobs:
           : "${REGISTRY_USERNAME:?set the REGISTRY_USERNAME secret}"
           : "${REGISTRY_PASSWORD:?set the REGISTRY_PASSWORD secret}"
           mkdir -p "$DOCKER_CONFIG"
-          printf '{"auths":{"https://%s":{"username":"%s","password":"%s"},"%s":{"username":"%s","password":"%s"}}}' \
-            "$REGISTRY" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" \
-            "$REGISTRY" "$REGISTRY_USERNAME" "$REGISTRY_PASSWORD" > "$DOCKER_CONFIG/config.json"
+          # Registry is a host[:port], not an arbitrary JSON string.
+          case "$REGISTRY" in *[!A-Za-z0-9.:-]*) echo "Invalid registry host" >&2; exit 1;; esac
+          AUTH="$(printf '%s' "${REGISTRY_USERNAME}:${REGISTRY_PASSWORD}" | base64 | tr -d '\n')"
+          printf '{"auths":{"https://%s":{"auth":"%s"},"%s":{"auth":"%s"}}}' \
+            "$REGISTRY" "$AUTH" "$REGISTRY" "$AUTH" > "$DOCKER_CONFIG/config.json"
 
       - name: Push release tag
         run: |

@@ -1,7 +1,10 @@
 # vim: filetype=python
 """Release and credential regression tests with synthetic data only."""
 
+import base64
 import importlib.util
+import json
+import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -74,6 +77,31 @@ except BlockingIOError:
         [sys.executable, "-c", code, str(path.with_suffix(".lock"))], check=False
     )
     assert result.returncode == 0
+
+
+def test_registry_auth_preserves_arbitrary_password():
+    text = (ROOT / ".forgejo/workflows/build.yaml").read_text()
+    start = text.index('          AUTH="$(printf', text.index("- name: Registry login"))
+    end = text.index("\n\n", start)
+    script = "\n".join(line[10:] for line in text[start:end].splitlines())
+    # Capture the generated config on stdout, rather than using a real registry.
+    script = script.replace(' > "$DOCKER_CONFIG/config.json"', "")
+    password = 'quotes" slash\\n actual\nnewline'
+    out = subprocess.run(
+        ["sh", "-c", script],
+        env={
+            **os.environ,
+            "REGISTRY": "registry.example.com",
+            "REGISTRY_USERNAME": "example",
+            "REGISTRY_PASSWORD": password,
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    config = json.loads(out.stdout)
+    auth = config["auths"]["registry.example.com"]["auth"]
+    assert base64.b64decode(auth).decode() == "example:" + password
 
 
 def test_release_uses_event_sha_and_serializes():
