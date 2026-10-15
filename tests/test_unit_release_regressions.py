@@ -74,3 +74,37 @@ except BlockingIOError:
         [sys.executable, "-c", code, str(path.with_suffix(".lock"))], check=False
     )
     assert result.returncode == 0
+
+
+def test_release_uses_event_sha_and_serializes():
+    for filename in ("build.yaml", "packages.yaml"):
+        text = (ROOT / ".forgejo/workflows" / filename).read_text()
+        assert 'git checkout --detach "${GITHUB_SHA}"' in text
+        assert 'git checkout "${GITHUB_REF}"' not in text
+        assert "cancel-in-progress: false" in text
+        assert "concurrency:" in text
+
+
+def test_version_skips_commit_already_in_newer_release(tmp_path):
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+    git("init")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    git("config", "commit.gpgsign", "false")
+    git("commit", "--allow-empty", "-m", "feat: first")
+    first = git("rev-parse", "HEAD")
+    git("commit", "--allow-empty", "-m", "fix: second")
+    git("tag", "0.1.0")
+    git("checkout", "--detach", first)
+    result = subprocess.run(
+        ["sh", str(ROOT / ".forgejo/scripts/next-version.sh"), ""],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout == ""

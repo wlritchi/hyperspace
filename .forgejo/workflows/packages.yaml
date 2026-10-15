@@ -12,6 +12,10 @@ on:
       - 'protocol/**'
       - 'client/**'
 
+concurrency:
+  group: release-packages
+  cancel-in-progress: false
+
 jobs:
   tag:
     runs-on: docker
@@ -28,8 +32,8 @@ jobs:
           git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
           AUTH="$(printf '%s' "x-access-token:${GH_TOKEN}" | base64 | tr -d '\n')"
           git config --local http.extraheader "Authorization: Basic ${AUTH}"
-          git fetch --tags origin "+${GITHUB_REF}:${GITHUB_REF}" || git fetch --tags origin
-          git checkout "${GITHUB_REF}"
+          git fetch --tags origin
+          git checkout --detach "${GITHUB_SHA}"
 
       - name: Tag
         run: |

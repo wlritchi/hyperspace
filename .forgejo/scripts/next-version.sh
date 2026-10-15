@@ -11,6 +11,14 @@
 set -eu
 PREFIX="$1"
 shift
+# Queued runs can execute out of order. A newer release that already
+# contains this commit covers it; do not allocate an older duplicate tag.
+for TAG in $(git tag -l --contains HEAD "${PREFIX}*"); do
+  VERSION="${TAG#"${PREFIX}"}"
+  if printf '%s\n' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    exit 0
+  fi
+done
 LAST="$(git tag -l --merged HEAD "${PREFIX}*" | sed "s/^${PREFIX}//" \
   | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
 if [ -n "${LAST}" ]; then

@@ -17,6 +17,10 @@ on:
       - main
   workflow_dispatch: {}
 
+concurrency:
+  group: release-server
+  cancel-in-progress: false
+
 jobs:
   image:
     runs-on: buildkit
@@ -42,8 +46,8 @@ jobs:
           git config --local http.extraheader "Authorization: Basic ${AUTH}"
           # Full history and tags: the version reads commits since the last
           # release tag.
-          git fetch --tags origin "+${GITHUB_REF}:${GITHUB_REF}" || git fetch --tags origin
-          git checkout "${GITHUB_REF}"
+          git fetch --tags origin
+          git checkout --detach "${GITHUB_SHA}"
 
       - name: Resolve version
         id: version
