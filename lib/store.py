@@ -1494,9 +1494,13 @@ class _Transaction:
 
     def __enter__(self) -> None:
         self._store._lock.acquire()
-        if not self._store._db.in_transaction:
-            self._store._db.execute("BEGIN IMMEDIATE")
-            self._depth_owner = True
+        try:
+            if not self._store._db.in_transaction:
+                self._store._db.execute("BEGIN IMMEDIATE")
+                self._depth_owner = True
+        except BaseException:
+            self._store._lock.release()
+            raise
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         try:
