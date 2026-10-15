@@ -74,9 +74,23 @@ def default_config_dir() -> Path:
 
 
 def sanitize_path(path: str) -> str:
-    """The project directory name that Claude Code uses for a working
-    directory: every character outside [A-Za-z0-9] becomes `-`."""
-    return re.sub(r"[^A-Za-z0-9]", "-", path)
+    """Match Claude Code 2.1.288, including its UTF-16 hash and 200-unit limit."""
+    raw = path.encode("utf-16-le", errors="surrogatepass")
+    units = [int.from_bytes(raw[i : i + 2], "little") for i in range(0, len(raw), 2)]
+    encoded = "".join(chr(c) if c < 128 and chr(c).isalnum() else "-" for c in units)
+    if len(encoded) <= 200:
+        return encoded
+    digest = 0
+    for c in units:
+        digest = (31 * digest + c) & 0xFFFFFFFF
+    if digest >= 0x80000000:
+        digest -= 0x100000000
+    number = abs(digest)
+    suffix = ""
+    while number:
+        number, digit = divmod(number, 36)
+        suffix = "0123456789abcdefghijklmnopqrstuvwxyz"[digit] + suffix
+    return encoded[:200] + "-" + (suffix or "0")
 
 
 def _records(data: bytes) -> list[dict[str, Any]]:

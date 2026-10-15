@@ -11,8 +11,10 @@ import threading
 import pytest
 
 from _hs import FakeClaude, context, make_server, prompt
+from hyperspace_client.adapters.claude_code import sanitize_path
 from hyperspace_client.api import ApiError
 from hyperspace_client.sync import Syncer
+from hyperspace_client.teleport import restore
 from store import SessionKey, Store, Writer
 
 H = "claude-code"
@@ -108,3 +110,18 @@ def test_failed_transaction_entry_releases_store_lock(tmp_path):
     assert acquired == [True]
     one.close()
     two.close()
+
+
+def test_long_workspace_matches_harness_encoding():
+    # Expected values from Claude Code 2.1.288's JavaScript implementation,
+    # not from the Python encoder used by FakeClaude.
+    assert sanitize_path("/a" * 110) == ("-a" * 100) + "-816x1g"
+    assert sanitize_path("/😀") == "---"
+
+
+def test_restore_into_long_workspace(hosts):
+    _, _, agent, _, b, t = hosts
+    workspace = "/a" * 160
+    result = restore(b, agent.adapter, t.stem, workspace, steal=True)
+    assert result.transcript.read_bytes() == t.read_bytes()
+    assert len(result.transcript.parent.name) <= 208

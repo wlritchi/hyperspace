@@ -75,9 +75,11 @@ They control the design.
 - **Location.** The main transcript is
   `<config dir>/projects/<sanitize(cwd)>/<sid>.jsonl`. The config directory is
   `~/.claude` unless `CLAUDE_CONFIG_DIR` is set. `sanitize` replaces every
-  character outside `[A-Za-z0-9]` with `-`, and very long names are shortened.
-  The encoding is lossy, so the client records the real `cwd` and does not
-  decode the directory name.
+  UTF-16 code unit outside `[A-Za-z0-9]` with `-`. Above 200 units, it keeps
+  the first 200 and adds `-` plus the absolute signed 32-bit polynomial hash
+  of the original path (multiplier 31), in base 36. This matches Claude Code
+  2.1.288. The encoding is lossy, so the client records the real `cwd` and
+  does not decode the directory name.
 - **Side files** are in `projects/<enc>/<sid>/`: `subagents/agent-*.jsonl`
   with `.meta.json` files, `tool-results/*` (large tool outputs that the
   transcript refers to by absolute path), and `workflows/`. Outside the
