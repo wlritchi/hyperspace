@@ -343,12 +343,16 @@ def _restore(
         pending = json.loads(pending_text)
     replay = pending.get("phase") == "sent"
     if replay:
-        if (
-            pending.get("server") != api.cache_identity
-            or pending.get("workspace") != workspace
-        ):
+        # The server ties the teleport id to the target host and workspace,
+        # not to the credential. Thus a new credential for the same host can
+        # replay the request. An older record names the credential.
+        same_server = (
+            pending.get("server") == api.server_identity
+            and pending.get("host") == ctx.host
+        ) or pending.get("server") == api.cache_identity
+        if not same_server or pending.get("workspace") != workspace:
             raise TeleportError(
-                "retry the pending restore with its original server, credential, and workspace"
+                "retry the pending restore with its original server, host, and workspace"
             )
         manifest = cast(Manifest, pending["manifest"])
         steal = bool(pending["steal"])
@@ -423,7 +427,8 @@ def _restore(
     moved: list[tuple[Path, Path]] = []
     teleport_id = str(pending["teleport_id"]) if replay else "t_" + uuid.uuid4().hex
     pending = {
-        "server": api.cache_identity,
+        "server": api.server_identity,
+        "host": ctx.host,
         "workspace": workspace,
         "steal": steal,
         "tool_results": tool_results,

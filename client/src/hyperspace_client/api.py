@@ -76,6 +76,9 @@ class Api:
         # Do not put a credential in the state database. A rotation causes
         # safe cache misses, and cannot reuse another account's cache.
         self.cache_identity = hashlib.sha256((url + "\n" + token).encode()).hexdigest()
+        # The server without the credential. State that must survive a
+        # rotation, such as a pending restore, uses this identity.
+        self.server_identity = hashlib.sha256(url.encode()).hexdigest()
 
     def close(self) -> None:
         self._client.close()

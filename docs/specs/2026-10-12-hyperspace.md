@@ -386,9 +386,13 @@ If a lease response is lost or returns a server error, the client retries with
 the same id. If confirmation remains unavailable, including an authentication
 or rate-limit failure on the retry, it keeps the complete files and the
 pending request (id, snapshot, and target). A later restore reconciles that
-same request. It does not guess whether the server committed. While pending,
-every synchronous prompt check blocks, even without a credential or a fresh
-resume check, and sync does not upload the files.
+same request. It does not guess whether the server committed. The pending
+request is bound to the server URL, the host, and the workspace, not to the
+credential: the server ties the teleport id to the target host and workspace.
+Thus a restore with a new credential for the same host, for example after an
+authentication failure, reconciles the request. While pending, every
+synchronous prompt check blocks, even without a credential or a fresh resume
+check, and sync does not upload the files.
 
 A replay of a committed teleport is refused if the session is now conflicted
 (`409 teleport_committed_conflict`) or its lease moved again

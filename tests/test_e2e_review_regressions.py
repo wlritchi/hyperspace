@@ -733,3 +733,55 @@ def test_fork_creator_with_own_read_scope_can_upload(tmp_path):
         api.create_generation(H, event["session_id"], WS, "transcript.jsonl", "root")
     finally:
         server.close()
+
+
+def test_pending_restore_replays_after_credential_rotation(tmp_path, monkeypatch):
+    from hyperspace_client.sync import Context
+
+    server = make_server(
+        tmp_path / "server",
+        {
+            "laptop": ("laptop", {"append", "read", "grant"}, "all"),
+            "agent": ("agent-1", {"append", "read", "grant"}, "granted"),
+            "rotated": ("agent-1", {"append", "read", "grant"}, "granted"),
+        },
+    )
+    laptop = FakeClaude(tmp_path / "laptop")
+    agent = FakeClaude(tmp_path / "agent")
+    a = context(server.api("laptop"), tmp_path / "a-state", laptop, "laptop")
+    b = context(server.api("agent"), tmp_path / "b-state", agent, "agent-1")
+    try:
+        t = laptop.transcript(WS)
+        laptop.write(t, prompt("backed up", cwd=WS))
+        Syncer(a, laptop.adapter.session_for_transcript(t), WS).run()
+        a.api.grant(H, t.stem, "agent-1")
+        original = b.api.teleport
+        calls: list[str] = []
+
+        def lost(*args, **kwargs):
+            calls.append(args[-1])
+            if len(calls) == 1:
+                original(*args, **kwargs)
+            raise ApiError(504, "error", "gateway timeout")
+
+        monkeypatch.setattr(b.api, "teleport", lost)
+        with pytest.raises(TeleportError, match="confirmation"):
+            restore(b, agent.adapter, t.stem, WS, steal=True)
+        assert b.state.get(f"restore_pending:{H}:{t.stem}")
+
+        # A pending request stays bound to its host and workspace.
+        elsewhere = Context(server.api("rotated"), b.state, agent.adapter, "agent-2")
+        with pytest.raises(TeleportError, match="original server"):
+            restore(elsewhere, agent.adapter, t.stem, WS)
+        with pytest.raises(TeleportError, match="original server"):
+            restore(b, agent.adapter, t.stem, "/work/other")
+
+        rotated = Context(server.api("rotated"), b.state, agent.adapter, "agent-1")
+        restore(rotated, agent.adapter, t.stem, WS)
+        assert not b.state.get(f"restore_pending:{H}:{t.stem}")
+        teleports = a.api.manifest(H, t.stem)["teleports"]
+        assert [e["id"] for e in teleports] == [calls[0]]
+    finally:
+        a.state.close()
+        b.state.close()
+        server.close()
