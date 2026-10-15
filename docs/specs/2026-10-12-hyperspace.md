@@ -231,7 +231,13 @@ than one session, and a session can leave its first workspace.
 ### Append protocol
 
 The client uploads only complete records. For a JSONL log, it uploads up to
-the last newline and leaves a partial last line for the next sync.
+the last newline and leaves a partial last line for the next sync. Each append
+ends at the end of a record, also when one record is larger than the usual
+append size. Only a record that is too large for one request goes up in more
+than one append. The activity count of a record goes with the append that
+holds the end of the record. Two hosts can fork between two pieces of such a
+record, when their first pieces are the same. The last piece is then after the
+fork on each branch, so each branch keeps the activity of its own record.
 
 An append request contains the generation id, the _base length_ (the
 generation length that the client expects), the sha256 of the new bytes, the

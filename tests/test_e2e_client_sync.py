@@ -30,7 +30,16 @@ from hyperspace_client.checkpoint import checkpoint
 from hyperspace_client.cli import _sweep
 from hyperspace_client.config import Config
 from hyperspace_client.state import State
-from hyperspace_client.sync import Context, Syncer
+from hyperspace_client.sync import (
+    CHUNK,
+    RECORD_MAX,
+    Context,
+    Syncer,
+    _chunk_size,
+    _record_start,
+    _records_ending,
+)
+from hyperspace_protocol import MAX_BODY
 from store import SessionKey
 
 WS = "/home/wlritchi/hyperspace"
@@ -285,6 +294,154 @@ def test_two_hosts_diverge(server: Server, fake: FakeClaude, tmp_path: Path) -> 
     entry, manifest = log_entry(server, t.stem)
     assert sorted(g["cause"] for g in entry["generations"]) == ["diverge", "root"]
     assert manifest["state"]["state"] == "conflicted"
+
+
+def test_a_record_larger_than_a_chunk_goes_up_whole(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    ctx = context(server.api("laptop"), tmp_path / "state", fake, "laptop")
+    t = fake.transcript(WS)
+    fake.write(t, prompt("x" * (CHUNK + 100)), tool_call())
+    sync(ctx, t)
+    assert active_bytes(server, t.stem) == t.read_bytes()
+    entry, _ = log_entry(server, t.stem)
+    assert entry["generations"][0]["activity"] == 2
+    cursor = ctx.state.cursor(t, ctx.api.cache_identity)
+    assert cursor is not None
+    data = t.read_bytes()
+    # Each append ends at the end of a record.
+    for seg in cursor.segments:
+        assert data[seg.offset + seg.length - 1 : seg.offset + seg.length] == b"\n"
+
+
+def test_a_record_larger_than_a_request_keeps_its_activity(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    ctx = context(server.api("laptop"), tmp_path / "state", fake, "laptop")
+    t = fake.transcript(WS)
+    fake.write(t, prompt("x" * (MAX_BODY + 100)), tool_call())
+    sync(ctx, t)
+    assert active_bytes(server, t.stem) == t.read_bytes()
+    entry, _ = log_entry(server, t.stem)
+    assert entry["generations"][0]["activity"] == 2
+    _, manifest = log_entry(server, t.stem)
+    assert manifest["metadata"]["cwd"] == WS
+
+
+def test_two_hosts_diverge_with_large_prompts(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    t = fake.transcript(WS)
+    fake.write(t, prompt("one"))
+    laptop = context(server.api("laptop"), tmp_path / "s1", fake, "laptop")
+    sync(laptop, t)
+    laptop.api.grant("claude-code", t.stem, "agent-1")
+    other = FakeClaude(tmp_path / "claude2")
+    t2 = other.transcript("/home/agent/workspace", t.stem)
+    t2.write_bytes(t.read_bytes())
+    agent = context(server.api("agent"), tmp_path / "s2", other, "agent-1")
+    sync(agent, t2, "/home/agent/workspace")
+    other.write(t2, prompt("a" * (CHUNK + 100)))
+    sync(agent, t2, "/home/agent/workspace")
+    fake.write(t, prompt("l" * (CHUNK + 100)))
+    r = sync(laptop, t)
+    assert r.diverged
+    _, manifest = log_entry(server, t.stem)
+    assert manifest["state"]["state"] == "conflicted"
+
+
+def test_two_hosts_diverge_in_the_last_piece_of_a_large_record(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    t = fake.transcript(WS)
+    fake.write(t, prompt("one"))
+    shared = len(t.read_bytes())
+    laptop = context(server.api("laptop"), tmp_path / "s1", fake, "laptop")
+    sync(laptop, t)
+    laptop.api.grant("claude-code", t.stem, "agent-1")
+    other = FakeClaude(tmp_path / "claude2")
+    t2 = other.transcript("/home/agent/workspace", t.stem)
+    t2.write_bytes(t.read_bytes())
+    agent = context(server.api("agent"), tmp_path / "s2", other, "agent-1")
+    sync(agent, t2, "/home/agent/workspace")
+    # Each record is too large for one request. The first piece of the two
+    # records is the same, and only the last piece is different.
+    other.write(t2, prompt("x" * (MAX_BODY + 100) + "a"))
+    sync(agent, t2, "/home/agent/workspace")
+    fake.write(t, prompt("x" * (MAX_BODY + 100) + "l"))
+    r = sync(laptop, t)
+    assert r.diverged
+    entry, manifest = log_entry(server, t.stem)
+    assert manifest["state"]["state"] == "conflicted"
+    by_cause = {g["cause"]: g for g in entry["generations"]}
+    assert sorted(by_cause) == ["diverge", "root"]
+    # The laptop skipped the same first piece, then forked inside the record.
+    assert by_cause["diverge"]["fork_offset"] > shared
+    key = SessionKey("default", "claude-code", t.stem)
+    agent_branch = server.store.read_log(key, by_cause["root"]["id"], 0, None)
+    laptop_branch = server.store.read_log(key, by_cause["diverge"]["id"], 0, None)
+    assert agent_branch == t2.read_bytes()
+    assert laptop_branch == t.read_bytes()
+    assert by_cause["root"]["activity"] == 2
+    assert by_cause["diverge"]["activity"] == 1
+
+
+def test_a_retry_does_not_skip_other_bytes(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    t = fake.transcript(WS)
+    fake.write(t, prompt("one"))
+    laptop = context(server.api("laptop"), tmp_path / "s1", fake, "laptop")
+    sync(laptop, t)
+    laptop.api.grant("claude-code", t.stem, "agent-1")
+    other = FakeClaude(tmp_path / "claude2")
+    t2 = other.transcript("/home/agent/workspace", t.stem)
+    t2.write_bytes(t.read_bytes())
+    agent = context(server.api("agent"), tmp_path / "s2", other, "agent-1")
+    sync(agent, t2, "/home/agent/workspace")
+    # The agent uploads the same record as the laptop, then one more.
+    other.write(t2, prompt("same"))
+    sync(agent, t2, "/home/agent/workspace")
+    other.write(t2, prompt("agent work"))
+    sync(agent, t2, "/home/agent/workspace")
+    # The laptop's append is a retry of the agent's segment. The cursor
+    # must not move past the agent's next record, which the laptop does
+    # not have.
+    fake.write(t, prompt("same"))
+    sync(laptop, t)
+    cursor = laptop.state.cursor(t, laptop.api.cache_identity)
+    assert cursor is not None
+    assert cursor.length == len(t.read_bytes())
+    fake.write(t, prompt("laptop work"))
+    r = sync(laptop, t)
+    assert r.diverged
+    entry, manifest = log_entry(server, t.stem)
+    assert manifest["state"]["state"] == "conflicted"
+    key = SessionKey("default", "claude-code", t.stem)
+    contents = sorted(
+        server.store.read_log(key, g["id"], 0, None) for g in entry["generations"]
+    )
+    assert contents == sorted([t.read_bytes(), t2.read_bytes()])
+
+
+def test_chunk_size_and_records(tmp_path: Path) -> None:
+    data = b"ab\ncdef\ngh\n"
+    assert _chunk_size(data, 4, 8) == 3  # the last newline in 4 bytes
+    assert _chunk_size(b"abcdef\ngh\n", 4, 8) == 7  # one whole record
+    assert _chunk_size(b"abcdefghij\n", 4, 8) == 4  # too large: a piece
+    assert _chunk_size(b"abc", 4, 8) == 3
+    assert RECORD_MAX < MAX_BODY
+    path = tmp_path / "log"
+    path.write_bytes(data)
+    assert _record_start(path, 0) == 0
+    assert _record_start(path, 3) == 3
+    assert _record_start(path, 5) == 3
+    # A piece holds the records that end in it, also when an earlier piece
+    # holds their start.
+    assert _records_ending(path, 0, 0, data[:5]) == (b"ab\n", 3)
+    assert _records_ending(path, 3, 5, data[5:9]) == (b"cdef\n", 8)
+    # A piece without the end of a record holds no record.
+    assert _records_ending(path, 3, 4, data[4:6]) == (b"", 3)
 
 
 def test_side_files(server: Server, fake: FakeClaude, tmp_path: Path) -> None:

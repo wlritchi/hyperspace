@@ -29,6 +29,10 @@ log = logging.getLogger("hyperspace")
 # Upload at most this much in one append. A smaller size than the server
 # limit leaves room for headers and keeps each request short.
 CHUNK = MAX_BODY // 2
+# A record that is larger than CHUNK goes up in one append if it is at most
+# this size. The margin keeps the compressed body below the server limit,
+# also for data that does not compress.
+RECORD_MAX = MAX_BODY - MAX_BODY // 128
 
 
 @dataclass
@@ -58,20 +62,50 @@ def _read(path: Path, start: int, end: int | None = None) -> bytes:
         return f.read() if end is None else f.read(end - start)
 
 
-def _chunks(data: bytes, size: int) -> list[bytes]:
-    """Split `data` into pieces of at most `size` bytes, at newlines where
-    possible."""
-    out: list[bytes] = []
-    start = 0
-    while start < len(data):
-        end = min(start + size, len(data))
-        if end < len(data):
-            cut = data.rfind(b"\n", start, end)
-            if cut >= start:
-                end = cut + 1
-        out.append(data[start:end])
-        start = end
-    return out
+def _chunk_size(data: bytes, size: int, limit: int) -> int:
+    """The length of the next piece of `data` to upload. The piece ends at
+    the last newline in the first `size` bytes. If there is no such newline,
+    the piece is the first record, when that record is at most `limit`
+    bytes. Otherwise the piece is `size` bytes of a record that is too large
+    for one request."""
+    if len(data) <= size:
+        return len(data)
+    cut = data.rfind(b"\n", 0, size)
+    if cut >= 0:
+        return cut + 1
+    cut = data.find(b"\n", size, limit)
+    return cut + 1 if cut >= 0 else size
+
+
+def _record_start(path: Path, offset: int) -> int:
+    """The offset where the record that holds byte `offset` starts: just
+    after the last newline before `offset`, or 0."""
+    pos = offset
+    with open(path, "rb") as f:
+        while pos > 0:
+            start = max(0, pos - CHUNK)
+            f.seek(start)
+            cut = f.read(pos - start).rfind(b"\n")
+            if cut >= 0:
+                return start + cut + 1
+            pos = start
+    return 0
+
+
+def _records_ending(
+    path: Path, record: int, offset: int, piece: bytes
+) -> tuple[bytes, int]:
+    """The complete records that end in `piece`, which is at `offset` in
+    the file at `path`, and the start of the record after them. `record` is
+    the start of the record that holds `offset`. It can be before `offset`,
+    when an earlier piece holds the start of that record."""
+    cut = piece.rfind(b"\n")
+    if cut < 0:
+        return b"", record
+    stop = offset + cut + 1
+    if record == offset:
+        return piece[: cut + 1], stop
+    return _read(path, record, stop), stop
 
 
 def _matching_prefix(path: Path, segments: list[Segment]) -> tuple[int, list[Segment]]:
@@ -270,22 +304,40 @@ class Syncer:
                 metadata = self.ctx.adapter.update_metadata(
                     metadata, f.rel_path, _read(f.path, 0, cursor.length)
                 )
+        # Each record goes with the append that holds its end. That append
+        # carries the activity of the record, and the metadata includes the
+        # record after that append. A record that is too large for one
+        # request goes up in pieces, and two hosts can fork between two
+        # pieces of a record. The last piece is after such a fork, so each
+        # branch keeps the activity of the record that it does not share.
+        record = _record_start(f.path, cursor.length)
         while cursor.length < end:
             before = cursor.length
-            chunk = _chunks(_read(f.path, before, end), CHUNK)[0]
-            self._append(f, cursor, chunk)
-            metadata = self.ctx.adapter.update_metadata(
-                metadata, f.rel_path, _read(f.path, before, cursor.length)
+            data = _read(f.path, before, min(end, before + RECORD_MAX))
+            piece = data[: _chunk_size(data, CHUNK, RECORD_MAX)]
+            records, _ = _records_ending(f.path, record, before, piece)
+            self._append(
+                f, cursor, piece, self.ctx.adapter.activity(f.rel_path, records)
             )
+            if cursor.length > before:
+                if cursor.length != before + len(piece):
+                    piece = _read(f.path, before, cursor.length)
+                records, record = _records_ending(f.path, record, before, piece)
+                metadata = self.ctx.adapter.update_metadata(
+                    metadata, f.rel_path, records
+                )
         _mark_read(cursor, st)
         self.ctx.state.save_cursor(cursor)
         self.result.files += 1
         return metadata
 
-    def _append(self, f: LocalFile, cursor: Cursor, chunk: bytes) -> None:
-        """Append `chunk` at the cursor, or move the cursor past bytes that
-        the server already has. On a conflict with other bytes, fork a
-        `diverge` generation and append there."""
+    def _append(
+        self, f: LocalFile, cursor: Cursor, chunk: bytes, activity: int
+    ) -> None:
+        """Append `chunk`, with `activity` activity records, at the cursor,
+        or move the cursor past bytes that the server already has. On a
+        conflict with other bytes, fork a `diverge` generation and append
+        there."""
         api = self.ctx.api
         try:
             response = api.append(
@@ -295,7 +347,7 @@ class Syncer:
                 cursor.generation,
                 cursor.length,
                 chunk,
-                self.ctx.adapter.activity(f.rel_path, chunk),
+                activity,
             )
         except AppendConflict as conflict:
             if conflict.session is not None:
@@ -321,9 +373,11 @@ class Syncer:
             self.ctx.state.save_cursor(cursor)
             self.result.diverged = True
             return
+        # For a retry, the response holds the current generation length,
+        # which can be larger than the end of `chunk`. The server checked
+        # only the bytes of `chunk`, so the cursor moves past only those.
+        # The next append finds any other bytes as a conflict.
         cursor.segments.append(Segment(cursor.length, len(chunk), _sha(chunk)))
-        # A retry can return a length that includes another host's bytes.
-        # Advance only past the segment that this request confirmed.
         cursor.length += len(chunk)
         self.ctx.state.save_cursor(cursor)
         self.result.uploaded += len(chunk)
