@@ -20,6 +20,8 @@ persistence:
 ingress:
   enabled: true
   className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "9m"
   host: hyperspace.example.com
   tls:
     secretName: hyperspace-tls
@@ -38,6 +40,11 @@ helm install hyperspace oci://registry.example.com/wlritchi/charts/hyperspace \
 The chart runs one replica (the server has one writer), keeps the data PVC
 when you uninstall, and makes no credentials. Clients must reach the server
 over HTTPS: the client refuses plain HTTP except to a loopback address.
+
+Set the ingress request body limit above 8 MiB, with room for compression
+frame overhead. The nginx example uses 9 MiB; nginx's default 1 MiB rejects
+some supported uploads. Other ingress controllers need their equivalent
+setting.
 
 About 2,000 sessions take about 500 MB on the server. The data directory only
 grows, so file-level backups of the PVC (for example with restic) are

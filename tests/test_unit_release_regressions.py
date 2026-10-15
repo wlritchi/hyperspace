@@ -136,3 +136,8 @@ def test_version_skips_commit_already_in_newer_release(tmp_path):
         check=True,
     )
     assert result.stdout == ""
+
+
+def test_nginx_example_allows_supported_uploads():
+    text = (ROOT / "docs/deploy.md").read_text()
+    assert 'nginx.ingress.kubernetes.io/proxy-body-size: "9m"' in text
