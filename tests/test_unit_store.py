@@ -3,6 +3,7 @@
 
 import hashlib
 import os
+import sqlite3
 from collections.abc import Iterator
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
@@ -12,7 +13,7 @@ import pytest
 
 import store as store_module
 from hyperspace_protocol import ReadScope
-from store import Conflict, SessionKey, Store, StoreError, Writer
+from store import _MIGRATIONS, Conflict, SessionKey, Store, StoreError, Writer
 
 KEY = SessionKey("acct", "claude-code", "s1")
 LAPTOP = Writer("acct", "laptop", "/home/wlritchi/hyperspace")
@@ -471,6 +472,117 @@ def test_purge_session(store: Store) -> None:
     assert store.read_log(KEY, g2, 0, None) == b"clean\n"
     rows = store._db.execute("SELECT target, reason FROM purges").fetchall()
     assert [tuple(r) for r in rows] == [("session acct/claude-code/s1", "leaked token")]
+
+
+def test_read_audit_keeps_the_session_key_after_a_purge(store: Store) -> None:
+    # SQLite gives the next session the rowid of the purged session, because
+    # the purged session had the highest rowid.
+    root(store)
+    store.audit_read(KEY, "laptop", "manifest")
+    store.purge_session(KEY, "leaked token")
+    other = SessionKey("acct", "claude-code", "s2")
+    root(store, key=other)
+    rows = store._db.execute(
+        "SELECT account, harness, session_id, what FROM read_audit"
+    ).fetchall()
+    assert [tuple(r) for r in rows] == [("acct", "claude-code", "s1", "manifest")]
+
+
+def version_1_index(data: Path) -> sqlite3.Connection:
+    data.mkdir()
+    db = sqlite3.connect(data / "index.sqlite3")
+    db.executescript(_MIGRATIONS[0])
+    db.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    db.execute("INSERT INTO schema_version VALUES (1)")
+    return db
+
+
+def test_migration_copies_the_session_key_into_read_audit(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    db = version_1_index(data)
+    db.execute(
+        "INSERT INTO sessions (id, account, harness, session_id, created) "
+        "VALUES (1, 'acct', 'claude-code', 's1', 't1')"
+    )
+    db.executemany(
+        "INSERT INTO read_audit (ts, account, host, session, what) "
+        "VALUES (?, 'acct', 'laptop', ?, 'manifest')",
+        # A later read, a read at the time of creation, and a read of a
+        # session that is gone.
+        [("t2", 1), ("t1", 1), ("t2", 2)],
+    )
+    db.commit()
+    db.close()
+    store = Store(data)
+    rows = store._db.execute(
+        "SELECT session, harness, session_id FROM read_audit ORDER BY id"
+    ).fetchall()
+    store.close()
+    assert [tuple(r) for r in rows] == [
+        (1, "claude-code", "s1"),
+        (1, "claude-code", "s1"),
+        (2, None, None),
+    ]
+
+
+def test_migration_does_not_give_old_reads_to_a_session_that_took_the_rowid(
+    tmp_path: Path,
+) -> None:
+    # Before the upgrade: a read of "secret", a purge of "secret", and then a
+    # new session "fresh" with the same rowid, which also has a read.
+    data = tmp_path / "data"
+    db = version_1_index(data)
+    db.execute(
+        "INSERT INTO sessions (id, account, harness, session_id, created) "
+        "VALUES (1, 'acct', 'claude-code', 'fresh', 't4')"
+    )
+    db.executemany(
+        "INSERT INTO read_audit (ts, account, host, session, what) "
+        "VALUES (?, 'acct', 'laptop', 1, 'manifest')",
+        [("t2",), ("t5",)],
+    )
+    db.execute(
+        "INSERT INTO purges (ts, target, reason) "
+        "VALUES ('t3', 'session acct/claude-code/secret', 'leaked token')"
+    )
+    db.commit()
+    db.close()
+    store = Store(data)
+    rows = store._db.execute(
+        "SELECT ts, harness, session_id FROM read_audit ORDER BY id"
+    ).fetchall()
+    store.close()
+    assert [tuple(r) for r in rows] == [
+        ("t2", None, None),
+        ("t5", "claude-code", "fresh"),
+    ]
+
+
+def test_migration_does_not_guess_when_a_purge_has_the_time_of_the_read(
+    tmp_path: Path,
+) -> None:
+    # The read, the purge, and the new session all have the same time. Thus
+    # the read can be of the purged session.
+    data = tmp_path / "data"
+    db = version_1_index(data)
+    db.execute(
+        "INSERT INTO sessions (id, account, harness, session_id, created) "
+        "VALUES (1, 'acct', 'claude-code', 'fresh', 't')"
+    )
+    db.execute(
+        "INSERT INTO read_audit (ts, account, host, session, what) "
+        "VALUES ('t', 'acct', 'laptop', 1, 'manifest')"
+    )
+    db.execute(
+        "INSERT INTO purges (ts, target, reason) "
+        "VALUES ('t', 'session acct/claude-code/secret', 'leaked token')"
+    )
+    db.commit()
+    db.close()
+    store = Store(data)
+    rows = store._db.execute("SELECT harness, session_id FROM read_audit").fetchall()
+    store.close()
+    assert [tuple(r) for r in rows] == [(None, None)]
 
 
 def test_purge_generation_takes_its_forks(store: Store) -> None:

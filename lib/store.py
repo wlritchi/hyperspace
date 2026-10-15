@@ -173,6 +173,41 @@ _MIGRATIONS: list[str] = [
         reason TEXT NOT NULL
     );
     """,
+    # SQLite can give a new session the rowid of a purged session. Thus each
+    # read audit row also keeps the external key of the session that it
+    # records. The updates copy the key into the rows that exist.
+    #
+    # An old row has only the rowid, and the session that has that rowid now
+    # can be a new session that took the rowid after a purge. That session
+    # was created after the purge, and the purge was after the read. Thus the
+    # updates copy the key only when the session was created before the read.
+    # When the two times are equal, the updates copy the key only if no
+    # session purge has the same time. All other rows keep a NULL key, which
+    # means "unknown". The updates do not guess a key for these rows.
+    """
+    ALTER TABLE read_audit ADD COLUMN harness TEXT;
+    ALTER TABLE read_audit ADD COLUMN session_id TEXT;
+    UPDATE read_audit SET harness = (
+        SELECT s.harness FROM sessions s
+        WHERE s.id = read_audit.session AND s.account = read_audit.account
+        AND (
+            s.created < read_audit.ts
+            OR (
+                s.created = read_audit.ts
+                AND NOT EXISTS (
+                    SELECT 1 FROM purges p
+                    WHERE p.ts = read_audit.ts AND p.target LIKE 'session %'
+                )
+            )
+        )
+    );
+    UPDATE read_audit SET session_id = (
+        SELECT s.session_id FROM sessions s
+        WHERE s.id = read_audit.session AND s.account = read_audit.account
+        AND s.harness = read_audit.harness
+    )
+    WHERE harness IS NOT NULL;
+    """,
 ]
 
 
@@ -1347,9 +1382,18 @@ class Store:
             return
         with self._tx():
             self._db.execute(
-                "INSERT INTO read_audit (ts, account, host, session, what) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (self.now(), key.account, host, session["id"], what),
+                "INSERT INTO read_audit "
+                "(ts, account, host, session, harness, session_id, what) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.now(),
+                    key.account,
+                    host,
+                    session["id"],
+                    key.harness,
+                    key.session_id,
+                    what,
+                ),
             )
 
     # --- Purge (admin) -----------------------------------------------------

@@ -120,18 +120,32 @@ def main() -> int:
     ).fetchall()
     table("purges", ["TIME", "TARGET", "REASON"], [[r[0], r[1], r[2]] for r in rows])
 
+    # SQLite can give a new session the rowid of a purged session. Thus show
+    # the session key that the audit row keeps, and compare the full key to
+    # find the rows of purged sessions. A row from before schema version 2
+    # can have no key, because the migration could not find the session that
+    # the row records. Do not show the session that has the rowid now.
     rows = db.execute(
         """
-        SELECT a.ts, a.host, COALESCE(s.session_id, '(purged)'), a.what
-        FROM read_audit a LEFT JOIN sessions s ON s.id = a.session
+        SELECT a.ts, a.host, a.harness, a.session_id, s.id IS NULL, a.what
+        FROM read_audit a LEFT JOIN sessions s
+            ON s.id = a.session AND s.account = a.account
+            AND s.harness = a.harness AND s.session_id = a.session_id
         ORDER BY a.id DESC LIMIT ?
         """,
         (args.reads,),
     ).fetchall()
+
+    def read_session(harness: str | None, session_id: str | None, gone: int) -> str:
+        if session_id is None:
+            return "(unknown)"
+        name = f"{harness}/{session_id}"
+        return f"{name} (purged)" if gone else name
+
     table(
         "recent reads",
         ["TIME", "HOST", "SESSION", "WHAT"],
-        [list(map(str, r)) for r in rows],
+        [[r[0], r[1], read_session(r[2], r[3], r[4]), r[5]] for r in rows],
     )
     return 0
 
