@@ -412,10 +412,16 @@ class ClaudeCode:
                     "messageUuid": fields["uuid"],
                 }
             newline = b"\n" if line.endswith(b"\n") else b""
-            out.append(
-                json.dumps(fields, ensure_ascii=False, separators=(",", ":")).encode()
-                + newline
-            )
+            try:
+                encoded = json.dumps(
+                    fields, ensure_ascii=False, separators=(",", ":")
+                ).encode()
+            except UnicodeEncodeError:
+                # JSON can contain escaped lone surrogates, but UTF-8 cannot.
+                encoded = json.dumps(
+                    fields, ensure_ascii=True, separators=(",", ":")
+                ).encode()
+            out.append(encoded + newline)
         return b"".join(out)
 
     @staticmethod

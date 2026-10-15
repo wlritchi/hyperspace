@@ -273,7 +273,12 @@ def test_restore_refuses_a_second_copy(laptop: Host) -> None:
     ]
 
 
-def test_conflict_then_fork(server: Server, laptop: Host, agent: Host) -> None:
+@pytest.mark.parametrize(
+    "text", ["laptop work", "high surrogate \ud83d", "low surrogate \ude00"]
+)
+def test_conflict_then_fork(
+    server: Server, laptop: Host, agent: Host, text: str
+) -> None:
     t = start_session(laptop, LAPTOP_WS)
     sid = t.stem
     laptop.ctx.api.grant("claude-code", sid, "agent-1")
@@ -282,7 +287,7 @@ def test_conflict_then_fork(server: Server, laptop: Host, agent: Host) -> None:
     agent.fake.write(restored, prompt("agent work", cwd=AGENT_WS))
     sync(agent, restored, AGENT_WS)
     # The laptop was off during the steal, and its user kept working.
-    laptop.fake.write(t, prompt("laptop work"))
+    laptop.fake.write(t, prompt(text))
     session = laptop.adapter.session_for_transcript(t)
     assert session is not None
     Syncer(laptop.ctx, session, LAPTOP_WS).run()
