@@ -493,7 +493,14 @@ class ClaudeCode:
             except (OSError, ValueError):
                 continue
             sid = record.get("sessionId")
-            if isinstance(sid, str) and sid not in live and _alive(record):
+            if not isinstance(sid, str) or sid in live:
+                continue
+            try:
+                # The server refuses a heartbeat with an invalid id.
+                validate_session_id(sid)
+            except ValueError:
+                continue
+            if _alive(record):
                 live.append(sid)
         return live
 

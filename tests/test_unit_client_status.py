@@ -7,6 +7,7 @@ Code" in the plan (docs/plans/2026-10-15-session-status.md)."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -327,3 +328,13 @@ def test_a_stale_record_does_not_undo_status_fields(tmp_path: Path) -> None:
         }
     finally:
         state.close()
+
+
+def test_live_sessions_skips_invalid_ids(tmp_path: Path) -> None:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    for name, sid in (("1", SID), ("2", "../not-an-id"), ("3", "")):
+        (sessions / f"{name}.json").write_text(
+            json.dumps({"sessionId": sid, "pid": os.getpid()})
+        )
+    assert ClaudeCode(tmp_path).live_sessions() == [SID]
