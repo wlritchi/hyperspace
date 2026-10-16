@@ -563,10 +563,10 @@ def _request(
 
 def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent | None:
     """Write an explicit status. For the current session, hold its sync lock,
-    replace any queued write, and mark the turn as declared, so that the
-    Stop hook keeps this status. If a sync holds the lock for longer than a
-    short wait, queue the write for that sync. Return the event, or None if
-    the write was dropped or queued."""
+    replace any queued write, and save the write as the declaration of the
+    turn. The Stop hook then keeps this status. If a sync holds the lock for
+    longer than a short wait, queue the write for that sync. Return the event,
+    or None if the write was dropped or queued."""
     harness = ClaudeCode.harness
     state = ctx.state
     if sid != os.environ.get(SESSION_ENV):
@@ -581,7 +581,7 @@ def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent |
         record = state.session(harness, sid)
         if not locked:
             state.want_status(harness, sid, {**request, "base_seq": seq(record.status)})
-            state.set_turn_declared(harness, sid, True)
+            state.set_declared(harness, sid, request)
             return None
         state.drop_wanted_status(harness, sid)
         try:
@@ -591,7 +591,7 @@ def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent |
             # the write.
             state.want_status(harness, sid, {**request, "base_seq": 0})
             event = None
-        state.set_turn_declared(harness, sid, True)
+        state.set_declared(harness, sid, request)
         return event
 
 

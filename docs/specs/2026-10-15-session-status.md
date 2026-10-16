@@ -211,11 +211,16 @@ The adapter maps harness events to status writes. For Claude Code:
 | A cron or other trigger starts a turn with no prompt                        | As UserPromptSubmit.                                                                        |
 | PreToolUse for AskUserQuestion, or a Notification for a permission prompt   | `ready`, reason `asked`.                                                                    |
 | PostToolUse for AskUserQuestion, or the tool call after a permission prompt | `working`.                                                                                  |
-| Stop, with an explicit status from the agent in this turn                   | No write. The agent's declaration stays.                                                    |
+| Stop, with an explicit status from the agent in this turn                   | No write. The agent's declaration stays (see below).                                        |
 | Stop, with running tasks in the job's `inFlight` (see below)                | `waiting`, wake `local`.                                                                    |
 | Stop, otherwise                                                             | `ready`, reason `idle`.                                                                     |
 | SessionStart with `source: resume`                                          | No write. A resume alone does not reopen a `done` session (U5).                             |
 | SessionEnd                                                                  | No write. Liveness records that the process stopped.                                        |
+
+A question or a permission prompt after a declaration still writes `ready`,
+reason `asked`, because the session needs the user while the prompt shows. The
+tool call after it writes `working`. If such writes replaced the declaration,
+the Stop hook writes the declaration again, as an explicit write.
 
 The status writes go through the checkpoint sync of the session (main spec,
 "Checkpoint scheduling"). The hook records the wanted status in local state,

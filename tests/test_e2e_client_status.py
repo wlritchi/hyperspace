@@ -212,7 +212,46 @@ def test_status_cli_defaults_to_env_session(
     hook(ctx, fake, sid, "Stop")
     sync(ctx, path)
     assert server_status(ctx.api, sid)["status"] == "waiting"
-    assert not ctx.state.session(HARNESS, sid).turn_declared
+    assert ctx.state.session(HARNESS, sid).declared is None
+
+
+@pytest.mark.parametrize("sync_each", [True, False])
+def test_declaration_holds_over_a_prompt_in_the_turn(
+    ctx: Context, fake: FakeClaude, monkeypatch: pytest.MonkeyPatch, sync_each: bool
+) -> None:
+    sid, path = started_session(ctx, fake)
+    monkeypatch.setenv(SESSION_ENV, sid)
+    request = _request(
+        "waiting", sid, reason=None, wake="local", note=None, by_user=False
+    )
+    declared = set_status(ctx, sid, request)
+    assert declared is not None
+    # After the declaration, a tool call needs permission. While the prompt
+    # shows, the session needs the user.
+    hook(ctx, fake, sid, "PreToolUse", tool_name="Bash")
+    hook(ctx, fake, sid, "Notification", notification_type="permission_prompt")
+    if sync_each:
+        sync(ctx, path)
+        assert server_status(ctx.api, sid)["reason"] == "asked"
+    hook(ctx, fake, sid, "PostToolUse", tool_name="Bash")
+    if sync_each:
+        sync(ctx, path)
+        assert server_status(ctx.api, sid)["status"] == "working"
+    # The Stop hook writes the declaration again.
+    hook(ctx, fake, sid, "Stop")
+    sync(ctx, path)
+    event = server_status(ctx.api, sid)
+    assert (event["status"], event.get("wake"), event["explicit"]) == (
+        "waiting",
+        "local",
+        True,
+    )
+    assert event["source"]["kind"] == "agent"
+    # The declaration applies to one turn.
+    hook(ctx, fake, sid, "UserPromptSubmit")
+    hook(ctx, fake, sid, "Stop")
+    sync(ctx, path)
+    assert server_status(ctx.api, sid)["reason"] == "idle"
 
 
 def test_agent_does_not_write_over_an_outside_done(
@@ -296,7 +335,7 @@ def test_write_during_a_long_sync_is_queued(
     assert server_status(ctx.api, sid) == before
     queued = ctx.state.wanted_status(HARNESS, sid)
     assert queued is not None and queued[0]["wake"] == "message"
-    assert ctx.state.session(HARNESS, sid).turn_declared
+    assert ctx.state.session(HARNESS, sid).declared == request
     # The Stop hook keeps the declaration, and the next sync sends it.
     hook(ctx, fake, sid, "Stop")
     sync(ctx, path)
