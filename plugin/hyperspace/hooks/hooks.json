@@ -40,6 +40,11 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
             "async": true
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/notice.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -89,6 +94,17 @@
       }
     ],
     "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh\"",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "Notification": [
       {
         "hooks": [
           {

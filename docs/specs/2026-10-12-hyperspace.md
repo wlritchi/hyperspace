@@ -1070,7 +1070,11 @@ stdin, or does nothing if the CLI is not installed. The client installs and
 upgrades separately (`uv tool install`, or the runner image). The only
 contract between the plugin and the client is `hyperspace hook` with the
 hook's JSON on stdin; the client ignores events that it does not know, so a
-newer or older plugin works with any client.
+newer or older plugin works with any client. The one other hook is
+`hooks/notice.sh`, a synchronous PostToolUse hook for the session status (see
+[session status and liveness](2026-10-15-session-status.md)). It runs
+`hyperspace hook --notices` only when the client left a flag file for the
+session, and it always exits 0.
 
 `hyperspace hook` never fails and prints nothing on an error; errors go to
 `$XDG_STATE_HOME/hyperspace/log`. Checkpoints and sweeps run in a detached
@@ -1082,12 +1086,19 @@ process, so the hook returns at once and the work outlives the session.
 | UserPromptSubmit                                                                         | sync  | Start a checkpoint. At the first prompt after a resume: block the prompt if the session moved or is conflicted (see "Prevention"). Otherwise print a new notice, if any. Network only when the saved state is older than the resume, with a 2 s timeout. |
 | PreToolUse, PostToolUse, PostToolUseFailure, SubagentStop, PreCompact, PostCompact, Stop | async | Start a checkpoint. PreToolUse records the tool call before a long tool runs.                                                                                                                                                                            |
 | SessionEnd                                                                               | async | Start a checkpoint with no wait for the interval.                                                                                                                                                                                                        |
+| Notification                                                                             | async | Start a checkpoint.                                                                                                                                                                                                                                      |
+| PostToolUse (`notice.sh`)                                                                | sync  | Give the agent the pending notices, for example that the session was marked done on a different host.                                                                                                                                                    |
+
+The events in `STATUS_EVENTS` of the client also queue a status write, which
+the checkpoint sends (see "Transitions" in the session status spec).
 
 The hooks use `transcript_path` from the hook input, so they follow a
 transcript that Claude Code moved.
 
-v1 has no skill. The CLI is the interface for teleports (see "Later: teleport
-skills").
+The plugin has a `/done` command and two skills for the session status: one
+tells an agent when to set its status, and one makes an overview of open
+sessions. They only call the CLI. There is no teleport skill: the CLI is the
+interface for teleports (see "Later: teleport skills").
 
 On container runners, the image includes the plugin and the client. The
 Deployment gives the client its configuration: `HYPERSPACE_URL`,

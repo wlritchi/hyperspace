@@ -12,6 +12,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 PLUGIN = ROOT / "plugin" / "hyperspace"
 FORWARD = PLUGIN / "hooks" / "forward.sh"
+NOTICE = PLUGIN / "hooks" / "notice.sh"
 
 FAKE_CLI = """#!{python}
 import json, os, sys
@@ -87,13 +88,102 @@ def test_manifest_has_no_version() -> None:
 def test_hooks_json_forwards_every_event() -> None:
     config = json.loads((PLUGIN / "hooks" / "hooks.json").read_text())["hooks"]
     sync = {"SessionStart", "UserPromptSubmit"}
-    assert sync <= set(config)
+    assert sync | {"Notification"} <= set(config)
+    notice = []
     for event, groups in config.items():
         for group in groups:
             for entry in group["hooks"]:
+                if entry["command"] == '"${CLAUDE_PLUGIN_ROOT}/hooks/notice.sh"':
+                    notice.append((event, entry.get("async", False)))
+                    continue
                 assert entry["command"] == '"${CLAUDE_PLUGIN_ROOT}/hooks/forward.sh"'
                 assert entry.get("async", False) is (event not in sync), event
+    # The notice hook is synchronous, so that its output reaches the agent.
+    assert notice == [("PostToolUse", False)]
 
 
 def test_forwarder_is_executable() -> None:
     assert os.access(FORWARD, os.X_OK)
+
+
+def notice_env(fake: dict[str, str], tmp_path: Path, **extra: str) -> dict[str, str]:
+    return {
+        **fake,
+        "HOME": str(tmp_path),
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+        **extra,
+    }
+
+
+def notice(env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    payload = json.dumps({"hook_event_name": "PostToolUse"})
+    return subprocess.run(
+        [str(NOTICE)],
+        input=payload,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=30,
+    )
+
+
+def test_notice_sh_fast_path(fake: dict[str, str], tmp_path: Path) -> None:
+    env = notice_env(fake, tmp_path, CLAUDE_CODE_SESSION_ID="s1")
+    flags = tmp_path / "state" / "hyperspace" / "notify"
+    flags.mkdir(parents=True)
+    (flags / "other-session").touch()
+    done = notice(env)
+    assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
+    assert calls(env) == []
+
+
+def test_notice_sh_prints_notice(fake: dict[str, str], tmp_path: Path) -> None:
+    env = notice_env(fake, tmp_path, CLAUDE_CODE_SESSION_ID="s1")
+    flags = tmp_path / "state" / "hyperspace" / "notify"
+    flags.mkdir(parents=True)
+    (flags / "s1").touch()
+    done = notice(env)
+    assert done.returncode == 0
+    assert done.stdout.strip() == "output from the CLI"
+    assert [c["argv"] for c in calls(env)] == [["hook", "--notices"]]
+
+
+def test_notice_sh_without_session_id(fake: dict[str, str], tmp_path: Path) -> None:
+    env = notice_env(fake, tmp_path)
+    assert notice(env).returncode == 0
+    assert calls(env) == []
+    flags = tmp_path / "state" / "hyperspace" / "notify"
+    flags.mkdir(parents=True)
+    (flags / "s1").touch()
+    assert notice(env).returncode == 0
+    assert [c["argv"] for c in calls(env)] == [["hook", "--notices"]]
+
+
+def test_notice_sh_hides_an_old_cli(tmp_path: Path) -> None:
+    # A client without --notices fails; the hook still exits 0 quietly.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    cli = bin_dir / "hyperspace"
+    cli.write_text("#!/bin/sh\necho 'error: unknown option' >&2\nexit 2\n")
+    cli.chmod(0o755)
+    env = notice_env(
+        {"PATH": f"{bin_dir}:/usr/bin:/bin"}, tmp_path, CLAUDE_CODE_SESSION_ID="s1"
+    )
+    flags = tmp_path / "state" / "hyperspace" / "notify"
+    flags.mkdir(parents=True)
+    (flags / "s1").touch()
+    done = notice(env)
+    assert (done.returncode, done.stdout, done.stderr) == (0, "", "")
+
+
+def test_plugin_commands_and_skills_only_call_the_cli() -> None:
+    texts = [
+        (PLUGIN / "commands" / "done.md").read_text(),
+        (PLUGIN / "skills" / "session-status" / "SKILL.md").read_text(),
+        (PLUGIN / "skills" / "session-overview" / "SKILL.md").read_text(),
+    ]
+    for text in texts:
+        assert text.startswith("---\n")
+        assert "hyperspace " in text
+    assert "hyperspace done --by-user" in texts[0]
