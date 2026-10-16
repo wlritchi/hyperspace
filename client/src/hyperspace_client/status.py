@@ -235,8 +235,14 @@ def observe(
         if record.done_seen is None:
             record.done_seen = time.time()
         if notify and event["explicit"] and not _own_agent(event, host):
+            # One notice for each mark: a later mark with the same text
+            # also gives a notice.
             state.add_notice(
-                record.harness, record.session_id, "status", done_notice(event)
+                record.harness,
+                record.session_id,
+                "status",
+                done_notice(event),
+                key=f"seq:{seq(event)}",
             )
     else:
         record.done_seen = None

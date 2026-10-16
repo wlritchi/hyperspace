@@ -94,11 +94,15 @@ CREATE TABLE IF NOT EXISTS wanted_status (
 );
 """
 # Columns added after the first release, with their definitions.
-_SESSION_COLUMNS = {
-    "held_lease": "INTEGER NOT NULL DEFAULT 0",
-    "status": "TEXT",
-    "declared": "TEXT",
-    "done_seen": "REAL",
+_ADDED_COLUMNS = {
+    "sessions": {
+        "held_lease": "INTEGER NOT NULL DEFAULT 0",
+        "status": "TEXT",
+        "declared": "TEXT",
+        "done_seen": "REAL",
+    },
+    # The identity of a notice for `add_notice`, if it is not the text.
+    "notices": {"key": "TEXT"},
 }
 # Wait between two tries for a lock that another process holds.
 _LOCK_POLL = 0.1
@@ -173,10 +177,13 @@ class State:
         self._db.executescript(_SCHEMA)
         # Legacy cursors have no trustworthy server identity. Leave their
         # table untouched, but never reuse them: sync adopts remote bytes.
-        columns = {r[1] for r in self._db.execute("PRAGMA table_info(sessions)")}
-        for name, definition in _SESSION_COLUMNS.items():
-            if name not in columns:
-                self._db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {definition}")
+        for table, added in _ADDED_COLUMNS.items():
+            columns = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+            for name, definition in added.items():
+                if name not in columns:
+                    self._db.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                    )
         self._db.commit()
 
     def close(self) -> None:
@@ -491,21 +498,32 @@ class State:
         plugin's notice hook checks it with no Python process."""
         return self.directory / "notify" / session_id
 
-    def add_notice(self, harness: str, session_id: str, kind: str, text: str) -> None:
+    def add_notice(
+        self,
+        harness: str,
+        session_id: str,
+        kind: str,
+        text: str,
+        key: str | None = None,
+    ) -> None:
+        """Queue a notice, if no earlier notice of `kind` (delivered or not)
+        has the same `key`. With no `key`, the text is the key. Thus a sync
+        that sees the same problem again does not repeat its notice."""
         flag = self.notice_flag(session_id)
         flag.parent.mkdir(exist_ok=True)
         flag.touch()
         with self._db:
             exists = self._db.execute(
                 "SELECT 1 FROM notices WHERE harness = ? AND session_id = ? "
-                "AND kind = ? AND text = ?",
-                (harness, session_id, kind, text),
+                "AND kind = ? AND coalesce(key, text) = ?",
+                (harness, session_id, kind, text if key is None else key),
             ).fetchone()
             if exists is None:
                 self._db.execute(
-                    "INSERT INTO notices (harness, session_id, kind, text, created) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (harness, session_id, kind, text, time.time()),
+                    "INSERT INTO notices "
+                    "(harness, session_id, kind, text, created, key) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (harness, session_id, kind, text, time.time(), key),
                 )
 
     def take_notices(self, harness: str, session_id: str) -> list[str]:
