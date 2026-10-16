@@ -14,6 +14,7 @@ environment.
 | Heartbeat seconds  |                           | `heartbeat_interval` |
 | Launcher idle exit |                           | `launcher_idle_exit` |
 | Claude Code binary | `HYPERSPACE_CLAUDE`       | `claude_bin`         |
+| Runner resume args | `HYPERSPACE_LAUNCHER_CLAUDE_ARGS` (JSON) | `launcher_claude_args` |
 
 With no token in the environment or a file, the token comes from the token
 cache or the system keyring (see `credentials`).
@@ -22,13 +23,14 @@ cache or the system keyring (see `credentials`).
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
 import socket
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 from hyperspace_client import credentials
@@ -102,6 +104,8 @@ class Config:
     # Seconds with no live session before the launcher stops.
     launcher_idle_exit: float = 600.0
     claude_bin: str = "claude"
+    # More Claude Code options for a runner's resumes, for example the model.
+    launcher_claude_args: list[str] = field(default_factory=list[str])
     state_dir: Path = field(default_factory=state_dir)
 
     def require_server(self) -> tuple[str, str]:
@@ -128,6 +132,38 @@ class Config:
             self.token = token
             return self.url, token
         return self.url, self.token
+
+
+# The launcher sets these itself. Another value of one of them would resume
+# the wrong session, fork a copy, or start a headless turn.
+_LAUNCHER_OWNS = frozenset(
+    {
+        "--bg",
+        "--background",
+        "--resume",
+        "-r",
+        "--continue",
+        "-c",
+        "--fork-session",
+        "--session-id",
+        "--print",
+        "-p",
+    }
+)
+
+
+def check_claude_args(value: object) -> list[str]:
+    """The launcher's extra Claude Code options: a list of strings with no
+    option that the launcher sets itself."""
+    if not isinstance(value, list) or not all(
+        isinstance(a, str) and a and "\0" not in a for a in value
+    ):
+        raise ConfigError("launcher_claude_args must be a list of non-empty strings")
+    args = cast(list[str], value)
+    for arg in args:
+        if arg.split("=", 1)[0] in _LAUNCHER_OWNS:
+            raise ConfigError(f"launcher_claude_args cannot contain {arg}")
+    return args
 
 
 def _read_token(path: Path) -> str:
@@ -199,6 +235,17 @@ def load(env: dict[str, str] | None = None, path: Path | None = None) -> Config:
     cfg.claude_bin = str(
         env.get("HYPERSPACE_CLAUDE") or data.get("claude_bin") or "claude"
     )
+    raw_args = env.get("HYPERSPACE_LAUNCHER_CLAUDE_ARGS")
+    if raw_args:
+        try:
+            claude_args: object = json.loads(raw_args)
+        except ValueError:
+            raise ConfigError(
+                "HYPERSPACE_LAUNCHER_CLAUDE_ARGS must be a JSON list of strings"
+            ) from None
+    else:
+        claude_args = data.get("launcher_claude_args", [])
+    cfg.launcher_claude_args = check_claude_args(claude_args)
     ttl = data.get("token_cache_ttl", 86400)
     if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 60:
         raise ConfigError("token_cache_ttl must be a whole number of seconds >= 60")

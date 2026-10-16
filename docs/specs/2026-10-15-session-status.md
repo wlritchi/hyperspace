@@ -382,14 +382,26 @@ main process, and it does not stop when no session runs. At boot it:
 3. Resumes each session that is interrupted, or that is `waiting` with wake
    `local`, as a background job, with `claude --bg --resume <sid>` in the
    session's workspace. It does not resume a session that is `ready`,
-   `waiting` with wake `message`, or `done` (R1, R2, R3).
+   `waiting` with wake `message`, or `done`, or that has no status (R1, R2,
+   R3). It also does not resume a session that runs on a different host, so
+   that the resume does not make a conflict.
 
-While it runs, it does not resume a job that the Claude Code daemon stopped if
-its session is `done`, or if no event needs a process (R2, R3). A runner with
-no session to resume runs only the launcher.
+At each tick, it does step 3 again for the held sessions that do not run. It
+does not resume a job that the Claude Code daemon stopped if its session is
+`done`, or if no event needs a process (R2, R3). It resumes one session at
+most 5 times in an hour, so that a session that stops at once does not start
+in a loop. A runner with no session to resume runs only the launcher.
 
-The launcher reads the Claude Code flags for a resume (model, agent, and
-channels) from its configuration. The runner image gives that configuration.
+The resume runs in the workspace that the runner recorded for the session in
+its local state, and only for a session with a local transcript. The first
+message tells the agent that the runner restarted, and, for a `waiting`
+session, that its crons, Monitors and background tasks stopped.
+
+The launcher reads the Claude Code options for a resume (model, agent, and
+channels) from `launcher_claude_args`, or from
+`HYPERSPACE_LAUNCHER_CLAUDE_ARGS` as a JSON list. The runner image gives that
+configuration. The launcher refuses an option that it sets itself, for example
+`--resume` or `--fork-session`.
 
 ## Messages to a session
 

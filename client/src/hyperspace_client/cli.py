@@ -31,7 +31,13 @@ from hyperspace_client.notices import after_sync, refresh_states
 from hyperspace_client.state import State
 from hyperspace_client.status import clean_note, printable, seq, write
 from hyperspace_client.sync import Context, Syncer, register_host
-from hyperspace_client.teleport import TeleportError, fork, restore, send
+from hyperspace_client.teleport import (
+    TeleportError,
+    fork,
+    restore,
+    restore_held,
+    send,
+)
 from hyperspace_protocol import (
     CAP_LIVENESS,
     CAP_SESSION_STATUS,
@@ -790,8 +796,11 @@ def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
                     adapter,
                     cfg.claude_bin,
                     cfg.heartbeat_interval,
-                    None if args.stay else cfg.launcher_idle_exit,
+                    None if args.stay or args.runner else cfg.launcher_idle_exit,
                     before_tick=lambda: _refresh_token(cfg, ctx),
+                    runner=args.runner,
+                    claude_args=cfg.launcher_claude_args,
+                    workspace=str(Path.cwd().resolve()),
                 ).run()
             finally:
                 ctx.api.close()
@@ -874,28 +883,7 @@ def cmd_restore(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def _restore_held(ctx: Context, adapter: ClaudeCode, workspace: str) -> int:
-    """Restore each session whose lease this host holds and that has no
-    local copy, each in its own last workspace on this host."""
-    restored = 0
-    # A completed lease transfer can precede the destination's first append,
-    # so placement-based host filtering would hide a pending restore. Ask
-    # for the server's maximum. The list is not filtered by host.
-    for summary in ctx.api.sessions(harness=adapter.harness, limit="1000"):
-        lease = summary["state"]["lease"]
-        sid = summary["session_id"]
-        if lease["state"] != "held" or lease.get("host") != ctx.host:
-            continue
-        if adapter.find_transcripts(sid) and not ctx.state.get(
-            f"restore_pending:{adapter.harness}:{sid}"
-        ):
-            continue
-        target = lease.get("workspace") or workspace
-        try:
-            restore(ctx, adapter, sid, target, held_only=True)
-            restored += 1
-        except (TeleportError, ApiError) as exc:
-            log.warning("%s: not restored: %s", sid, exc)
-    print(f"restored {restored} sessions")
+    print(f"restored {restore_held(ctx, adapter, workspace)} sessions")
     return 0
 
 
@@ -1108,6 +1096,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--stay",
         action="store_true",
         help="do not stop when no session runs (for a service manager)",
+    )
+    p.add_argument(
+        "--runner",
+        action="store_true",
+        help="runner mode: never stop, restore the held sessions, and resume "
+        "those that need a process; run it in the runner's workspace",
     )
     p.add_argument(
         "--if-absent",

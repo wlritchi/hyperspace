@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import time
@@ -45,6 +46,8 @@ from hyperspace_protocol import (
     validate_metadata,
     validate_session_id,
 )
+
+log = logging.getLogger("hyperspace")
 
 SURRENDERED = ".hyperspace-surrendered-"
 
@@ -710,3 +713,29 @@ def fork(
         )
     restored = restore(ctx, adapter, new_id, workspace)
     return ForkResult(session_id, new_id, branch, restored.transcript)
+
+
+def restore_held(ctx: Context, adapter: ClaudeCode, workspace: str) -> int:
+    """Restore each session whose lease this host holds and that has no
+    local copy, each in its own last workspace on this host. Return the
+    number of restored sessions."""
+    restored = 0
+    # A completed lease transfer can precede the destination's first append,
+    # so placement-based host filtering would hide a pending restore. Ask
+    # for the server's maximum. The list is not filtered by host.
+    for summary in ctx.api.sessions(harness=adapter.harness, limit="1000"):
+        lease = summary["state"]["lease"]
+        sid = summary["session_id"]
+        if lease["state"] != "held" or lease.get("host") != ctx.host:
+            continue
+        if adapter.find_transcripts(sid) and not ctx.state.get(
+            f"restore_pending:{adapter.harness}:{sid}"
+        ):
+            continue
+        target = lease.get("workspace") or workspace
+        try:
+            restore(ctx, adapter, sid, target, held_only=True)
+            restored += 1
+        except (TeleportError, ApiError) as exc:
+            log.warning("%s: not restored: %s", sid, exc)
+    return restored
