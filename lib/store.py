@@ -1565,43 +1565,58 @@ class Store:
         return age > timedelta(seconds=HEARTBEAT_EXPIRY * heartbeat["interval"])
 
     def _liveness(self, session: sqlite3.Row) -> Liveness | None:
-        row = self._db.execute(
-            "SELECT * FROM session_liveness WHERE session = ? "
-            "ORDER BY last_listed DESC LIMIT 1",
-            (session["id"],),
-        ).fetchone()
-        if row is None:
+        # Each row has the heartbeat of its host and source (config
+        # directory). Only that heartbeat can say that the copy stopped,
+        # because the other sources of the host do not list it.
+        rows = self._db.execute(
+            "SELECT l.host, l.first_listed, l.last_listed, "
+            "h.received, h.interval, h.unclosed "
+            "FROM session_liveness AS l LEFT JOIN host_heartbeats AS h "
+            "ON h.account = ? AND h.host = l.host AND h.source = l.source "
+            "WHERE l.session = ? ORDER BY l.last_listed DESC",
+            (session["account"], session["id"]),
+        ).fetchall()
+        if not rows:
             return None
-        # Only a heartbeat from the same source (config directory) can say
-        # that the session stopped. The other sources of the host do not
-        # list it.
-        heartbeat = self._db.execute(
-            "SELECT * FROM host_heartbeats "
-            "WHERE account = ? AND host = ? AND source = ?",
-            (session["account"], row["host"], row["source"]),
-        ).fetchone()
-        if heartbeat is None:
-            return None
+        now = self.now()
         liveness: Liveness
-        if heartbeat["received"] > row["last_listed"]:
+        # A copy can stop on one host while a copy on a different host still
+        # runs. Thus a heartbeat that lists the session and has not expired
+        # makes it live, whichever copy listed it last.
+        for row in rows:
+            if (
+                row["received"] is not None
+                and row["received"] <= row["last_listed"]
+                and not self._expired(row, now)
+            ):
+                liveness = {
+                    "state": "live",
+                    "host": row["host"],
+                    "since": row["first_listed"],
+                }
+                return self._close_blocked(session, row, liveness)
+        row = rows[0]
+        if row["received"] is None:
+            return None
+        if row["received"] > row["last_listed"]:
             # A newer heartbeat of the source did not list the session.
             liveness = {
                 "state": "stopped",
                 "host": row["host"],
                 "since": row["last_listed"],
             }
-        elif not self._expired(heartbeat, self.now()):
-            liveness = {
-                "state": "live",
-                "host": row["host"],
-                "since": row["first_listed"],
-            }
         else:
             liveness = {
                 "state": "unknown",
                 "host": row["host"],
-                "since": heartbeat["received"],
+                "since": row["received"],
             }
+        return self._close_blocked(session, row, liveness)
+
+    @staticmethod
+    def _close_blocked(
+        session: sqlite3.Row, heartbeat: sqlite3.Row, liveness: Liveness
+    ) -> Liveness:
         for item in json.loads(heartbeat["unclosed"]):
             if (
                 item["harness"] == session["harness"]

@@ -270,11 +270,15 @@ do not mark each other's sessions `stopped`.
 
 The server derives the liveness of a session:
 
-| Liveness  | Rule                                                                                      |
-| --------- | ----------------------------------------------------------------------------------------- |
-| `live`    | A heartbeat that has not expired lists the session.                                       |
-| `stopped` | The latest heartbeat of the host that last listed the session does not list it.           |
-| `unknown` | The heartbeat that last listed the session expired, and the host sent no newer heartbeat. |
+| Liveness  | Rule                                                                                                      |
+| --------- | --------------------------------------------------------------------------------------------------------- |
+| `live`    | A heartbeat that has not expired lists the session.                                                       |
+| `stopped` | Not `live`, and the latest heartbeat of the host that last listed the session does not list it.           |
+| `unknown` | Not `live`, and the heartbeat that last listed the session expired, and the host sent no newer heartbeat. |
+
+A copy that stops on one host does not hide a copy that runs on a different
+host, or from a different source on the same host. The `live` rule applies
+first, and its host is the host of the live copy.
 
 A heartbeat expires after three of its intervals.
 

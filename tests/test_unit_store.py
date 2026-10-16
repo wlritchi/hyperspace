@@ -927,6 +927,31 @@ def test_liveness_follows_the_host_that_listed_last(store: Store) -> None:
     assert store.session_state(KEY)["liveness"]["host"] == "agent-1"
 
 
+def test_stopped_copy_does_not_hide_a_live_copy(timed: Store, clock: Clock) -> None:
+    root(timed)
+    beat(timed, "laptop", KEY)
+    since = timed.session_state(KEY)["liveness"]["since"]
+    beat(timed, "agent-1", KEY)
+    # The copy on agent-1 stops. The heartbeat of the laptop has not expired
+    # and lists the session.
+    beat(timed, "agent-1")
+    assert timed.session_state(KEY)["liveness"] == {
+        "state": "live",
+        "host": "laptop",
+        "since": since,
+    }
+    # The same rule applies to two sources of one host.
+    beat(timed, "laptop", KEY, source="b")
+    beat(timed, "laptop", source="b")
+    live = timed.session_state(KEY)["liveness"]
+    assert live["state"] == "live" and live["since"] == since
+    # With no live copy, the host that listed last gives the state.
+    clock.t += timedelta(hours=1)
+    stopped = timed.session_state(KEY)["liveness"]
+    assert stopped["state"] == "stopped" and stopped["host"] == "laptop"
+    assert stopped["since"] > since
+
+
 def test_final_heartbeat_stops_sessions(timed: Store, clock: Clock) -> None:
     root(timed)
     beat(timed, "laptop", KEY)

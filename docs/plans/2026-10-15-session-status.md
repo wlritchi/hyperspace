@@ -75,7 +75,7 @@ class StatusEvent(TypedDict):
 
 class Liveness(TypedDict):
     state: LivenessState
-    host: str          # the host that last listed the session
+    host: str          # a live copy's host, else the last to list it
     since: str         # see "Liveness rules"
     close_blocked: NotRequired[str]   # from the launcher (step 4)
 
@@ -205,14 +205,16 @@ The server treats explicit and automatic writes the same way. The client uses
   upserts `session_liveness (session, host, now)`. It skips other ids with no
   error, so the response gives no existence oracle; `recorded` counts only the
   rows it wrote.
-- For a session, take the `session_liveness` row with the latest
-  `last_listed`. If there is none, there is no liveness.
-- Let `hb` be the `host_heartbeats` row of that host and of the row's source
-  (see "Fixes after review").
+- For each `session_liveness` row of a session, let `hb` be the
+  `host_heartbeats` row of its host and source (see "Fixes after review"). If
+  the session has no rows, there is no liveness.
+- If a row has `hb.received <= last_listed` (its latest heartbeat lists the
+  session) and `now - hb.received <= 3 * hb.interval`: `live` on that host,
+  since `first_listed`. If more than one row agrees, take the one with the
+  latest `last_listed` (see "Fixes after review", "Live copy").
+- Else take the row with the latest `last_listed`:
   - `hb.received > last_listed` (a newer heartbeat did not list it):
     `stopped`, since `last_listed`.
-  - else, `now - hb.received <= 3 * hb.interval`: `live`, since
-    `first_listed`.
   - else: `unknown`, since `hb.received`.
 - `session_liveness` has one more column, `first_listed TEXT NOT NULL`. A
   heartbeat that lists the session sets it to now if the row is new, or if the
@@ -964,6 +966,13 @@ without it.
   set and the latest known status is not explicit, the hook queues the
   declaration again, as an explicit write. Test:
   `test_declaration_holds_over_a_prompt_in_the_turn`.
+- **Live copy**: `_liveness` read only the row with the latest `last_listed`.
+  When a copy on a second host listed the session and then stopped, the
+  session showed `stopped` while the first copy still ran, and a runner could
+  resume its own copy. Now a row whose heartbeat lists the session and has not
+  expired makes it `live`; only with no such row does the latest row give
+  `stopped` or `unknown`. `close_blocked` comes from the heartbeat of the row
+  that gives the state. Test: `test_stopped_copy_does_not_hide_a_live_copy`.
 
 ## Step 6: outside this repo
 
