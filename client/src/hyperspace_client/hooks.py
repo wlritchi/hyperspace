@@ -180,9 +180,10 @@ def _close_if_done(cfg: Config, harness: str, session_id: str, start: Detach) ->
     state = State(cfg.state_dir)
     try:
         status = state.session(harness, session_id).status
+        reopened = launcher.queued_reopen(state, harness, session_id)
     finally:
         state.close()
-    if status is not None and status.get("status") == "done":
+    if status is not None and status.get("status") == "done" and not reopened:
         start(["--quiet", "launcher", "--close-job", Path(job_dir).name])
 
 
