@@ -547,10 +547,11 @@ def _request(
 
 
 def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent | None:
-    """Write an explicit status. For the current session, hold its sync lock
-    (or wait for it a short time), replace any queued write, and mark the
-    turn as declared, so that the Stop hook keeps this status. Return the
-    event, or None if the write was dropped or queued."""
+    """Write an explicit status. For the current session, hold its sync lock,
+    replace any queued write, and mark the turn as declared, so that the
+    Stop hook keeps this status. If a sync holds the lock for longer than a
+    short wait, queue the write for that sync. Return the event, or None if
+    the write was dropped or queued."""
     harness = ClaudeCode.harness
     state = ctx.state
     if sid != os.environ.get(SESSION_ENV):
@@ -561,9 +562,13 @@ def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent |
         return write(
             ctx, harness, sid, request, base, local if local.transcript else None
         )
-    with state.lock(harness, sid, STATUS_LOCK_WAIT):
-        state.drop_wanted_status(harness, sid)
+    with state.lock(harness, sid, STATUS_LOCK_WAIT) as locked:
         record = state.session(harness, sid)
+        if not locked:
+            state.want_status(harness, sid, {**request, "base_seq": seq(record.status)})
+            state.set_turn_declared(harness, sid, True)
+            return None
+        state.drop_wanted_status(harness, sid)
         try:
             event = write(ctx, harness, sid, request, seq(record.status), record)
         except NotFound:
@@ -571,9 +576,7 @@ def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent |
             # the write.
             state.want_status(harness, sid, {**request, "base_seq": 0})
             event = None
-        record = state.session(harness, sid)
-        record.turn_declared = True
-        state.save_session(record)
+        state.set_turn_declared(harness, sid, True)
         return event
 
 

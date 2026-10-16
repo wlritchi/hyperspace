@@ -20,6 +20,7 @@ from _hs import (
     text_reply,
     tool_call,
 )
+from hyperspace_client import cli as cli_mod
 from hyperspace_client.api import Api
 from hyperspace_client.cli import (
     SESSION_ENV,
@@ -254,6 +255,30 @@ def test_write_for_another_session(
         desk.state.close()
     assert event is not None
     assert event["source"] == {"kind": "agent", "host": "desk", "session_id": other}
+
+
+def test_write_during_a_long_sync_is_queued(
+    ctx: Context, fake: FakeClaude, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid, path = started_session(ctx, fake)
+    monkeypatch.setenv(SESSION_ENV, sid)
+    monkeypatch.setattr(cli_mod, "STATUS_LOCK_WAIT", 0.2)
+    before = server_status(ctx.api, sid)
+    request = _request(
+        "waiting", sid, reason=None, wake="message", note="CI", by_user=False
+    )
+    # A sync holds the session's lock for longer than the CLI waits.
+    with ctx.state.try_lock(HARNESS, sid) as locked:
+        assert locked
+        assert set_status(ctx, sid, request) is None
+    assert server_status(ctx.api, sid) == before
+    queued = ctx.state.wanted_status(HARNESS, sid)
+    assert queued is not None and queued[0]["wake"] == "message"
+    assert ctx.state.session(HARNESS, sid).turn_declared
+    # The Stop hook keeps the declaration, and the next sync sends it.
+    hook(ctx, fake, sid, "Stop")
+    sync(ctx, path)
+    assert server_status(ctx.api, sid)["wake"] == "message"
 
 
 def test_write_before_the_first_sync_is_queued(

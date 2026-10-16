@@ -345,7 +345,12 @@ class State:
         """Save a session's row. With `fields`, set only those columns, and
         keep the others. A process that does not hold the session's lock must
         use `fields`, so that it does not write back columns that a sync
-        changed after this process read them."""
+        changed after this process read them.
+
+        For a row that exists, this does not change `status`, `done_seen`
+        and `turn_declared`: hooks and the CLI change them while a sync holds
+        an older copy of the record. Use `save_status` and
+        `set_turn_declared` for them."""
         values: dict[str, object] = {
             "workspace": record.workspace,
             "transcript": record.transcript,
@@ -357,26 +362,68 @@ class State:
             "sent_metadata": json.dumps(record.sent_metadata),
             "last_placement": record.last_placement,
             "held_lease": int(record.held_lease),
-            "status": json.dumps(record.status) if record.status else None,
-            "turn_declared": int(record.turn_declared),
-            "done_seen": record.done_seen,
         }
         if fields is None:
             if record == self.session(record.harness, record.session_id):
                 return
             columns = list(values)
+            # A new row also gets the status columns of the record.
+            inserted = {
+                **values,
+                "status": json.dumps(record.status) if record.status else None,
+                "turn_declared": int(record.turn_declared),
+                "done_seen": record.done_seen,
+            }
         else:
             columns = list(fields)
             unknown = set(columns) - values.keys()
             if unknown:
                 raise ValueError(f"unknown session columns: {sorted(unknown)}")
+            inserted = {c: values[c] for c in columns}
         assign = ", ".join(f"{c} = excluded.{c}" for c in columns)
         with self._db:
             self._db.execute(
-                f"INSERT INTO sessions (harness, session_id, {', '.join(columns)}) "
-                f"VALUES ({', '.join('?' * (len(columns) + 2))}) "
+                f"INSERT INTO sessions (harness, session_id, {', '.join(inserted)}) "
+                f"VALUES ({', '.join('?' * (len(inserted) + 2))}) "
                 f"ON CONFLICT (harness, session_id) DO UPDATE SET {assign}",
-                (record.harness, record.session_id, *(values[c] for c in columns)),
+                (record.harness, record.session_id, *inserted.values()),
+            )
+
+    def save_status(
+        self,
+        harness: str,
+        session_id: str,
+        status: dict[str, Any],
+        done_seen: float | None,
+    ) -> None:
+        """Save a status event from the server, and the time when the client
+        first saw `done`. An event with a lower `seq` than the saved one does
+        not replace it."""
+        with self._db:
+            self._db.execute(
+                """
+                INSERT INTO sessions (harness, session_id, status, done_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (harness, session_id) DO UPDATE SET
+                    status = excluded.status,
+                    done_seen = excluded.done_seen
+                WHERE sessions.status IS NULL
+                    OR json_extract(sessions.status, '$.seq')
+                        < json_extract(excluded.status, '$.seq')
+                """,
+                (harness, session_id, json.dumps(status), done_seen),
+            )
+
+    def set_turn_declared(self, harness: str, session_id: str, value: bool) -> None:
+        with self._db:
+            self._db.execute(
+                """
+                INSERT INTO sessions (harness, session_id, turn_declared)
+                VALUES (?, ?, ?)
+                ON CONFLICT (harness, session_id) DO UPDATE SET
+                    turn_declared = excluded.turn_declared
+                """,
+                (harness, session_id, int(value)),
             )
 
     def known_sessions(self) -> list[SessionRecord]:
