@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -548,6 +550,13 @@ def test_launcher_start_fails_at_once_for_a_local_error(
         (httpx.ProxyError("407 Proxy Authentication Required"), False),
         (httpx.ProxyError("407"), False),
         (httpx.ProxyError("Invalid username/password"), False),
+        (
+            httpx.ProxyError(
+                "Requested USERNAME/PASSWORD from proxy server, "
+                "but got NO ACCEPTABLE METHODS."
+            ),
+            False,
+        ),
         (ApiError(500, "error"), True),
         (ApiError(503, "unavailable"), True),
         (ApiError(408, "timeout"), True),
@@ -564,6 +573,121 @@ def test_launcher_start_fails_at_once_for_a_local_error(
     ],
 )
 def test_temporary_errors(error: Exception, expected: bool) -> None:
+    assert launcher_mod.temporary(error) is expected
+
+
+_SOCKS_FAIL = b"\x05%c\x00\x01\x00\x00\x00\x00\x00\x00"
+
+
+def proxy_error(proxy: str, url: str, replies: list[bytes]) -> httpx.ProxyError:
+    """Return the httpx.ProxyError for a request through a fake proxy on
+    loopback. For each reply, the proxy first reads one message from the
+    client. After the last reply, it closes the connection."""
+    listener = socket.create_server(("127.0.0.1", 0))
+
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            for reply in replies:
+                connection.recv(4096)
+                connection.sendall(reply)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    port = listener.getsockname()[1]
+    try:
+        with (
+            httpx.Client(proxy=proxy.format(port=port), timeout=10) as client,
+            pytest.raises(httpx.ProxyError) as caught,
+        ):
+            client.get(url)
+    finally:
+        thread.join(timeout=10)
+        listener.close()
+    return caught.value
+
+
+@pytest.mark.parametrize(
+    ("proxy", "replies", "message", "expected"),
+    [
+        # The SOCKS proxy refuses the authentication method.
+        (
+            "socks5://user:secret@127.0.0.1:{port}",
+            [b"\x05\xff"],
+            (
+                "Requested USERNAME/PASSWORD from proxy server, "
+                "but got NO ACCEPTABLE METHODS."
+            ),
+            False,
+        ),
+        (
+            "socks5://127.0.0.1:{port}",
+            [b"\x05\xff"],
+            (
+                "Requested NO AUTHENTICATION REQUIRED from proxy server, "
+                "but got NO ACCEPTABLE METHODS."
+            ),
+            False,
+        ),
+        # The SOCKS proxy requires a credential that the client does not send.
+        (
+            "socks5://127.0.0.1:{port}",
+            [b"\x05\x02"],
+            (
+                "Requested NO AUTHENTICATION REQUIRED from proxy server, "
+                "but got USERNAME/PASSWORD."
+            ),
+            False,
+        ),
+        # The SOCKS proxy refuses the credential.
+        (
+            "socks5://user:wrong@127.0.0.1:{port}",
+            [b"\x05\x02", b"\x01\x01"],
+            "Invalid username/password",
+            False,
+        ),
+        # The SOCKS proxy cannot connect to the server.
+        (
+            "socks5://127.0.0.1:{port}",
+            [b"\x05\x00", _SOCKS_FAIL % 1],
+            "Proxy Server could not connect: General SOCKS server failure.",
+            True,
+        ),
+        (
+            "socks5://user:secret@127.0.0.1:{port}",
+            [b"\x05\x02", b"\x01\x00", _SOCKS_FAIL % 5],
+            "Proxy Server could not connect: Connection refused.",
+            True,
+        ),
+        # The HTTP proxy refuses the CONNECT.
+        (
+            "http://127.0.0.1:{port}",
+            [
+                (
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                    b'Proxy-Authenticate: Basic realm="proxy"\r\n'
+                    b"Content-Length: 0\r\n\r\n"
+                )
+            ],
+            "407 Proxy Authentication Required",
+            False,
+        ),
+        *(
+            (
+                "http://127.0.0.1:{port}",
+                [b"HTTP/1.1 %s\r\nContent-Length: 0\r\n\r\n" % status],
+                status.decode(),
+                True,
+            )
+            for status in (b"502 Bad Gateway", b"503 Service Unavailable")
+        ),
+    ],
+)
+def test_temporary_proxy_errors_from_the_transport(
+    proxy: str, replies: list[bytes], message: str, expected: bool
+) -> None:
+    error = proxy_error(proxy, "https://127.0.0.1:1/", replies)
+    assert str(error) == message
     assert launcher_mod.temporary(error) is expected
 
 

@@ -1093,9 +1093,20 @@ without it.
   local error. Through an HTTPS proxy (`HTTPS_PROXY`), httpcore raises
   `ProxyError` for each CONNECT response that is not 2xx, also for a 502, 503
   or 504 while the proxy is not available, so a runner stopped at once. Now a
-  `ProxyError` is temporary, except a refused proxy credential: a message that
-  starts with the status `407`, or the SOCKS message
-  `Invalid username/password`. Tests: `test_temporary_errors`,
+  `ProxyError` is temporary, except a refused proxy authentication: a message
+  that starts with the status `407`, or a SOCKS message that refers to
+  authentication. httpcore has two such SOCKS messages: a refused
+  authentication method
+  (`Requested USERNAME/PASSWORD from proxy server, but got NO ACCEPTABLE METHODS.`,
+  also with `NO AUTHENTICATION REQUIRED` when the proxy requires a credential
+  that the client does not send), and a refused credential
+  (`Invalid username/password`). The check finds the words `authentication`,
+  `username`, `password` or `method`, and not one exact message. A failed
+  SOCKS connect (`Proxy Server could not connect: ...`) and a CONNECT status
+  other than 407 stay temporary. The tests get each `ProxyError` from httpx
+  and httpcore, through a fake SOCKS5 or HTTP proxy on loopback (the test
+  dependencies include `socksio`). Tests: `test_temporary_errors`,
+  `test_temporary_proxy_errors_from_the_transport`,
   `test_launcher_waits_for_the_server_at_start`,
   `test_launcher_start_fails_at_once_for_a_local_error`.
 
