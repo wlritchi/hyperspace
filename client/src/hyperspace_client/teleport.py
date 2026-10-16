@@ -715,11 +715,18 @@ def fork(
     return ForkResult(session_id, new_id, branch, restored.transcript)
 
 
-def restore_held(ctx: Context, adapter: ClaudeCode, workspace: str) -> int:
+@dataclass
+class HeldRestore:
+    restored: int
+    # The sessions whose restore failed.
+    failed: list[str]
+
+
+def restore_held(ctx: Context, adapter: ClaudeCode, workspace: str) -> HeldRestore:
     """Restore each session whose lease this host holds and that has no
-    local copy, each in its own last workspace on this host. Return the
-    number of restored sessions."""
-    restored = 0
+    local copy or has a pending restore, each in its own last workspace on
+    this host."""
+    result = HeldRestore(0, [])
     # A completed lease transfer can precede the destination's first append,
     # so placement-based host filtering would hide a pending restore. Ask
     # for the server's maximum. The list is not filtered by host.
@@ -735,7 +742,8 @@ def restore_held(ctx: Context, adapter: ClaudeCode, workspace: str) -> int:
         target = lease.get("workspace") or workspace
         try:
             restore(ctx, adapter, sid, target, held_only=True)
-            restored += 1
+            result.restored += 1
         except (TeleportError, ApiError) as exc:
             log.warning("%s: not restored: %s", sid, exc)
-    return restored
+            result.failed.append(sid)
+    return result

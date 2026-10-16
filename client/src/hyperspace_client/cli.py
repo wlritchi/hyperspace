@@ -908,7 +908,7 @@ def cmd_restore(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def _restore_held(ctx: Context, adapter: ClaudeCode, workspace: str) -> int:
-    print(f"restored {restore_held(ctx, adapter, workspace)} sessions")
+    print(f"restored {restore_held(ctx, adapter, workspace).restored} sessions")
     return 0
 
 

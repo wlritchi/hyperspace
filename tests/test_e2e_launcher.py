@@ -12,11 +12,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from _hs import FakeClaude, Server, make_server, prompt, text_reply
 from hyperspace_client import launcher as launcher_mod
 from hyperspace_client.adapters.claude_code import ClaudeCode
+from hyperspace_client.api import ApiError
 from hyperspace_client.backfill import RunResult
 from hyperspace_client.cli import _hook_heartbeat, main, status_label
 from hyperspace_client.config import Config, ConfigError, load
@@ -35,6 +37,7 @@ from hyperspace_client.launcher import (
 )
 from hyperspace_client.state import State
 from hyperspace_client.sync import Context, Syncer
+from hyperspace_client.teleport import HeldRestore
 from hyperspace_protocol import SessionStateBody, SessionSummary
 
 WS = "/home/wlritchi/hyperspace"
@@ -670,14 +673,92 @@ def test_boot_restores_held_sessions(
 ) -> None:
     calls: list[str] = []
 
-    def restore_held(c: Context, adapter: ClaudeCode, workspace: str) -> int:
+    def restore_held(c: Context, adapter: ClaudeCode, workspace: str) -> HeldRestore:
         calls.append(workspace)
-        return 0
+        return HeldRestore(0, [])
 
     monkeypatch.setattr("hyperspace_client.launcher.restore_held", restore_held)
-    runner(ctx, host, Bg(), Clock(), workspace="/w").run(max_ticks=1)
+    runner(ctx, host, Bg(), Clock(), workspace="/w").run(max_ticks=3)
     launcher(ctx, host, Rm(ctx), Clock()).run(max_ticks=1)
     assert calls == ["/w"]
+
+
+def fresh_runner(
+    ctx: Context, tmp_path: Path, bg: Bg, clock: Clock
+) -> tuple[Launcher, Host]:
+    """A runner on the same host whose config and state directories are new
+    and empty, as after a pod restart."""
+    fresh = Host(tmp_path / "claude-2")
+    c = Context(
+        api=ctx.api, state=State(tmp_path / "state-2"), adapter=fresh, host=ctx.host
+    )
+    return runner(c, fresh, bg, clock), fresh
+
+
+@pytest.mark.parametrize("failure", ["list", "session"])
+def test_failed_boot_restore_is_retried(
+    ctx: Context,
+    fake: FakeClaude,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    bg = Bg()
+    clock = Clock()
+    run, fresh = fresh_runner(ctx, tmp_path, bg, clock)
+    api = run.ctx.api
+    sessions, manifest = api.sessions, api.manifest
+    fails = [1]
+
+    def flaky_sessions(**filters: Any) -> Any:
+        # Only the unfiltered list of `restore_held`.
+        if failure == "list" and "lease_host" not in filters and fails:
+            fails.pop()
+            raise httpx.ConnectError("server not available")
+        return sessions(**filters)
+
+    def flaky_manifest(*args: Any) -> Any:
+        if failure == "session" and fails:
+            fails.pop()
+            raise ApiError(503, "unavailable")
+        return manifest(*args)
+
+    monkeypatch.setattr(api, "sessions", flaky_sessions)
+    monkeypatch.setattr(api, "manifest", flaky_manifest)
+    run.run(max_ticks=1)
+    assert not fails
+    assert fresh.find_transcripts(sid) == []
+    assert bg.calls == []
+    # The server is available again. A later tick restores and resumes the
+    # session, with no restart of the launcher.
+    run.tick()
+    assert fresh.find_transcripts(sid) == [
+        fresh.project_dir(str(tmp_path / "ws")) / f"{sid}.jsonl"
+    ]
+    assert [(argv[5], cwd) for argv, cwd in bg.calls] == [(sid, str(tmp_path / "ws"))]
+    run.ctx.state.close()
+
+
+def test_restore_retry_backs_off(
+    ctx: Context, host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[float] = []
+    clock = Clock()
+
+    def restore_held(c: Context, adapter: ClaudeCode, workspace: str) -> HeldRestore:
+        calls.append(clock.t)
+        if len(calls) < 4:
+            return HeldRestore(0, ["s1"])
+        return HeldRestore(1, [])
+
+    monkeypatch.setattr("hyperspace_client.launcher.restore_held", restore_held)
+    run = runner(ctx, host, Bg(), clock)
+    run.run(max_ticks=20)
+    # One tick each 60 s; the waits are 60, 120 and 240 s, then no more
+    # restores after one with no failure.
+    assert calls == [0, 60, 180, 420]
 
 
 def test_launcher_claude_args_config(tmp_path: Path) -> None:

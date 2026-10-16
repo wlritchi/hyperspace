@@ -903,7 +903,8 @@ The code follows this step, with these changes:
 
 - **Restore**: the `restore --held` logic moved from `cli.py` to
   `teleport.restore_held`, so that the launcher can use it. The launcher's
-  fallback workspace is its working directory.
+  fallback workspace is its working directory. A failed restore is tried again
+  at later ticks (see "Fixes after review").
 - **Decision**: `needs_process(summary, host, running)` returns the first
   message or None. It also returns None for a lease that is not `held` by this
   host, and for a session that the server shows as `live` on any host (see
@@ -998,6 +999,20 @@ without it.
   clears first. Tests: `test_needs_process_table`,
   `test_session_live_from_another_config_dir_is_not_resumed`,
   `test_own_live_from_before_a_restart_does_not_block_the_resume`.
+- **Restore retry**: `Launcher.boot` ran `restore_held` once before the first
+  tick, and only logged a failure. On a runner with no local transcripts, a
+  server that was not available at boot, or a failed restore of one session,
+  left held sessions with no local copy, and `resume` refused them until the
+  launcher restarted. Now `restore_held` returns a `HeldRestore` with the
+  restored count and the failed session ids, and `Launcher.restore` runs at
+  the runner's ticks, after the heartbeat and the sweep and before the
+  resumes. It runs at the first tick, and again after a failure, after one
+  tick interval, then a wait that doubles to at most `RESTORE_RETRY_MAX` (one
+  hour), until a restore has no failure. A session with a pending restore
+  marker is in the retry, because `restore_held` includes it. Tests:
+  `test_failed_boot_restore_is_retried` (a failed list and a failed session
+  restore), `test_restore_retry_backs_off`,
+  `test_boot_restores_held_sessions`.
 
 ## Step 6: outside this repo
 
