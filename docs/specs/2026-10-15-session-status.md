@@ -448,9 +448,13 @@ the CLI; the plugin still holds no logic.
 status in the window a message. The message explains the status system and
 asks the agent to set its status with a note, and to change nothing else.
 
-- On a workstation, the command resumes each session for one turn with
-  `claude --resume <sid> -p`, with permission only for `hyperspace status`. It
-  skips sessions that are live.
+- The command resumes each session for one turn with
+  `claude --resume <sid> -p`, with permission only for `hyperspace status` and
+  `hyperspace done`. It skips sessions that are live, that have a status, or
+  whose lease a different host holds.
+- It records each session that it messages before the resume starts. A second
+  run, for example after an interruption, skips these sessions unless
+  `--retry` is given. `--dry-run` lists the sessions and messages none.
 - On a runner, the same command runs on the runner, for example with
   `kubectl exec`. It needs the client in the runner image, but no launcher and
   no subspace.

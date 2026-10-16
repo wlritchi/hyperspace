@@ -192,6 +192,18 @@ not done, with their status, and `hyperspace done <session id>` marks a
 session done. If a host is gone and cannot surrender its lease,
 `hyperspace restore --steal` takes it.
 
+Sessions from before the session status have no status. To ask each one to set
+its own status, run the backfill on each host that has the sessions:
+
+```sh
+hyperspace backfill-status --since 30d --dry-run   # list the sessions
+hyperspace backfill-status --since 30d --rate 30   # message them
+```
+
+The backfill resumes each session for one headless turn, so each session costs
+a full context load. It records each session that it messaged, and a second
+run skips them unless you give `--retry`.
+
 ## 5. Admin work
 
 Admin scripts run inside the pod, on the data directory, and are safe while
