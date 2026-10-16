@@ -572,10 +572,17 @@ def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent |
     if sid != os.environ.get(SESSION_ENV):
         base = seq(ctx.api.state(harness, sid).get("status"))
         # A session with a copy on this host keeps its saved status current,
-        # so that its hooks base their writes on this event.
+        # so that its hooks base their writes on this event. A later sync
+        # does not see the event as new, so the notice is added here.
         local = state.session(harness, sid)
         return write(
-            ctx, harness, sid, request, base, local if local.transcript else None
+            ctx,
+            harness,
+            sid,
+            request,
+            base,
+            local if local.transcript else None,
+            notify=True,
         )
     with state.lock(harness, sid, STATUS_LOCK_WAIT) as locked:
         record = state.session(harness, sid)

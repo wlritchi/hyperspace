@@ -276,10 +276,13 @@ def write(
     request: dict[str, Any],
     base: int,
     record: SessionRecord | None = None,
+    notify: bool = False,
 ) -> StatusEvent | None:
     """Send a status write with the base `base`. Return the new event, the
     current event if it already has the wanted status, or None if the write
-    was dropped. With `record`, save the events that the client learns."""
+    was dropped. With `record`, save the events that the client learns.
+    With `notify`, the new event can give the session a notice: the write
+    comes from outside the session."""
     for attempt in range(2):
         body = cast(StatusRequest, {**request, "base_seq": base})
         try:
@@ -301,7 +304,7 @@ def write(
             base = seq(current)
             continue
         if record is not None:
-            observe(ctx.state, record, event, ctx.host, notify=False)
+            observe(ctx.state, record, event, ctx.host, notify=notify)
         return event
     return None
 
