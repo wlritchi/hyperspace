@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +25,24 @@ from hyperspace_client.adapters import (
     decode_segment,
     encode_segment,
 )
-from hyperspace_protocol import MAX_STATUS_EXCERPT
+from hyperspace_protocol import MAX_STATUS_EXCERPT, validate_session_id
 
 HARNESS = "claude-code"
 TRANSCRIPT = "transcript.jsonl"
+
+
+@dataclass(frozen=True)
+class Job:
+    """A Claude Code background job: `claude rm <short>` removes it."""
+
+    short: str
+    session_id: str
+    # The modification time of the job's state.json.
+    mtime: float
+
+
+# A job directory name that cannot be read as an option.
+_JOB_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 # Claude Code session ids are UUIDs. Other .jsonl files in a project
 # directory (legacy agent-*.jsonl files, copies that Claude Code or
@@ -553,6 +568,35 @@ class ClaudeCode:
             except OSError:
                 continue
         return found
+
+    def jobs(self) -> list[Job]:
+        """The background jobs on this host, from
+        `<config dir>/jobs/<short>/state.json`. Claude Code says that this file
+        is not a stable interface, so a job with an unexpected name or no
+        session id is left out."""
+        jobs = self.config_dir / "jobs"
+        if not jobs.is_dir():
+            return []
+        out: list[Job] = []
+        for path in sorted(jobs.glob("*/state.json")):
+            short = path.parent.name
+            # The name goes to `claude rm` as an argument.
+            if not _JOB_NAME.fullmatch(short):
+                continue
+            try:
+                record: dict[str, Any] = json.loads(path.read_text())
+                mtime = path.stat().st_mtime
+            except (OSError, ValueError):
+                continue
+            sid = record.get("sessionId")
+            if not isinstance(sid, str):
+                continue
+            try:
+                validate_session_id(sid)
+            except ValueError:
+                continue
+            out.append(Job(short, sid, mtime))
+        return out
 
     # --- Status ------------------------------------------------------------------
 

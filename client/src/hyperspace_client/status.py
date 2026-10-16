@@ -334,12 +334,21 @@ def send_wanted(ctx: Context, session: LocalSession) -> None:
 
 
 _CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# ANSI escape sequences: CSI (for example colors), OSC up to its end, the
+# character set forms, and the two-character forms.
+_ESCAPE = re.compile(
+    "\x1b\\[[0-?]*[ -/]*[@-~]"
+    "|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)?"
+    "|\x1b[ -/]+[0-~]"
+    "|\x1b[@-~]"
+)
 
 
 def printable(text: str) -> str:
-    """`text` with no C0 or C1 control characters except newline and tab.
-    Text from the server can hold terminal escape sequences."""
-    return _CONTROL.sub("", text)
+    """`text` with no escape sequences and no C0 or C1 control characters
+    except newline and tab. Text from the server, and the output of other
+    programs, can hold terminal escape sequences."""
+    return _CONTROL.sub("", _ESCAPE.sub("", text))
 
 
 def clean_note(note: str | None) -> str | None:

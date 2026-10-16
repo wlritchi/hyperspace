@@ -87,10 +87,50 @@ def test_only_a_start_or_resume_reads_the_keyring(
     cfg: Config, source: str, unlock: bool
 ) -> None:
     _, started = run(cfg, hook_event_name="SessionStart", source=source)
-    assert len(started) == 2
+    assert len(started) == 3
+    assert started[2][:3] == ["--quiet", "launcher", "--if-absent"]
     assert all(("--unlock" in args) == unlock for args in started)
     _, started = run(cfg, hook_event_name="UserPromptSubmit")
     assert "--unlock" not in started[0]
+
+
+def test_launcher_off_switch(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HYPERSPACE_LAUNCHER", "off")
+    _, started = run(cfg, hook_event_name="SessionStart", source="startup")
+    assert not any("launcher" in args for args in started)
+
+
+def _seen_status(cfg: Config, status: str) -> None:
+    state = State(cfg.state_dir)
+    try:
+        record = state.session("claude-code", SID)
+        record.status = {"seq": 1, "status": status}
+        state.save_session(record)
+    finally:
+        state.close()
+
+
+@pytest.mark.parametrize(
+    ("job_dir", "status", "closes"),
+    [
+        ("/home/u/.claude/jobs/1111aaaa", "done", True),
+        ("/home/u/.claude/jobs/1111aaaa", "ready", False),
+        (None, "done", False),
+    ],
+)
+def test_session_end_closes_a_done_job(
+    cfg: Config,
+    monkeypatch: pytest.MonkeyPatch,
+    job_dir: str | None,
+    status: str,
+    closes: bool,
+) -> None:
+    if job_dir is not None:
+        monkeypatch.setenv("CLAUDE_JOB_DIR", job_dir)
+    _seen_status(cfg, status)
+    _, started = run(cfg, hook_event_name="SessionEnd")
+    close = ["--quiet", "launcher", "--close-job", "1111aaaa"]
+    assert (close in started) == closes
 
 
 def test_user_prompt_prints_notices(cfg: Config) -> None:

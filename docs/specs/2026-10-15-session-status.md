@@ -320,7 +320,14 @@ Two triggers do step 4:
   to stop, syncs, and runs `claude rm`.
 - A sweep in the launcher finds jobs that are not live and whose session is
   `done`. This catches a session that was marked `done` from a different host
-  after its job stopped, and a SessionEnd hook that did not run.
+  after its job stopped, and a SessionEnd hook that did not run. The sweep
+  asks the server for the status of a stopped job when it first sees the job,
+  when the job's state file changes, and every 15 minutes.
+
+Both triggers ask the server for the status just before they run `claude rm`,
+and act only on `done`. When `claude rm` refuses, the launcher records the
+reason and sends it in each heartbeat, until the job goes away or its state
+file changes.
 
 ## Launcher
 
@@ -337,9 +344,9 @@ agent-initiated teleport (main spec, "Later"). It:
 A lock in the client state directory makes sure that only one launcher runs
 for each host and harness config directory. The SessionStart and SessionEnd
 hooks do not talk to the launcher. They send their extra heartbeat to the
-server directly, with the full list of live sessions from the adapter. Thus
-the hooks need no channel to the launcher, and two heartbeats that cross give
-the same result.
+server directly, with the full list of live sessions from the adapter and the
+refused jobs from the client's local state. Thus the hooks need no channel to
+the launcher, and two heartbeats that cross give the same result.
 
 If the launcher stops while sessions run, its heartbeat expires and their
 liveness becomes `unknown`. The next SessionStart hook starts the launcher
@@ -360,10 +367,10 @@ heartbeat reads the cache, so the cache does not expire while the launcher
 runs.
 
 This mode needs no service manager, so it works on each OS where the hooks
-work. A user who wants the launcher all the time, for example for later work
-that receives sessions with no user action, can run
-`hyperspace launcher --stay` from a systemd user unit, a launchd agent, or the
-Task Scheduler. The client documents an example for systemd and launchd.
+work. (The client itself works only on Linux and macOS.) A user who wants the
+launcher all the time, for example for later work that receives sessions with
+no user action, can run `hyperspace launcher --stay` from a systemd user unit
+or a launchd agent. `docs/deploy.md` has examples of both.
 
 ### Runner mode
 

@@ -129,17 +129,19 @@ def send(
         return _send(ctx, adapter, session_id, to_host)
 
 
-def _send(
-    ctx: Context, adapter: ClaudeCode, session_id: str, to_host: str | None
-) -> str:
+def back_up(
+    ctx: Context,
+    adapter: ClaudeCode,
+    session_id: str,
+    transcripts: list[Path],
+    purpose: str,
+) -> None:
+    """Sync the session and check that the server has every local byte of
+    it, including an incomplete last record. Raise `TeleportError` if not.
+    The caller holds the session's sync lock."""
     harness = adapter.harness
-    if adapter.is_running(session_id):
-        raise TeleportError(
-            f"session {session_id} is running on this host. Stop it first."
-        )
-    local = adapter.find_transcripts(session_id)
     record = ctx.state.session(harness, session_id)
-    for transcript in local:
+    for transcript in transcripts:
         session = adapter.session_for_transcript(transcript)
         assert session is not None
         workspace = record.workspace or adapter.first_cwd(session) or str(Path.cwd())
@@ -147,7 +149,7 @@ def _send(
         # when the file is now shorter with no new record.
         result = Syncer(ctx, session, workspace, empty_rewrites=True).run()
         if result.errors:
-            raise TeleportError("cannot surrender: " + "; ".join(result.errors))
+            raise TeleportError(f"cannot {purpose}: " + "; ".join(result.errors))
         metadata = ctx.state.session(harness, session_id).metadata
         for f in adapter.files(session, metadata):
             if not f.path.exists():
@@ -169,7 +171,7 @@ def _send(
                     )
                 ):
                     raise TeleportError(
-                        f"cannot surrender: {f.rel_path} has unuploaded bytes"
+                        f"cannot {purpose}: {f.rel_path} has unuploaded bytes"
                     )
             else:
                 known = ctx.state.blob(
@@ -177,8 +179,20 @@ def _send(
                 )
                 if known is None or known[2] != hashlib.sha256(data).hexdigest():
                     raise TeleportError(
-                        f"cannot surrender: {f.rel_path} has unuploaded bytes"
+                        f"cannot {purpose}: {f.rel_path} has unuploaded bytes"
                     )
+
+
+def _send(
+    ctx: Context, adapter: ClaudeCode, session_id: str, to_host: str | None
+) -> str:
+    harness = adapter.harness
+    if adapter.is_running(session_id):
+        raise TeleportError(
+            f"session {session_id} is running on this host. Stop it first."
+        )
+    local = adapter.find_transcripts(session_id)
+    back_up(ctx, adapter, session_id, local, "surrender")
     if adapter.is_running(session_id):
         raise TeleportError("session started during sync; stop it before surrender")
     if to_host is not None and to_host != ctx.host:

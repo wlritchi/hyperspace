@@ -6,9 +6,9 @@ client. See "Plugin" in the spec.
 
 | Event                      | Action                                        |
 | -------------------------- | --------------------------------------------- |
-| SessionStart               | Print notices (no network); start a checkpoint, and a sweep at most once an hour; at a start or resume, these can read the keyring |
+| SessionStart               | Print notices (no network); start a checkpoint, the launcher if it does not run, and a sweep at most once an hour; at a start or resume, these can read the keyring |
 | UserPromptSubmit           | Start a checkpoint; at the first prompt after a resume, print a block decision if the session lives elsewhere |
-| SessionEnd                 | Start a checkpoint with no wait               |
+| SessionEnd                 | Start a checkpoint with no wait; for a `done` background job, start the close of the job |
 | Other events in `CHECKPOINT_EVENTS` | Start a checkpoint                   |
 | Any other event            | Nothing                                       |
 
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -32,6 +33,7 @@ from typing import Any
 
 import httpx
 
+from hyperspace_client import launcher
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.config import Config, ConfigError
@@ -122,9 +124,15 @@ def handle(payload: dict[str, Any], cfg: Config, start: Detach = detach) -> str:
         sync.append("--unlock")
     start(sync)
 
+    if event == "SessionEnd":
+        _close_if_done(cfg, session.harness, session.session_id, start)
+
     if event == "SessionStart":
         sweep = ["--quiet", "sync", "--all", "--if-stale", SWEEP_EVERY]
         start(sweep + ["--unlock"] if unlock else sweep)
+        if not launcher.off():
+            run = ["--quiet", "launcher", "--if-absent"]
+            start(run + ["--unlock"] if unlock else run)
         state = State(cfg.state_dir)
         try:
             return session_start_notice(
@@ -160,6 +168,22 @@ def handle(payload: dict[str, Any], cfg: Config, start: Detach = detach) -> str:
             return json.dumps(decision)
         return "\n\n".join(notices)
     return ""
+
+
+def _close_if_done(cfg: Config, harness: str, session_id: str, start: Detach) -> None:
+    """At the end of a background job whose session is `done`, close the
+    job when its process stops. Claude Code sets `CLAUDE_JOB_DIR` only in
+    a background job."""
+    job_dir = os.environ.get("CLAUDE_JOB_DIR")
+    if not job_dir or launcher.off():
+        return
+    state = State(cfg.state_dir)
+    try:
+        status = state.session(harness, session_id).status
+    finally:
+        state.close()
+    if status is not None and status.get("status") == "done":
+        start(["--quiet", "launcher", "--close-job", Path(job_dir).name])
 
 
 def notices(payload: dict[str, Any], cfg: Config) -> str:

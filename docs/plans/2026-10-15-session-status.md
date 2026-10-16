@@ -217,10 +217,11 @@ The server treats explicit and automatic writes the same way. The client uses
   keeps the old value. Thus `since` for `live` is the start of the current
   run.
 - `close_blocked` comes from `hb.unclosed` for this session, for any state.
-  The session must have a liveness row for that host: a session that the host
-  never listed in `sessions` shows no `close_blocked`. Step 4 must therefore
-  list a job in at least one heartbeat before it can report it as unclosed, or
-  this rule must change.
+  The store keeps only the `unclosed` entries of sessions that the host can
+  read. For such an entry with no liveness row for the host (the job stopped
+  before any heartbeat listed it), the heartbeat adds a row with
+  `first_listed = last_listed =` the session's last activity, so that the
+  session shows as `stopped` with its `close_blocked` (changed in step 4).
 - A final heartbeat (`final: true`) with an empty list makes the host's
   sessions `stopped` at once.
 
@@ -766,6 +767,47 @@ One `hyperspace launcher` process for each host sends the heartbeat and closes
       `done, not closed: ...` in `ls`.
 - [ ] `docs/launcher.md` has the systemd and launchd examples.
 - [ ] Commit type `feat(client)`.
+
+### Step 4 as built
+
+The code follows this step, with these changes:
+
+- **close_blocked**: the server rule changed (see step 1, "Liveness rules"),
+  not the client. A job that stopped before any heartbeat listed it now shows
+  `done, not closed: <reason>`. The store also drops `unclosed` entries for
+  sessions that the host cannot read.
+- **Close checks**: `close_job` holds the session's sync lock, checks that the
+  session does not run, asks the server for the status, and acts only on
+  `done`. It backs up the session with `teleport.back_up` (taken out of the
+  surrender, which uses it too), checks again that the session does not run,
+  and runs exactly `claude rm <job>`. The job name must match
+  `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`, so it cannot be read as an option.
+- **Rechecks**: the sweep asks the server for the status of a stopped job when
+  it first sees the job, when its `state.json` changes, and every 15 minutes
+  (`RECHECK`), not at each tick.
+- **Refusals** are in the client state (`launcher_unclosed`), by job name,
+  with the `state.json` mtime. A refusal holds until the job goes away or its
+  state changes. Every heartbeat, also from a hook, sends them, because a
+  heartbeat replaces the host's earlier list. The reason is the first line of
+  the output of `claude rm`, with escape sequences removed (`printable` now
+  removes whole ANSI sequences, not only the control characters).
+- **`--close-job`** takes no `--wait-pid`. It polls the adapter's live check
+  for the job's session, which also covers a reused pid.
+- **Heartbeat from a hook**: the checkpoint sync for `--event SessionStart`
+  and `--event SessionEnd` sends it after the sync, also when another process
+  held the session's lock.
+- **Token**: before each tick, the launcher reads the token cache again
+  (`cache-only`), which keeps the cache alive, and takes a new token after a
+  new login.
+- **Docs**: the systemd and launchd examples are in `docs/deploy.md`, not in a
+  new `docs/launcher.md`. The client is Unix-only (`fcntl`), so the spec no
+  longer names the Task Scheduler.
+- **Config**: `heartbeat_interval`, `launcher_idle_exit`, and `claude_bin`
+  (`HYPERSPACE_CLAUDE` takes precedence; the backfill uses it too).
+- **Tests**: all launcher tests are in `tests/test_e2e_launcher.py`, against
+  the in-process server, with a fake `claude rm` and a fake clock. The hook
+  tests are in `tests/test_unit_client_hooks.py`, and the server rule tests in
+  `tests/test_unit_store.py`.
 
 ## Step 5: launcher, runner mode
 
