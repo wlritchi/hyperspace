@@ -161,18 +161,20 @@ CREATE TABLE status_events (
 CREATE TABLE host_heartbeats (
     account TEXT NOT NULL,
     host TEXT NOT NULL,
+    source TEXT NOT NULL,
     received TEXT NOT NULL,
     interval INTEGER NOT NULL,
     final INTEGER NOT NULL,
     unclosed TEXT NOT NULL,
-    PRIMARY KEY (account, host)
+    PRIMARY KEY (account, host, source)
 );
 CREATE TABLE session_liveness (
     session INTEGER NOT NULL REFERENCES sessions (id),
     host TEXT NOT NULL,
+    source TEXT NOT NULL,
     first_listed TEXT NOT NULL,
     last_listed TEXT NOT NULL,
-    PRIMARY KEY (session, host)
+    PRIMARY KEY (session, host, source)
 );
 ```
 
@@ -205,7 +207,8 @@ The server treats explicit and automatic writes the same way. The client uses
   rows it wrote.
 - For a session, take the `session_liveness` row with the latest
   `last_listed`. If there is none, there is no liveness.
-- Let `hb` be the `host_heartbeats` row of that host.
+- Let `hb` be the `host_heartbeats` row of that host and of the row's source
+  (see "Fixes after review").
   - `hb.received > last_listed` (a newer heartbeat did not list it):
     `stopped`, since `last_listed`.
   - else, `now - hb.received <= 3 * hb.interval`: `live`, since

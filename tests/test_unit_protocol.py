@@ -195,6 +195,12 @@ def test_heartbeat_validation() -> None:
     }
     assert validate_heartbeat(full) == full
     assert validate_heartbeat({"interval": 3600}) == {"interval": 3600, "sessions": []}
+    assert validate_heartbeat({"interval": 60, "source": "ab_12-"}) == {
+        "interval": 60,
+        "source": "ab_12-",
+        "sessions": [],
+    }
+    assert "source" not in validate_heartbeat({"interval": 60, "source": ""})
     for bad in (
         {"interval": 9},
         {"interval": 3601},
@@ -206,6 +212,9 @@ def test_heartbeat_validation() -> None:
         {"interval": 60, "unclosed": [ref]},
         {"interval": 60, "unclosed": [{**ref, "reason": "a\nb"}]},
         {"interval": 60, "final": "yes"},
+        {"interval": 60, "source": "../x"},
+        {"interval": 60, "source": "x" * 65},
+        {"interval": 60, "source": 3},
     ):
         with pytest.raises(ValidationError):
             validate_heartbeat(bad)
