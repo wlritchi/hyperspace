@@ -66,9 +66,11 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
    `working` when the runner stopped, and a session that is `waiting` for an
    event that only its process can receive (`wake: local`). It runs
    `claude <args> --bg --resume <session id> <message>` in the session's
-   workspace, after it checks that the session does not run. The message tells
-   the agent that the runner restarted, and that its crons, Monitors and
-   background tasks stopped.
+   workspace, after it checks that the session does not run. It does not
+   resume a session that the server shows as `live` on any host, also on the
+   runner itself (for example from a different harness config directory). The
+   message tells the agent that the runner restarted, and that its crons,
+   Monitors and background tasks stopped.
 3. Does not resume a session that is `ready`, `done`, `waiting` with
    `wake: message`, or that has no status. The user, or a message, wakes these
    sessions. Sessions from before the session status feature have no status

@@ -530,6 +530,14 @@ def _summary(
         (
             _summary(
                 {"status": "working"},
+                liveness={"state": "live", "host": "agent-1", "since": "t"},
+            ),
+            False,
+            None,
+        ),
+        (
+            _summary(
+                {"status": "working"},
                 liveness={"state": "stopped", "host": "laptop", "since": "t"},
             ),
             False,
@@ -587,6 +595,38 @@ def test_running_session_is_not_resumed(
     # The process stops: the next tick resumes the session.
     host.live = []
     run.tick()
+    assert [argv[5] for argv, _ in bg.calls] == [sid]
+
+
+def test_session_live_from_another_config_dir_is_not_resumed(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    # A second config directory on this host runs the session. The
+    # launcher's own `is_running` cannot see that process.
+    other = Host(tmp_path / "other-claude")
+    launcher_mod.send_heartbeat(ctx, other, [sid], 60)
+    assert state(ctx, sid)["liveness"]["host"] == "laptop"  # pyright: ignore[reportTypedDictNotRequiredAccess]
+    bg = Bg()
+    run = runner(ctx, host, bg, Clock())
+    run.tick()
+    assert bg.calls == []
+    # The other process stops: the next tick resumes the session.
+    launcher_mod.send_heartbeat(ctx, other, [], 60)
+    run.tick()
+    assert [argv[5] for argv, _ in bg.calls] == [sid]
+
+
+def test_own_live_from_before_a_restart_does_not_block_the_resume(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    # The heartbeat of this config directory before the runner restarted.
+    launcher_mod.send_heartbeat(ctx, host, [sid], 60)
+    bg = Bg()
+    runner(ctx, host, bg, Clock()).tick()
     assert [argv[5] for argv, _ in bg.calls] == [sid]
 
 

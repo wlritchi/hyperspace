@@ -297,14 +297,18 @@ def close_after_exit(
 
 def needs_process(summary: SessionSummary, host: str, running: bool) -> str | None:
     """The first message for a resume of a held session on a runner, or None
-    if the session needs no process here (R1 to R3 in the spec)."""
+    if the session needs no process here (R1 to R3 in the spec), or if the
+    server shows it as `live` on any host."""
     state = summary["state"]
     lease = state["lease"]
     if running or lease["state"] != "held" or lease.get("host") != host:
         return None
     live = state.get("liveness")
-    if live is not None and live["state"] == "live" and live["host"] != host:
-        # A copy runs on a different host. A resume here makes a conflict.
+    if live is not None and live["state"] == "live":
+        # A copy runs on a different host, or on this host from a different
+        # config directory, which `running` does not show. A resume makes a
+        # second copy. Each tick sends the launcher's heartbeat before the
+        # resumes, so a `live` from its heartbeat before a restart clears.
         return None
     event = state.get("status")
     if event is None:
