@@ -161,7 +161,10 @@ def check_claude_args(value: object) -> list[str]:
         raise ConfigError("launcher_claude_args must be a list of non-empty strings")
     args = cast(list[str], value)
     for arg in args:
-        if arg.split("=", 1)[0] in _LAUNCHER_OWNS:
+        # A bare "--" ends the options, and a group of short options such as
+        # "-pc" can hide a denied option, so permit neither.
+        short_group = arg.startswith("-") and not arg.startswith("--") and len(arg) > 2
+        if arg == "--" or short_group or arg.split("=", 1)[0] in _LAUNCHER_OWNS:
             raise ConfigError(f"launcher_claude_args cannot contain {arg}")
     return args
 

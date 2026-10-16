@@ -587,6 +587,10 @@ def test_launcher_claude_args_config(tmp_path: Path) -> None:
         '["--fork-session"]',
         '["-p"]',
         '["--bg"]',
+        '["--", "x"]',
+        '["-pc"]',
+        '["-rabc"]',
+        '["-p=x"]',
     ):
         with pytest.raises(ConfigError):
             load({"HYPERSPACE_LAUNCHER_CLAUDE_ARGS": bad}, none)
