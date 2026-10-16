@@ -187,7 +187,9 @@ hyperspace restore <session id> --resume
 
 The resumed session starts with a notice that says where it was before. Use
 `hyperspace ls` and `hyperspace show <session id>` to see sessions, their
-leases, and their branches. If a host is gone and cannot surrender its lease,
+leases, and their branches. `hyperspace ls --open` lists the sessions that are
+not done, with their status, and `hyperspace done <session id>` marks a
+session done. If a host is gone and cannot surrender its lease,
 `hyperspace restore --steal` takes it.
 
 ## 5. Admin work

@@ -23,11 +23,15 @@ from hyperspace_protocol import (
     ForkEvent,
     GenerationCause,
     GenerationInfo,
+    HeartbeatRequest,
+    HeartbeatResponse,
     HostInfo,
     Manifest,
     SessionMetadata,
     SessionStateBody,
     SessionSummary,
+    StatusEvent,
+    StatusRequest,
     TeleportResponse,
     encode_workspace,
     validate_workspace,
@@ -53,6 +57,15 @@ class AppendConflict(ApiError):
         super().__init__(409, "conflict", f"generation length is {length}")
         self.length = length
         self.session = session
+
+
+class StatusConflict(ApiError):
+    """`409 stale_status`: the base of a status write is not the latest
+    event. `current` is the latest event, or None if there is none."""
+
+    def __init__(self, detail: str, current: StatusEvent | None) -> None:
+        super().__init__(409, "stale_status", detail)
+        self.current = current
 
 
 class Api:
@@ -101,6 +114,8 @@ class Api:
         detail = str(body.get("detail", response.text[:200]))
         if response.status_code == 409 and code == "conflict":
             raise AppendConflict(int(body.get("length", 0)), body.get("session"))
+        if response.status_code == 409 and code == "stale_status":
+            raise StatusConflict(detail, body.get("status"))
         if response.status_code == 404:
             raise NotFound(404, code, detail)
         raise ApiError(response.status_code, code, detail)
@@ -121,10 +136,13 @@ class Api:
         self._capabilities = set(body.get("capabilities", []))
         return body
 
-    def require_capability(self, capability: str) -> None:
+    def has_capability(self, capability: str) -> bool:
         if self._capabilities is None:
             self.whoami()
-        if capability not in (self._capabilities or set()):
+        return capability in (self._capabilities or set())
+
+    def require_capability(self, capability: str) -> None:
+        if not self.has_capability(capability):
             raise ApiError(400, "upgrade_required", f"server must support {capability}")
 
     def _workspace_headers(self, workspace: str) -> dict[str, str]:
@@ -144,9 +162,15 @@ class Api:
     def hosts(self) -> list[dict[str, Any]]:
         return cast(list[dict[str, Any]], self._json("GET", "/hosts")["hosts"])
 
+    def heartbeat(self, request: HeartbeatRequest) -> HeartbeatResponse:
+        return cast(
+            HeartbeatResponse, self._json("PUT", "/hosts/self/heartbeat", json=request)
+        )
+
     # --- Sessions ----------------------------------------------------------
 
-    def sessions(self, **filters: str) -> list[SessionSummary]:
+    def sessions(self, **filters: str | list[str]) -> list[SessionSummary]:
+        """A list filter with a list value repeats the query parameter."""
         params = {k: v for k, v in filters.items() if v}
         body = self._json("GET", "/sessions", params=params)
         return cast(list[SessionSummary], body["sessions"])
@@ -158,6 +182,10 @@ class Api:
         return cast(
             SessionStateBody, self._json("GET", self._s(harness, sid) + "/state")
         )
+
+    def add_status(self, harness: str, sid: str, request: StatusRequest) -> StatusEvent:
+        body = self._json("POST", self._s(harness, sid) + "/status", json=request)
+        return cast(StatusEvent, body["status"])
 
     def add_metadata(
         self, harness: str, sid: str, workspace: str, metadata: SessionMetadata

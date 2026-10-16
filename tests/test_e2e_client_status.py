@@ -1,0 +1,371 @@
+# vim: filetype=python
+"""Session status from the client's hooks and CLI, against an in-process
+server."""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from _hs import (
+    FakeClaude,
+    Server,
+    context,
+    make_server,
+    prompt,
+    text_reply,
+    tool_call,
+)
+from hyperspace_client.api import Api
+from hyperspace_client.cli import (
+    SESSION_ENV,
+    Exit,
+    _print_status_table,
+    _request,
+    _target,
+    set_status,
+    status_label,
+    tail,
+)
+from hyperspace_client.state import State
+from hyperspace_client.status import on_hook, send_wanted
+from hyperspace_client.sync import Context, Syncer
+from hyperspace_protocol import (
+    CAP_RESTORE_PRECONDITION,
+    CAP_WORKSPACE_UTF8,
+    StatusEvent,
+)
+
+WS = "/home/wlritchi/hyperspace"
+HARNESS = "claude-code"
+
+
+@pytest.fixture
+def server(tmp_path: Path) -> Iterator[Server]:
+    s = make_server(
+        tmp_path / "server",
+        hosts={
+            "laptop": ("laptop", {"append", "read", "grant"}, "all"),
+            "desk": ("desk", {"append", "read", "grant"}, "all"),
+        },
+    )
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def fake(tmp_path: Path) -> FakeClaude:
+    return FakeClaude(tmp_path / "claude")
+
+
+@pytest.fixture
+def ctx(server: Server, fake: FakeClaude, tmp_path: Path) -> Iterator[Context]:
+    c = context(server.api("laptop"), tmp_path / "state", fake, "laptop")
+    yield c
+    c.state.close()
+
+
+def sync(ctx: Context, transcript: Path) -> None:
+    session = ctx.adapter.session_for_transcript(transcript)
+    assert session is not None
+    Syncer(ctx, session, WS).run()
+
+
+def hook(ctx: Context, fake: FakeClaude, sid: str, event: str, **payload: Any) -> None:
+    on_hook(ctx.state, fake.adapter, HARNESS, sid, event, payload)
+
+
+def server_status(api: Api, sid: str) -> StatusEvent:
+    event = api.state(HARNESS, sid).get("status")
+    assert event is not None
+    return event
+
+
+def started_session(ctx: Context, fake: FakeClaude) -> tuple[str, Path]:
+    """A session with one turn that ended: the server has `ready`."""
+    path = fake.transcript(WS)
+    sid = path.stem
+    fake.write(path, prompt("hello"))
+    hook(ctx, fake, sid, "UserPromptSubmit")
+    sync(ctx, path)
+    fake.write(path, tool_call(), text_reply("All set. Shall I push?"))
+    hook(ctx, fake, sid, "Stop")
+    sync(ctx, path)
+    return sid, path
+
+
+def test_hook_sequence_sets_status(ctx: Context, fake: FakeClaude) -> None:
+    path = fake.transcript(WS)
+    sid = path.stem
+    fake.write(path, prompt("hello"))
+    hook(ctx, fake, sid, "UserPromptSubmit")
+    sync(ctx, path)
+    event = server_status(ctx.api, sid)
+    assert (event["status"], event["source"]["kind"], event["explicit"]) == (
+        "working",
+        "hook",
+        False,
+    )
+    hook(ctx, fake, sid, "PreToolUse", tool_name="AskUserQuestion")
+    fake.write(path, tool_call("AskUserQuestion"))
+    sync(ctx, path)
+    assert server_status(ctx.api, sid).get("reason") == "asked"
+    hook(ctx, fake, sid, "PostToolUse", tool_name="AskUserQuestion")
+    fake.write(path, text_reply("Done. Shall I push?"))
+    hook(ctx, fake, sid, "Stop")
+    sync(ctx, path)
+    event = server_status(ctx.api, sid)
+    assert (event["status"], event.get("reason")) == ("ready", "idle")
+    # The list entry carries the excerpt; the state body does not.
+    assert "excerpt" not in event
+    (summary,) = ctx.api.sessions(open="1")
+    assert summary.get("excerpt") == "Done. Shall I push?"
+    assert ctx.state.wanted_status(HARNESS, sid) is None
+    assert ctx.state.session(HARNESS, sid).status == event
+
+
+def test_remote_done_is_not_overwritten(
+    server: Server, ctx: Context, fake: FakeClaude
+) -> None:
+    sid, path = started_session(ctx, fake)
+    desk = server.api("desk")
+    base = server_status(desk, sid)["seq"]
+    desk.add_status(
+        HARNESS,
+        sid,
+        {
+            "status": "done",
+            "note": "merged",
+            "source_kind": "user",
+            "explicit": True,
+            "base_seq": base,
+        },
+    )
+    # The user prompts here before the client knows of the mark.
+    fake.write(path, prompt("one more thing"))
+    hook(ctx, fake, sid, "UserPromptSubmit")
+    sync(ctx, path)
+    event = server_status(ctx.api, sid)
+    assert (event["status"], event["source"]["host"]) == ("done", "desk")
+    assert ctx.state.wanted_status(HARNESS, sid) is None
+    assert ctx.state.notice_flag(sid).exists()
+    (notice,) = ctx.state.take_notices(HARNESS, sid)
+    assert "desk marked this session done (by user). Note: merged" in notice
+    record = ctx.state.session(HARNESS, sid)
+    assert record.done_seen is not None
+    # Tool calls and the end of the turn do not change a done session.
+    hook(ctx, fake, sid, "PreToolUse", tool_name="Bash")
+    hook(ctx, fake, sid, "Stop")
+    assert ctx.state.wanted_status(HARNESS, sid) is None
+
+
+def test_done_then_prompt_reopens(
+    server: Server, ctx: Context, fake: FakeClaude
+) -> None:
+    sid, path = started_session(ctx, fake)
+    request = {**_request("done", sid, reason=None, wake=None, note="x", by_user=True)}
+    assert set_status(ctx, sid, request) is not None
+    assert server_status(ctx.api, sid)["status"] == "done"
+    # The user's next prompt reopens the session.
+    fake.write(path, prompt("actually, also do Y"))
+    hook(ctx, fake, sid, "UserPromptSubmit")
+    sync(ctx, path)
+    event = server_status(ctx.api, sid)
+    assert (event["status"], event["explicit"], event["source"]["kind"]) == (
+        "working",
+        True,
+        "user",
+    )
+    assert event.get("note") == "reopened by a prompt"
+    # A mark from this host by the user does not give a notice to itself.
+    assert ctx.state.take_notices(HARNESS, sid) == []
+
+
+def test_status_cli_defaults_to_env_session(
+    ctx: Context, fake: FakeClaude, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid, path = started_session(ctx, fake)
+    monkeypatch.delenv(SESSION_ENV, raising=False)
+    with pytest.raises(Exit):
+        _target(None)
+    monkeypatch.setenv(SESSION_ENV, sid)
+    assert _target(None) == sid
+    request = _request(
+        "waiting", sid, reason=None, wake="message", note="CI\non PR 41", by_user=False
+    )
+    assert request["source_kind"] == "agent" and "source_session" not in request
+    assert request["note"] == "CI on PR 41"
+    # A queued automatic write is replaced by the explicit one.
+    hook(ctx, fake, sid, "PreToolUse", tool_name="AskUserQuestion")
+    event = set_status(ctx, sid, request)
+    assert event is not None and event["wake"] == "message"
+    assert ctx.state.wanted_status(HARNESS, sid) is None
+    # The declaration holds over the Stop hook of this turn.
+    hook(ctx, fake, sid, "Stop")
+    sync(ctx, path)
+    assert server_status(ctx.api, sid)["status"] == "waiting"
+    assert not ctx.state.session(HARNESS, sid).turn_declared
+
+
+def test_agent_does_not_write_over_an_outside_done(
+    server: Server, ctx: Context, fake: FakeClaude, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid, _ = started_session(ctx, fake)
+    desk = server.api("desk")
+    desk.add_status(
+        HARNESS,
+        sid,
+        {
+            "status": "done",
+            "source_kind": "user",
+            "explicit": True,
+            "base_seq": server_status(desk, sid)["seq"],
+        },
+    )
+    monkeypatch.setenv(SESSION_ENV, sid)
+    agent = _request("ready", sid, reason=None, wake=None, note=None, by_user=False)
+    assert set_status(ctx, sid, agent) is None
+    assert server_status(ctx.api, sid)["source"]["host"] == "desk"
+    # The user, on the other hand, can reopen it with one retry.
+    user = _request("ready", sid, reason=None, wake=None, note="not yet", by_user=True)
+    event = set_status(ctx, sid, user)
+    assert event is not None and event["status"] == "ready"
+
+
+def test_write_for_another_session(
+    server: Server, ctx: Context, fake: FakeClaude, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid, _ = started_session(ctx, fake)
+    other = "22222222-2222-2222-2222-222222222222"
+    monkeypatch.setenv(SESSION_ENV, other)
+    request = _request("done", sid, reason=None, wake=None, note="dup", by_user=False)
+    assert request["source_session"] == other
+    desk = context(
+        server.api("desk"), ctx.state.directory.parent / "desk", fake, "desk"
+    )
+    try:
+        event = set_status(desk, sid, request)
+    finally:
+        desk.state.close()
+    assert event is not None
+    assert event["source"] == {"kind": "agent", "host": "desk", "session_id": other}
+
+
+def test_write_before_the_first_sync_is_queued(
+    ctx: Context, fake: FakeClaude, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = fake.transcript(WS)
+    sid = path.stem
+    monkeypatch.setenv(SESSION_ENV, sid)
+    request = _request("done", sid, reason=None, wake=None, note="quick", by_user=False)
+    assert set_status(ctx, sid, request) is None
+    assert ctx.state.wanted_status(HARNESS, sid) is not None
+    fake.write(path, prompt("hi"), text_reply("hello"))
+    sync(ctx, path)
+    assert server_status(ctx.api, sid)["status"] == "done"
+
+
+def test_old_server_without_capability(ctx: Context, fake: FakeClaude) -> None:
+    path = fake.transcript(WS)
+    sid = path.stem
+    fake.write(path, prompt("hello"))
+    hook(ctx, fake, sid, "UserPromptSubmit")
+    ctx.api._capabilities = {CAP_WORKSPACE_UTF8, CAP_RESTORE_PRECONDITION}  # pyright: ignore[reportPrivateUsage]
+    sync(ctx, path)
+    assert "status" not in ctx.api.state(HARNESS, sid)
+    # The write stays queued for a server that has the capability.
+    assert ctx.state.wanted_status(HARNESS, sid) is not None
+    ctx.api._capabilities = None  # pyright: ignore[reportPrivateUsage]
+    session = ctx.adapter.session_for_transcript(path)
+    assert session is not None
+    send_wanted(ctx, session)
+    assert server_status(ctx.api, sid)["status"] == "working"
+
+
+def test_ls_open_columns(
+    server: Server, ctx: Context, fake: FakeClaude, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sid, _ = started_session(ctx, fake)
+    path2 = fake.transcript(WS)
+    fake.write(path2, prompt("build it"))
+    hook(ctx, fake, path2.stem, "UserPromptSubmit")
+    sync(ctx, path2)
+    # Both run on laptop. Then the second session's process stops during
+    # its turn.
+    both = [
+        {"harness": HARNESS, "session_id": sid},
+        {"harness": HARNESS, "session_id": path2.stem},
+    ]
+    ctx.api.heartbeat({"interval": 60, "sessions": both})
+    ctx.api.heartbeat({"interval": 60, "sessions": both[:1]})
+    sessions = ctx.api.sessions(open="1")
+    _print_status_table(sessions, 30 * 60)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].split() == ["SESSION", "STATUS", "WHERE", "AGE", "TITLE", "NOTE"]
+    # `ready` comes before `interrupted`.
+    assert lines[1].startswith(sid) and "ready:idle" in lines[1]
+    assert "laptop:" + WS in lines[1] and "All set. Shall I push?" in lines[1]
+    assert lines[2].startswith(path2.stem) and "interrupted" in lines[2]
+
+
+def test_status_label() -> None:
+    now = time.time()
+    base: dict[str, Any] = {
+        "state": "normal",
+        "lease": {"state": "held", "host": "laptop", "since": "x"},
+    }
+    working: dict[str, Any] = {
+        "seq": 1,
+        "status": "working",
+        "source": {"kind": "hook", "host": "laptop"},
+        "explicit": False,
+        "received": "2026-10-16T00:00:00Z",
+    }
+    live = {"state": "live", "host": "laptop", "since": "2026-10-16T00:00:00Z"}
+    old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600))
+    assert status_label({**base}, now, 1800) == "-"  # type: ignore[arg-type]
+    state: Any = {**base, "status": working, "liveness": live, "last_append": old}
+    assert status_label(state, now, 1800) == "stalled"
+    assert status_label(state, now, 7200) == "working"
+    state["liveness"] = {**live, "state": "unknown", "since": "2026-10-16T09:41:00Z"}
+    assert status_label(state, now, 1800) == "working, unknown since 09:41"
+    done = {**working, "status": "done", "explicit": True}
+    state = {
+        **base,
+        "status": done,
+        "liveness": {**live, "state": "stopped", "close_blocked": "unpushed work"},
+    }
+    assert status_label(state, now, 1800) == "done, not closed: unpushed work"
+
+
+def test_tail_reads_active_branch(ctx: Context, fake: FakeClaude) -> None:
+    path = fake.transcript(WS)
+    sid = path.stem
+    fake.write(
+        path,
+        prompt("first"),
+        text_reply("answer one"),
+        prompt("second"),
+        tool_call("Read"),
+        text_reply("answer two"),
+    )
+    sync(ctx, path)
+    out = tail(ctx.api, sid, 1)
+    assert "second" in out and "[tool] Read" in out and "answer two" in out
+    assert "answer one" not in out
+    # A rewrite of the local file makes a new active branch.
+    path.write_text("")
+    fake.write(path, prompt("rewritten"), text_reply("new answer"))
+    sync(ctx, path)
+    assert "new answer" in tail(ctx.api, sid, 5)
+    assert "answer two" not in tail(ctx.api, sid, 5)
+
+
+def test_state_dir_is_shared_with_the_notice_hook(tmp_path: Path) -> None:
+    # The plugin's notice.sh looks for flags in $XDG_STATE_HOME/hyperspace.
+    state = State(tmp_path / "hyperspace")
+    assert state.notice_flag("x") == tmp_path / "hyperspace" / "notify" / "x"

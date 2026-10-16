@@ -8,6 +8,9 @@ session teleport between hosts.
 - `hyperspace teleport` on one host and `hyperspace restore` on another move a
   session, so that `claude --resume <id>` continues it there. The agent gets a
   notice that says where the session was and where it is now.
+- Each session has a status (working, waiting, ready, or done).
+  `hyperspace ls --open` lists the open work on all hosts. See
+  [session status and liveness](docs/specs/2026-10-15-session-status.md).
 - The server does not parse transcripts. Client adapters hold the harness
   knowledge. v1 has an adapter for Claude Code.
 
