@@ -651,11 +651,42 @@ The message (`MESSAGE`):
 
 ### Done when
 
-- [ ] Tests pass; ruff and pyright are clean.
+- [x] Tests pass; ruff and pyright are clean.
 - [ ] One manual run with `--limit 3` on the workstation sets a sensible
       status for three old sessions (with the live test precautions of step
       2).
-- [ ] Commit type `feat(client)`.
+- [x] Commit type `feat(client)`.
+
+### Step 3 as built
+
+- `hyperspace backfill-status [--since 30d] [--rate 60] [--limit N] [--timeout 600] [--dry-run] [--retry]`.
+- Candidates are newest first, not oldest first: a run that stops or has a
+  `--limit` then covers the sessions that the user most likely still needs.
+- The server check is one `GET .../state` for each local candidate, not one
+  `GET /sessions?status=none` list. The list has a maximum of 1,000 entries
+  and filters `since` by the server's activity time, which for backfilled
+  sessions is the upload time, not the time of the work. The window uses the
+  transcript's modification time.
+- Skip reasons: `messaged before`, `live`, `no workspace` (the workspace
+  directory is not there), `excluded` (`exclude_cwd`), `not on server`,
+  `has status`, and `lease not here` (the lease is not held by this host).
+  `run` checks `live` and the server state again just before each resume,
+  because the state can change while the throttle waits.
+- The client records each attempt in its key-value state
+  (`backfill:<harness>:<sid>`) before the resume starts, and adds the result
+  after it. `--retry` ignores these records.
+- The outcome is `set` only if the latest event is an explicit write from the
+  agent. A `ready` that the Stop hook writes when the agent sets nothing
+  counts as `no status`.
+- The resume runs in its own process group, with `CLAUDE_CODE_SESSION_ID` and
+  `CLAUDE_JOB_DIR` removed from its environment, so that a backfill that runs
+  inside a Claude Code session does not act on that session. A timeout stops
+  the whole group.
+- Tests: `tests/test_unit_client_backfill.py`,
+  `tests/test_e2e_client_backfill.py`, and `tests/fake_claude.py`. The e2e
+  tests use an in-process runner in place of the binary, because a subprocess
+  cannot reach the in-process server; the unit tests run `run_claude` against
+  `fake_claude.py`.
 
 ## Step 4: launcher, workstation mode
 

@@ -18,8 +18,8 @@ from typing import Any, cast
 
 import httpx
 
+from hyperspace_client import backfill, credentials
 from hyperspace_client import config as config_mod
-from hyperspace_client import credentials
 from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import Api, ApiError, NotFound
@@ -672,6 +672,65 @@ def cmd_tail(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def cmd_backfill_status(args: argparse.Namespace, cfg: Config) -> int:
+    try:
+        since = backfill.parse_age(args.since)
+    except ValueError as exc:
+        raise Exit(2, str(exc)) from None
+    if args.rate <= 0:
+        raise Exit(2, "--rate must be more than 0")
+
+    def run(ctx: Context, adapter: ClaudeCode) -> int:
+        ctx.api.require_capability(CAP_SESSION_STATUS)
+        now = time.time()
+        selection = backfill.select(
+            ctx,
+            adapter,
+            since,
+            now,
+            retry=args.retry,
+            limit=args.limit,
+            excluded=lambda ws: _excluded(cfg, ws),
+        )
+        skipped = ", ".join(
+            f"{reason} {count}" for reason, count in sorted(selection.skipped.items())
+        )
+        if args.dry_run:
+            rows = [["SESSION", "AGE", "WORKSPACE", "TITLE"]]
+            for c in selection.candidates:
+                rows.append(
+                    [
+                        c.session.session_id,
+                        _age(now - c.modified),
+                        c.workspace,
+                        c.title[:50],
+                    ]
+                )
+            _print_table(rows)
+            print(f"{len(selection.candidates)} sessions to message")
+            if skipped:
+                print(f"skipped: {skipped}")
+            return 0
+        if skipped:
+            print(f"skipped: {skipped}")
+        claude = os.environ.get("HYPERSPACE_CLAUDE", "claude")
+        results = backfill.run(
+            ctx,
+            adapter,
+            selection.candidates,
+            claude=claude,
+            rate=args.rate,
+            timeout=args.timeout,
+            report=lambda line: print(line, flush=True),
+        )
+        print(
+            ", ".join(f"{k} {v}" for k, v in sorted(results.items())) or "nothing to do"
+        )
+        return 0
+
+    return _with_context(cfg, run)
+
+
 def cmd_grant(args: argparse.Namespace, cfg: Config) -> int:
     url, token = cfg.require_server()
     with Api(url, token) as api:
@@ -881,6 +940,40 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("session", nargs="?")
     p.add_argument("-n", type=int, default=3, help="the number of turns (default 3)")
     p.set_defaults(func=cmd_tail)
+
+    p = sub.add_parser(
+        "backfill-status",
+        help="ask each recent session on this host with no status to set one",
+    )
+    p.add_argument(
+        "--since",
+        default="30d",
+        metavar="AGE",
+        help="sessions whose transcript changed in this time (default 30d)",
+    )
+    p.add_argument(
+        "--rate",
+        type=float,
+        default=60,
+        help="the most sessions to resume each hour (default 60)",
+    )
+    p.add_argument("--limit", type=int, help="the most sessions to message")
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=600,
+        metavar="SECONDS",
+        help="stop a resume after this time (default 600)",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="list the sessions and do nothing"
+    )
+    p.add_argument(
+        "--retry",
+        action="store_true",
+        help="also message sessions that an earlier run messaged",
+    )
+    p.set_defaults(func=cmd_backfill_status)
 
     p = sub.add_parser("show", help="show a session: lease, placements, branches")
     p.add_argument("session")
