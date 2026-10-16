@@ -566,8 +566,10 @@ The code follows this step, with these changes and additions:
   notice, also when its host, source and note are the same as an earlier mark.
 - `State` adds the new `sessions` and `notices` columns to the file of an
   older client in one `BEGIN IMMEDIATE` transaction, and it reads the columns
-  in that transaction. At `SessionStart`, many hook processes open the file at
-  the same time; the second waits for the lock and then sees the columns.
+  again in that transaction. At `SessionStart`, many hook processes open the
+  file at the same time; the second waits for the lock and then sees the
+  columns. The first read of the columns does not lock, so that the open of an
+  up-to-date file does not wait for an unrelated writer.
 - `SessionStart` does not print a pending `done` notice ("Finish the current
   step and stop"), because no turn runs at a start. The notice stays pending,
   and `SessionStart` prints only that the session is marked done and that a
