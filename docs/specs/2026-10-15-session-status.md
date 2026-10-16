@@ -400,8 +400,12 @@ main process, and it does not stop when no session runs. At boot it:
    `local`, as a background job, with `claude --bg --resume <sid>` in the
    session's workspace. It does not resume a session that is `ready`,
    `waiting` with wake `message`, or `done`, or that has no status (R1, R2,
-   R3). It also does not resume a session that runs on a different host, so
-   that the resume does not make a conflict.
+   R3). It also does not resume a session that the server shows as `live`, on
+   any host, so that the resume does not make a second copy. This includes its
+   own host, because a different harness config directory on the host can run
+   the session, and the launcher's own live-process check does not see that
+   process. The launcher sends its heartbeat before it resumes, so a `live`
+   from its own heartbeat before a restart does not stay.
 
 At each tick, it does step 3 again for the held sessions that do not run. It
 does not resume a job that the Claude Code daemon stopped if its session is

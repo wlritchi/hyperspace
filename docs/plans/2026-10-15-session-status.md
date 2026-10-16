@@ -902,8 +902,8 @@ The code follows this step, with these changes:
   fallback workspace is its working directory.
 - **Decision**: `needs_process(summary, host, running)` returns the first
   message or None. It also returns None for a lease that is not `held` by this
-  host, and for a session that the server shows as `live` on a different host
-  (a resume there makes a conflict).
+  host, and for a session that the server shows as `live` on any host (see
+  "Fixes after review").
 - **Resume**: `Launcher.resume` uses the workspace from the local session
   record only, never a path from the server, and only for a session with a
   local transcript under that id (so the id is a valid UUID file name). It
@@ -985,6 +985,15 @@ without it.
   expired makes it `live`; only with no such row does the latest row give
   `stopped` or `unknown`. `close_blocked` comes from the heartbeat of the row
   that gives the state. Test: `test_stopped_copy_does_not_hide_a_live_copy`.
+- **Live on the runner's own host**: `needs_process` skipped only a session
+  that was `live` on a different host. A different harness config directory on
+  the runner can run the session, and the launcher's `is_running` does not see
+  that process, so the runner made a second copy. Now it skips a session that
+  is `live` on any host. The tick sends the launcher's heartbeat before the
+  resumes, so a `live` from the launcher's own heartbeat before a restart
+  clears first. Tests: `test_needs_process_table`,
+  `test_session_live_from_another_config_dir_is_not_resumed`,
+  `test_own_live_from_before_a_restart_does_not_block_the_resume`.
 
 ## Step 6: outside this repo
 
