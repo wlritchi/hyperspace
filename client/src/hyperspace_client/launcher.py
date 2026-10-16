@@ -70,8 +70,8 @@ RESUME_TIMEOUT = 120.0
 # session that stops at once is not resumed in a loop.
 MAX_RESUMES = 5
 RESUME_WINDOW = 3600.0
-# After a failed restore of held sessions, the next one is after one tick
-# interval. The wait doubles after each failure, to at most this time.
+# The longest wait between restores of held sessions after failures. The wait
+# starts at one tick interval and doubles after each failure.
 RESTORE_RETRY_MAX = 3600.0
 
 # With --runner or --stay, the launcher waits this long after a start error
@@ -350,10 +350,8 @@ def needs_process(summary: SessionSummary, host: str, running: bool) -> str | No
         return None
     live = state.get("liveness")
     if live is not None and live["state"] == "live":
-        # A copy runs on a different host, or on this host from a different
-        # config directory, which `running` does not show. A resume makes a
-        # second copy. Each tick sends the launcher's heartbeat before the
-        # resumes, so a `live` from its heartbeat before a restart clears.
+        # `running` does not show a copy on another host, or on this host in
+        # another config directory. A resume would make a second copy.
         return None
     event = state.get("status")
     if event is None:
@@ -395,7 +393,7 @@ class Launcher:
     # The earliest time of the next restore of held sessions; None after a
     # restore with no failure.
     _restore_at: float | None = float("-inf")
-    _restore_fails: int = 0
+    _restore_wait: float = 0.0
 
     def sweep(self, live: list[str]) -> None:
         """Close the stopped jobs of `done` sessions."""
@@ -485,6 +483,8 @@ class Launcher:
         try:
             if self.before_tick is not None:
                 self.before_tick()
+            # Send the heartbeat before the resumes, so that a stale `live`
+            # from before a restart clears.
             send_heartbeat(self.ctx, self.adapter, live, self.interval)
             self.sweep(live)
             if self.runner:
@@ -496,9 +496,9 @@ class Launcher:
         return live
 
     def restore(self) -> None:
-        """Runner mode: restore the held sessions that have no local copy, at
-        the first tick. If a restore fails, do it again at a later tick, with
-        a backoff, until one has no failure."""
+        """Runner mode: restore the held sessions at the first tick. After a
+        failure, try again at later ticks with a doubling wait, until a
+        restore has no failure."""
         if self._restore_at is None or self.clock() < self._restore_at:
             return
         try:
@@ -510,10 +510,10 @@ class Launcher:
             if not result.failed:
                 self._restore_at = None
                 return
-        delay = min(self.interval * 2**self._restore_fails, RESTORE_RETRY_MAX)
-        self._restore_fails += 1
-        self._restore_at = self.clock() + delay
-        log.info("launcher: restore of held sessions again in %d s", delay)
+        wait = max(self._restore_wait * 2, self.interval)
+        self._restore_wait = min(wait, RESTORE_RETRY_MAX)
+        self._restore_at = self.clock() + self._restore_wait
+        log.info("launcher: restore again in %d s", self._restore_wait)
 
     def run(self, max_ticks: int | None = None) -> int:
         last_live = self.clock()
