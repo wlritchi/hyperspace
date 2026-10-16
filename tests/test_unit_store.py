@@ -951,6 +951,31 @@ def test_heartbeat_close_blocked(store: Store) -> None:
     assert liveness["state"] == "stopped" and liveness["close_blocked"] == reason
 
 
+def test_close_blocked_for_a_session_never_listed(store: Store) -> None:
+    g = root(store)
+    put(store, g, 0, b"one\n")
+    last = store.session_state(KEY)["last_append"]
+    unclosed = [{"harness": KEY.harness, "session_id": KEY.session_id, "reason": "x"}]
+    beat(store, "laptop", unclosed=unclosed)
+    liveness = store.session_state(KEY)["liveness"]
+    assert liveness == {
+        "state": "stopped",
+        "host": "laptop",
+        "since": last,
+        "close_blocked": "x",
+    }
+
+
+def test_unclosed_needs_read_access(store: Store) -> None:
+    root(store)
+    unclosed = [{"harness": KEY.harness, "session_id": KEY.session_id, "reason": "x"}]
+    beat(store, "agent-1", scope="granted", unclosed=unclosed)
+    assert "liveness" not in store.session_state(KEY)
+    beat(store, "laptop", KEY)
+    beat(store, "agent-1", scope="granted", unclosed=unclosed)
+    assert "close_blocked" not in store.session_state(KEY)["liveness"]
+
+
 def test_heartbeat_skips_unknown_and_unreadable_sessions(store: Store) -> None:
     root(store)
     missing = SessionKey("acct", "claude-code", "missing")
