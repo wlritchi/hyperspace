@@ -175,6 +175,7 @@ def test_done_then_prompt_reopens(
     request = {**_request("done", sid, reason=None, wake=None, note="x", by_user=True)}
     assert set_status(ctx, sid, request) is not None
     assert server_status(ctx.api, sid)["status"] == "done"
+    assert ctx.state.notice_flag(sid).exists()
     # The user's next prompt reopens the session.
     fake.write(path, prompt("actually, also do Y"))
     hook(ctx, fake, sid, "UserPromptSubmit")
@@ -186,7 +187,7 @@ def test_done_then_prompt_reopens(
         "user",
     )
     assert event.get("note") == "reopened by a prompt"
-    # A mark from this host by the user does not give a notice to itself.
+    # The reopen drops the done notice that the agent did not get.
     assert ctx.state.take_notices(HARNESS, sid) == []
 
 
@@ -326,6 +327,24 @@ def test_write_for_another_session(
         desk.state.close()
     assert event is not None
     assert event["source"] == {"kind": "agent", "host": "desk", "session_id": other}
+
+
+@pytest.mark.parametrize("by_user", [False, True])
+def test_write_for_another_session_on_this_host(
+    ctx: Context, fake: FakeClaude, monkeypatch: pytest.MonkeyPatch, by_user: bool
+) -> None:
+    sid, _ = started_session(ctx, fake)
+    # A different session on this host, or the user in a different terminal.
+    if by_user:
+        monkeypatch.delenv(SESSION_ENV, raising=False)
+    else:
+        monkeypatch.setenv(SESSION_ENV, "22222222-2222-2222-2222-222222222222")
+    request = _request("done", sid, reason=None, wake=None, note="dup", by_user=by_user)
+    event = set_status(ctx, sid, request)
+    assert event is not None and event["source"]["host"] == "laptop"
+    assert ctx.state.session(HARNESS, sid).status == event
+    (notice,) = ctx.state.take_notices(HARNESS, sid)
+    assert "laptop marked this session done" in notice
 
 
 def test_backfill_turn_sets_only_its_own_status(

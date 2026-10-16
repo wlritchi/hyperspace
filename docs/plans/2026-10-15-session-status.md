@@ -561,7 +561,10 @@ The code follows this step, with these changes and additions:
   `hyperspace status` with no `STATUS` shows the status and the liveness.
   `hyperspace tail` takes the current session when no id is given.
 - A CLI write for a different session that has a local copy also saves the
-  event in that session's local record.
+  event in that session's local record. An explicit `done` there also adds the
+  notice (A3, U4), because a later sync does not see the saved event as new.
+  Thus a mark from a different session or terminal on the same host reaches
+  the live session. A write for the current session adds no notice.
 - The test dependencies have no `pytest-mock`. The send and retry tests use
   the in-process server instead of mocks. `tests/conftest.py` removes
   `CLAUDE_CODE_SESSION_ID` and `CLAUDE_JOB_DIR`, so that the tests behave the
