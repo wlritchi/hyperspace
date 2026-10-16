@@ -235,18 +235,20 @@ _MIGRATIONS: list[str] = [
     CREATE TABLE host_heartbeats (
         account TEXT NOT NULL,
         host TEXT NOT NULL,
+        source TEXT NOT NULL,
         received TEXT NOT NULL,
         interval INTEGER NOT NULL,
         final INTEGER NOT NULL,
         unclosed TEXT NOT NULL,
-        PRIMARY KEY (account, host)
+        PRIMARY KEY (account, host, source)
     );
     CREATE TABLE session_liveness (
         session INTEGER NOT NULL REFERENCES sessions (id),
         host TEXT NOT NULL,
+        source TEXT NOT NULL,
         first_listed TEXT NOT NULL,
         last_listed TEXT NOT NULL,
-        PRIMARY KEY (session, host)
+        PRIMARY KEY (session, host, source)
     );
     """,
 ]
@@ -1456,17 +1458,20 @@ class Store:
     def heartbeat(
         self, account: str, host: str, scope: ReadScope, request: HeartbeatRequest
     ) -> HeartbeatResponse:
-        """Record the sessions that run on `host` now.
+        """Record the sessions that run on `host` now, for the heartbeat's
+        source (one harness config directory of the host).
 
         The store skips a listed session that does not exist or that the host
         cannot read, with no error, so that a heartbeat is not an existence
         oracle.
         """
+        source = request.get("source", "")
         with self._tx():
             now = self.now()
             previous = self._db.execute(
-                "SELECT * FROM host_heartbeats WHERE account = ? AND host = ?",
-                (account, host),
+                "SELECT * FROM host_heartbeats "
+                "WHERE account = ? AND host = ? AND source = ?",
+                (account, host, source),
             ).fetchone()
             recorded = 0
             for item in request["sessions"]:
@@ -1476,8 +1481,9 @@ class Store:
                 if session is None or not self._can_read_row(session, host, scope):
                     continue
                 row = self._db.execute(
-                    "SELECT * FROM session_liveness WHERE session = ? AND host = ?",
-                    (session["id"], host),
+                    "SELECT * FROM session_liveness "
+                    "WHERE session = ? AND host = ? AND source = ?",
+                    (session["id"], host, source),
                 ).fetchone()
                 # `first_listed` is the start of the current run on this host.
                 # It stays only if the previous heartbeat listed the session
@@ -1493,12 +1499,13 @@ class Store:
                 self._db.execute(
                     """
                     INSERT INTO session_liveness
-                    (session, host, first_listed, last_listed) VALUES (?, ?, ?, ?)
-                    ON CONFLICT (session, host) DO UPDATE SET
+                    (session, host, source, first_listed, last_listed)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (session, host, source) DO UPDATE SET
                         first_listed = excluded.first_listed,
                         last_listed = excluded.last_listed
                     """,
-                    (session["id"], host, first, now),
+                    (session["id"], host, source, first, now),
                 )
                 recorded += 1
             unclosed: list[UnclosedSession] = []
@@ -1517,18 +1524,18 @@ class Store:
                     self._db.execute(
                         """
                         INSERT INTO session_liveness
-                        (session, host, first_listed, last_listed)
-                        VALUES (?, ?, ?, ?)
-                        ON CONFLICT (session, host) DO NOTHING
+                        (session, host, source, first_listed, last_listed)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT (session, host, source) DO NOTHING
                         """,
-                        (session["id"], host, since, since),
+                        (session["id"], host, source, since, since),
                     )
             self._db.execute(
                 """
                 INSERT INTO host_heartbeats
-                (account, host, received, interval, final, unclosed)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT (account, host) DO UPDATE SET
+                (account, host, source, received, interval, final, unclosed)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (account, host, source) DO UPDATE SET
                     received = excluded.received,
                     interval = excluded.interval,
                     final = excluded.final,
@@ -1537,6 +1544,7 @@ class Store:
                 (
                     account,
                     host,
+                    source,
                     now,
                     request["interval"],
                     int(request.get("final", False)),
@@ -1558,15 +1566,19 @@ class Store:
         ).fetchone()
         if row is None:
             return None
+        # Only a heartbeat from the same source (config directory) can say
+        # that the session stopped. The other sources of the host do not
+        # list it.
         heartbeat = self._db.execute(
-            "SELECT * FROM host_heartbeats WHERE account = ? AND host = ?",
-            (session["account"], row["host"]),
+            "SELECT * FROM host_heartbeats "
+            "WHERE account = ? AND host = ? AND source = ?",
+            (session["account"], row["host"], row["source"]),
         ).fetchone()
         if heartbeat is None:
             return None
         liveness: Liveness
         if heartbeat["received"] > row["last_listed"]:
-            # A newer heartbeat of the host did not list the session.
+            # A newer heartbeat of the source did not list the session.
             liveness = {
                 "state": "stopped",
                 "host": row["host"],

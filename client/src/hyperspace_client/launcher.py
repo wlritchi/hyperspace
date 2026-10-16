@@ -42,7 +42,8 @@ from hyperspace_protocol import (
 log = logging.getLogger("hyperspace")
 
 OFF_ENV = "HYPERSPACE_LAUNCHER"
-# The state key of the jobs that `claude rm` refused, by job name.
+# The state key of the jobs that `claude rm` refused, by job name. Each
+# harness config directory has its own key, with its source id at the end.
 UNCLOSED_KEY = "launcher_unclosed"
 RM_TIMEOUT = 120.0
 # A stopped job whose session is not `done` is checked again after this time,
@@ -92,14 +93,20 @@ def run_rm(argv: list[str]) -> tuple[int, str]:
     return done.returncode, done.stderr + done.stdout
 
 
+def source_id(config_dir: Path) -> str:
+    """The id of a harness config directory: the launcher's lock name, the
+    heartbeat's source, and the key of the launcher's state."""
+    return hashlib.sha256(str(config_dir.resolve()).encode()).hexdigest()[:16]
+
+
 @contextmanager
 def host_lock(state_dir: Path, host: str, config_dir: Path) -> Iterator[bool]:
     """Hold the launcher lock of this host and harness config directory for
     the `with` body. The value is False if another launcher holds it."""
-    digest = hashlib.sha256(str(config_dir).encode()).hexdigest()[:16]
     locks = state_dir / "locks"
     locks.mkdir(parents=True, exist_ok=True)
-    fd = os.open(locks / f"launcher--{host}--{digest}.lock", os.O_RDWR | os.O_CREAT)
+    name = f"launcher--{host}--{source_id(config_dir)}.lock"
+    fd = os.open(locks / name, os.O_RDWR | os.O_CREAT)
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -111,10 +118,11 @@ def host_lock(state_dir: Path, host: str, config_dir: Path) -> Iterator[bool]:
         os.close(fd)
 
 
-def load_unclosed(state: State) -> dict[str, dict[str, Any]]:
-    """The jobs that `claude rm` refused: job name to session id, reason, and
-    the mtime of the job's state.json at the refusal."""
-    raw = state.get(UNCLOSED_KEY)
+def load_unclosed(state: State, adapter: ClaudeCode) -> dict[str, dict[str, Any]]:
+    """The jobs of `adapter`'s config directory that `claude rm` refused:
+    job name to session id, reason, and the mtime of the job's state.json at
+    the refusal."""
+    raw = state.get(_unclosed_key(adapter))
     if raw is None:
         return {}
     try:
@@ -124,21 +132,30 @@ def load_unclosed(state: State) -> dict[str, dict[str, Any]]:
     return cast(dict[str, dict[str, Any]], value) if isinstance(value, dict) else {}
 
 
-def save_unclosed(state: State, entries: dict[str, dict[str, Any]]) -> None:
-    state.put(UNCLOSED_KEY, json.dumps(entries, sort_keys=True))
+def save_unclosed(
+    state: State, adapter: ClaudeCode, entries: dict[str, dict[str, Any]]
+) -> None:
+    state.put(_unclosed_key(adapter), json.dumps(entries, sort_keys=True))
+
+
+def _unclosed_key(adapter: ClaudeCode) -> str:
+    return f"{UNCLOSED_KEY}:{source_id(adapter.config_dir)}"
 
 
 def send_heartbeat(
     ctx: Context,
-    harness: str,
+    adapter: ClaudeCode,
     live: list[str],
     interval: int,
     final: bool = False,
 ) -> None:
-    """Send the host's heartbeat. It includes the refused jobs that the
-    launcher recorded, because each heartbeat replaces the earlier list."""
+    """Send the heartbeat of `adapter`'s config directory. It includes the
+    refused jobs that the launcher recorded, because each heartbeat replaces
+    the earlier list of its source."""
+    harness = adapter.harness
     request: HeartbeatRequest = {
         "interval": interval,
+        "source": source_id(adapter.config_dir),
         "sessions": [
             {"harness": harness, "session_id": sid}
             for sid in live[:MAX_HEARTBEAT_SESSIONS]
@@ -146,7 +163,7 @@ def send_heartbeat(
     }
     unclosed: list[UnclosedSession] = [
         {"harness": harness, "session_id": e["session_id"], "reason": e["reason"]}
-        for e in load_unclosed(ctx.state).values()
+        for e in load_unclosed(ctx.state, adapter).values()
     ]
     if unclosed:
         request["unclosed"] = unclosed[:MAX_HEARTBEAT_SESSIONS]
@@ -207,14 +224,14 @@ def close_job(
     return reason
 
 
-def record_refusal(state: State, job: Job, reason: str) -> None:
-    entries = load_unclosed(state)
+def record_refusal(state: State, adapter: ClaudeCode, job: Job, reason: str) -> None:
+    entries = load_unclosed(state, adapter)
     entries[job.short] = {
         "session_id": job.session_id,
         "reason": reason,
         "mtime": job.mtime,
     }
-    save_unclosed(state, entries)
+    save_unclosed(state, adapter, entries)
 
 
 def close_after_exit(
@@ -245,7 +262,7 @@ def close_after_exit(
         log.warning("%s: not closed: %s", job.session_id, exc)
         return
     if reason is not None:
-        record_refusal(ctx.state, job, reason)
+        record_refusal(ctx.state, adapter, job, reason)
 
 
 def needs_process(summary: SessionSummary, host: str, running: bool) -> str | None:
@@ -302,7 +319,7 @@ class Launcher:
         now = self.clock()
         jobs = self.adapter.jobs()
         by_name = {j.short: j for j in jobs}
-        entries = load_unclosed(self.ctx.state)
+        entries = load_unclosed(self.ctx.state, self.adapter)
         # A refusal holds until the job goes away or its state changes.
         kept = {
             short: e
@@ -310,7 +327,7 @@ class Launcher:
             if short in by_name and by_name[short].mtime == e.get("mtime")
         }
         if kept != entries:
-            save_unclosed(self.ctx.state, kept)
+            save_unclosed(self.ctx.state, self.adapter, kept)
         self._checked = {k: v for k, v in self._checked.items() if k in by_name}
         for job in jobs:
             if job.session_id in live or job.short in kept:
@@ -327,7 +344,7 @@ class Launcher:
                 log.info("%s: not closed: %s", job.session_id, exc)
                 continue
             if reason is not None:
-                record_refusal(self.ctx.state, job, reason)
+                record_refusal(self.ctx.state, self.adapter, job, reason)
 
     def resume_held(self, live: list[str]) -> None:
         """Resume the sessions whose lease this host holds and that need a
@@ -385,7 +402,7 @@ class Launcher:
         try:
             if self.before_tick is not None:
                 self.before_tick()
-            send_heartbeat(self.ctx, self.adapter.harness, live, self.interval)
+            send_heartbeat(self.ctx, self.adapter, live, self.interval)
             self.sweep(live)
             if self.runner:
                 self.resume_held(live)
@@ -418,7 +435,7 @@ class Launcher:
             ):
                 try:
                     send_heartbeat(
-                        self.ctx, self.adapter.harness, [], self.interval, final=True
+                        self.ctx, self.adapter, [], self.interval, final=True
                     )
                 except (ApiError, httpx.HTTPError) as exc:
                     log.warning("launcher: last heartbeat: %s", exc)

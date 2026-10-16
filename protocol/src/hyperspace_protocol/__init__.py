@@ -284,6 +284,9 @@ def _session_ref(value: object) -> dict[str, Any]:
     }
 
 
+_HEARTBEAT_SOURCE = re.compile(r"[A-Za-z0-9_-]{0,64}")
+
+
 def validate_heartbeat(value: dict[str, Any]) -> HeartbeatRequest:
     """Check a heartbeat, and return it with only the known fields."""
     interval = _nonnegative_int(value.get("interval"), "interval")
@@ -293,6 +296,11 @@ def validate_heartbeat(value: dict[str, Any]) -> HeartbeatRequest:
             f"{MAX_HEARTBEAT_INTERVAL} seconds"
         )
     request: dict[str, Any] = {"interval": interval}
+    source = value.get("source", "")
+    if not isinstance(source, str) or not _HEARTBEAT_SOURCE.fullmatch(source):
+        raise ValidationError("source must be 0 to 64 letters, digits, - or _")
+    if source:
+        request["source"] = source
     for name in ("sessions", "unclosed"):
         items = value.get(name, [])
         if not isinstance(items, list):
@@ -592,6 +600,10 @@ class UnclosedSession(TypedDict):
 
 class HeartbeatRequest(TypedDict):
     interval: int
+    # The client's id for the harness config directory. A host with more than
+    # one config directory sends one heartbeat for each; each replaces only
+    # the earlier heartbeat with the same source. Absent: "".
+    source: NotRequired[str]
     sessions: list[HeartbeatSession]
     unclosed: NotRequired[list[UnclosedSession]]
     # The launcher stops after this heartbeat.

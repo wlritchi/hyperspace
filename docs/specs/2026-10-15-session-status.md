@@ -256,6 +256,13 @@ from the adapter's live-process check (`is_running` in the main spec). The
 heartbeat also gives its interval. SessionStart and SessionEnd send an extra
 heartbeat at once, so that a change shows without a wait.
 
+A host can have more than one harness config directory, each with its own
+launcher. Each heartbeat therefore has a _source_: the client's id for its
+config directory. A heartbeat replaces only the earlier heartbeat of the same
+source, and only a heartbeat of the source that listed a session can show that
+the session stopped. Thus the launchers of two config directories on one host
+do not mark each other's sessions `stopped`.
+
 The server derives the liveness of a session:
 
 | Liveness  | Rule                                                                                      |
@@ -490,7 +497,8 @@ asks the agent to set its status with a note, and to change nothing else.
 
 - `status_events`: one row per status event, append-only, with the fields of
   "Status events".
-- `host_heartbeats`: one row per host, overwritten by each heartbeat.
+- `host_heartbeats`: one row per host and source, overwritten by each
+  heartbeat of that source.
 
 A purge of a session (`scripts/purge.py`) also removes its status events.
 
@@ -499,7 +507,7 @@ A purge of a session (`scripts/purge.py`) also removes its status events.
 | Method and path                         | Scope                    | Purpose                                                                       |
 | --------------------------------------- | ------------------------ | ----------------------------------------------------------------------------- |
 | `POST /sessions/{harness}/{sid}/status` | `append` and read access | Add a status event. `409 stale_status` if `base_seq` is not the current `seq` |
-| `PUT /hosts/self/heartbeat`             | `append`                 | Replace the host's list of live sessions                                      |
+| `PUT /hosts/self/heartbeat`             | `append`                 | Replace the list of live sessions of one source of the host                   |
 
 Changes to existing bodies:
 

@@ -211,7 +211,7 @@ def _hook_heartbeat(cfg: Config, ctx: Context, session_id: str, event: str) -> N
         if event == "SessionEnd":
             # The process can still be alive while its SessionEnd hook runs.
             live = [sid for sid in live if sid != session_id]
-        launcher.send_heartbeat(ctx, ctx.adapter.harness, live, cfg.heartbeat_interval)
+        launcher.send_heartbeat(ctx, ctx.adapter, live, cfg.heartbeat_interval)
     except (ApiError, httpx.HTTPError) as exc:
         log.info("%s: no heartbeat: %s", session_id, exc)
 

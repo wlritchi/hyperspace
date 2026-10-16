@@ -30,6 +30,7 @@ from hyperspace_client.launcher import (
     host_lock,
     load_unclosed,
     needs_process,
+    record_refusal,
     run_rm,
 )
 from hyperspace_client.state import State
@@ -173,6 +174,34 @@ def test_heartbeat_makes_session_live_then_stopped(
     assert state(ctx, sid)["liveness"]["state"] == "stopped"
 
 
+def test_config_dirs_of_one_host_keep_their_own_liveness(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    first = session(ctx, fake)
+    fake_b = FakeClaude(tmp_path / "claude-b")
+    host_b = Host(fake_b.root)
+    ctx_b = Context(api=ctx.api, state=ctx.state, adapter=host_b, host="laptop")
+    second = session(ctx_b, fake_b)
+    host.live, host_b.live = [first], [second]
+    run_a = launcher(ctx, host, Rm(ctx), Clock())
+    clock_b = Clock()
+    run_b = launcher(ctx_b, host_b, Rm(ctx_b), clock_b, idle_exit=60.0)
+    run_a.tick()
+    run_b.tick()
+    for sid in (first, second):
+        assert state(ctx, sid)["liveness"]["state"] == "live"
+    # A refusal in one config directory stays when the other one sweeps.
+    record_refusal(ctx.state, host, job_for(host, fake, "aa", first), "unpushed")
+    run_b.tick()
+    assert set(load_unclosed(ctx.state, host)) == {"aa"}
+    # The second launcher stops for idle; its last heartbeat ends only its
+    # own sessions.
+    host_b.live = []
+    assert run_b.run(max_ticks=5) == 0
+    assert state(ctx, second)["liveness"]["state"] == "stopped"
+    assert state(ctx, first)["liveness"]["state"] == "live"
+
+
 def test_idle_exit_sends_final_heartbeat(
     ctx: Context, fake: FakeClaude, host: Host
 ) -> None:
@@ -298,7 +327,7 @@ def test_rm_refusal_is_reported_once(
     rm.code = 0
     run.tick()
     assert len(rm.calls) == 2
-    assert load_unclosed(ctx.state) == {}
+    assert load_unclosed(ctx.state, host) == {}
 
 
 def test_close_job_waits_for_the_process(
