@@ -1018,6 +1018,12 @@ _single-flight sync with a trailing run_ for each session:
    If the mark is set, it waits until at least `checkpoint_interval` (default
    10 s) has passed since its last sync started, and goes back to step 2.
 
+A process that holds the session's lock and does not sync, for example the
+runner's launcher while it resumes the session (session status spec, "Runner
+mode"), checks the dirty mark when it releases the lock. If the mark is set,
+it starts a checkpoint, because the checkpoints that started during the hold
+did not sync.
+
 The result: during a busy turn, a session uploads at most once each 10
 seconds, and the last change is always uploaded. A crash loses at most about
 10 seconds of transcript. During one long tool call, no new records come from

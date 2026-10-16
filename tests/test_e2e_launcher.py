@@ -24,6 +24,7 @@ from hyperspace_client.api import Api, ApiError
 from hyperspace_client.backfill import RunResult
 from hyperspace_client.cli import _hook_heartbeat, main, status_label
 from hyperspace_client.config import Config, ConfigError, load
+from hyperspace_client.hooks import handle
 from hyperspace_client.launcher import (
     MAX_RESUMES,
     RESUME_WAITING,
@@ -43,6 +44,7 @@ from hyperspace_client.state import State
 from hyperspace_client.sync import Context, Syncer
 from hyperspace_client.teleport import HeldRestore, TeleportError, restore
 from hyperspace_protocol import SessionStateBody, SessionSummary
+from store import SessionKey
 
 WS = "/home/wlritchi/hyperspace"
 HARNESS = "claude-code"
@@ -152,7 +154,12 @@ def state(ctx: Context, sid: str) -> SessionStateBody:
     return ctx.api.state(HARNESS, sid)
 
 
+def no_start(args: list[str]) -> None:
+    raise AssertionError(f"the launcher started {args}")
+
+
 def launcher(ctx: Context, host: Host, rm: Rm, clock: Clock, **kw: Any) -> Launcher:
+    kw.setdefault("start", no_start)
     return Launcher(
         ctx,
         host,
@@ -1054,3 +1061,99 @@ def test_resume_holds_the_session_lock_only_through_the_launch(
         os.kill(daemon, 0)
     finally:
         os.kill(daemon, signal.SIGKILL)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        RunResult(0, ""),
+        RunResult(1, "error"),
+        # `claude --bg` timed out.
+        RunResult(None, ""),
+        OSError("claude: not found"),
+    ],
+)
+def test_a_checkpoint_that_the_launch_blocks_runs_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+    server: Server,
+    fake: FakeClaude,
+    tmp_path: Path,
+    outcome: RunResult | OSError,
+) -> None:
+    # The CLI and the launcher use the same state directory and server.
+    for name, value in {
+        "XDG_STATE_HOME": str(tmp_path / "xdg"),
+        "HYPERSPACE_CONFIG": str(tmp_path / "none.toml"),
+        "HYPERSPACE_URL": "http://127.0.0.1:9",
+        "HYPERSPACE_TOKEN": "unused",
+        "HYPERSPACE_HOST": "laptop",
+        "CLAUDE_CONFIG_DIR": str(fake.root),
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    def context(cfg: Config, state: State) -> Context:
+        return Context(
+            api=server.api("laptop"), state=state, adapter=ClaudeCode(), host=cfg.host
+        )
+
+    monkeypatch.setattr("hyperspace_client.cli._context", context)
+    host = Host(fake.root)
+    ctx = Context(
+        api=server.api("laptop"),
+        state=State(tmp_path / "xdg" / "hyperspace"),
+        adapter=host,
+        host="laptop",
+    )
+    try:
+        ws = tmp_path / "ws"
+        sid = held_session(ctx, fake, ws)
+        set_status(ctx, sid, "working")
+        transcript = host.find_transcripts(sid)[0]
+        cfg = load()
+        hooked: list[list[str]] = []
+
+        def checkpoint(args: list[str]) -> None:
+            hooked.append(args)
+            assert main(args) == 0
+
+        def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
+            # Before `claude --bg` returns (or times out), the session runs a
+            # short turn. Its Stop hook starts a checkpoint, which does not
+            # get the session's lock.
+            fake.write(transcript, prompt("go on"), text_reply())
+            handle(
+                {
+                    "hook_event_name": "Stop",
+                    "transcript_path": str(transcript),
+                    "cwd": str(ws),
+                },
+                cfg,
+                start=checkpoint,
+            )
+            assert hooked
+            assert ctx.state.dirty_since(HARNESS, sid) is not None
+            if isinstance(outcome, OSError):
+                raise outcome
+            return outcome
+
+        started: list[list[str]] = []
+        run = runner(ctx, host, Bg(), Clock(), start=started.append)
+        run.run_claude = bg
+        run.tick()
+        assert started == [
+            ["--quiet", "sync", "--checkpoint", "--transcript", str(transcript)]
+        ]
+        assert main(started[0]) == 0
+        assert ctx.state.dirty_since(HARNESS, sid) is None
+        assert state(ctx, sid).get("status", {}).get("status") == "ready"
+        files = server.store.manifest(SessionKey("default", HARNESS, sid))["files"]
+        lengths = [
+            g["length"]
+            for f in files
+            if f["kind"] == "log"
+            for g in f["generations"]
+            if g["id"] == f["active"]
+        ]
+        assert transcript.stat().st_size in lengths
+    finally:
+        ctx.state.close()

@@ -1037,6 +1037,20 @@ without it.
   `test_pending_restore_blocks_the_resume`,
   `test_no_resume_while_another_process_holds_the_session_lock`,
   `test_resume_holds_the_session_lock_only_through_the_launch`.
+- **Checkpoint after the resume hold**: during the hold, a checkpoint that a
+  hook of the new session starts marks the session dirty, does not get the
+  lock, and exits, because the lock holder usually syncs again for the mark.
+  The launcher does not sync. If `claude --bg` was slow to return, and the
+  session ran a short turn and stopped in that time, its last transcript
+  records and its queued status stayed unsent. Now `Launcher.resume` holds the
+  lock with `Launcher._hold`. When the lock is free again, also after a
+  failure, a timeout or an exception of `claude --bg`, `_hold` starts
+  `hyperspace sync --checkpoint --transcript <path>` as a detached process if
+  the session has a dirty mark. The transcript path is the one that the
+  checkpoint sync recorded before it marked the session. `detach` moved from
+  `hooks` to `launcher`, because `hooks` imports `launcher`. Test:
+  `test_a_checkpoint_that_the_launch_blocks_runs_after_it` (a success, a
+  failure, a timeout and an exception).
 - **Start errors**: `cmd_launcher` called `register_host` and `has_capability`
   before `Launcher.run`, and an error stopped the launcher. On a runner whose
   server was not available at the pod's start, the entrypoint exited 1 and the
