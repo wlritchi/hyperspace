@@ -1,18 +1,32 @@
 # vim: filetype=python
 """Validation functions in hyperspace-protocol."""
 
+from typing import Any
+
 import pytest
 
 from hyperspace_protocol import (
+    MAX_HEARTBEAT_SESSIONS,
+    MAX_STATUS_EXCERPT,
+    MAX_STATUS_NOTE,
     ValidationError,
     validate_file_path,
     validate_harness,
+    validate_heartbeat,
     validate_host_name,
     validate_id,
     validate_session_id,
     validate_sha256,
+    validate_status_request,
     validate_workspace,
 )
+
+STATUS: dict[str, Any] = {
+    "status": "working",
+    "source_kind": "hook",
+    "explicit": False,
+    "base_seq": 0,
+}
 
 
 @pytest.mark.parametrize(
@@ -119,3 +133,76 @@ def test_workspace() -> None:
     for bad in ("", "relative/path", "/a\x00b", "/" + "a" * 4096):
         with pytest.raises(ValidationError):
             validate_workspace(bad)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {},
+        {"status": "ready", "reason": "asked"},
+        {"status": "waiting", "wake": "message", "note": "CI on PR #41"},
+        {"status": "done", "source_kind": "user", "explicit": True, "base_seq": 7},
+        {"source_kind": "agent", "source_session": "s2", "excerpt": "x" * 1000},
+        {"note": "n" * MAX_STATUS_NOTE},
+    ],
+)
+def test_status_request_valid(extra: dict[str, Any]) -> None:
+    body = {**STATUS, **extra}
+    assert validate_status_request({**body, "unknown": 1}) == body
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"status": "busy"},
+        {"status": "ready"},
+        {"status": "ready", "reason": "bored"},
+        {"reason": "idle"},
+        {"status": "waiting"},
+        {"wake": "local"},
+        {"note": "two\nlines"},
+        {"note": "n" * (MAX_STATUS_NOTE + 1)},
+        {"note": 3},
+        {"excerpt": "x" * (MAX_STATUS_EXCERPT + 1)},
+        {"source_kind": "robot"},
+        {"source_session": "../x"},
+        {"explicit": 1},
+        {"base_seq": -1},
+        {"base_seq": True},
+        {"base_seq": "0"},
+        {"base_seq": None},
+    ],
+)
+def test_status_request_invalid(extra: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate_status_request({**STATUS, **extra})
+
+
+def test_heartbeat_validation() -> None:
+    ref = {"harness": "claude-code", "session_id": "s1"}
+    assert validate_heartbeat({"interval": 60, "sessions": [ref]}) == {
+        "interval": 60,
+        "sessions": [ref],
+    }
+    full = {
+        "interval": 10,
+        "sessions": [],
+        "unclosed": [{**ref, "reason": "unpushed work"}],
+        "final": True,
+    }
+    assert validate_heartbeat(full) == full
+    assert validate_heartbeat({"interval": 3600}) == {"interval": 3600, "sessions": []}
+    for bad in (
+        {"interval": 9},
+        {"interval": 3601},
+        {"interval": True},
+        {"interval": 60, "sessions": {}},
+        {"interval": 60, "sessions": [{"harness": "claude-code"}]},
+        {"interval": 60, "sessions": [{**ref, "session_id": "../x"}]},
+        {"interval": 60, "sessions": [ref] * (MAX_HEARTBEAT_SESSIONS + 1)},
+        {"interval": 60, "unclosed": [ref]},
+        {"interval": 60, "unclosed": [{**ref, "reason": "a\nb"}]},
+        {"interval": 60, "final": "yes"},
+    ):
+        with pytest.raises(ValidationError):
+            validate_heartbeat(bad)

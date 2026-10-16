@@ -51,6 +51,42 @@ def test_purge_and_stats_beside_a_live_store(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
+def test_purge_reports_status_events(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    store = Store(data)
+    store.create_generation(KEY, "transcript.jsonl", W, "root")
+    for seq in (0, 1):
+        store.add_status(
+            KEY,
+            "laptop",
+            {
+                "status": "working",
+                "source_kind": "hook",
+                "explicit": False,
+                "base_seq": seq,
+            },
+        )
+    store.heartbeat(
+        "default",
+        "laptop",
+        "all",
+        {
+            "interval": 60,
+            "sessions": [{"harness": KEY.harness, "session_id": KEY.session_id}],
+        },
+    )
+    store.close()
+
+    args = ["--data-dir", str(data), "--reason", "test", "session", "claude-code"]
+    dry = run("purge.py", *args, KEY.session_id)
+    assert dry.returncode == 1, dry.stderr
+    assert "2 status events, 1 liveness rows" in dry.stdout
+    done = run("purge.py", "--yes", *args, KEY.session_id)
+    assert done.returncode == 0, done.stderr
+    assert '"status_events": 2' in done.stdout
+
+
+@pytest.mark.slow
 def test_stats_keeps_reads_of_a_purged_session_apart_from_a_new_session(
     tmp_path: Path,
 ) -> None:

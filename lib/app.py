@@ -39,22 +39,30 @@ from hyperspace_protocol import (
     HEADER_WORKSPACE,
     HEADER_WORKSPACE_UTF8,
     HOST_KINDS,
+    LIVENESS_STATES,
     MAX_BODY,
+    STATUSES,
+    StatusResponse,
     ValidationError,
     decode_workspace,
     validate_file_path,
     validate_harness,
+    validate_heartbeat,
     validate_host_name,
     validate_id,
     validate_session_id,
     validate_sha256,
+    validate_status_request,
     validate_workspace,
 )
-from store import Conflict, SessionKey, Store, StoreError, Writer
+from store import Conflict, SessionKey, StaleStatus, Store, StoreError, Writer
 
 log = logging.getLogger("hyperspace")
 
 _JSON_LIMIT = 64 * 1024
+# A heartbeat can list MAX_HEARTBEAT_SESSIONS sessions and as many unclosed
+# sessions with a reason each.
+_HEARTBEAT_JSON_LIMIT = 1024 * 1024
 
 _STATUS = {
     "not_found": 404,
@@ -64,6 +72,7 @@ _STATUS = {
     "conflicted": 409,
     "not_holder": 409,
     "stale_snapshot": 409,
+    "stale_status": 409,
     "teleport_committed_conflict": 409,
     "teleport_committed_moved": 409,
     "bad_request": 400,
@@ -388,6 +397,9 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
                             "session": exc.session,
                         },
                     )
+                except StaleStatus as exc:
+                    body = {"status": exc.current} if exc.current is not None else None
+                    return error(exc.code, exc.detail, body)
                 except StoreError as exc:
                     return error(exc.code, exc.detail)
                 except ApiError as exc:
@@ -445,8 +457,8 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
             raise ApiError("too_large", "decompressed body is too large")
         return data
 
-    async def read_json(request: Request) -> dict[str, Any]:
-        raw = await read_body(request, _JSON_LIMIT)
+    async def read_json(request: Request, limit: int = _JSON_LIMIT) -> dict[str, Any]:
+        raw = await read_body(request, limit)
         if not raw:
             return {}
         try:
@@ -468,6 +480,17 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         if result < 0:
             raise ApiError("bad_request", f"{name} must not be negative")
         return result
+
+    def choices(
+        values: list[str], allowed: tuple[str, ...], name: str
+    ) -> set[str] | None:
+        """A repeatable query parameter. `None` means no filter."""
+        if not values:
+            return None
+        for value in values:
+            if value not in allowed:
+                raise ApiError("bad_request", f"{name} must be one of {list(allowed)}")
+        return set(values)
 
     # --- Endpoints --------------------------------------------------------
 
@@ -532,6 +555,13 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         if on_host is not None:
             validate_host_name(on_host)
         limit = int_param(request, "limit", 200) or 200
+        lease_host = q.get("lease_host")
+        if lease_host is not None:
+            validate_host_name(lease_host)
+        statuses = choices(q.getlist("status"), (*STATUSES, "none"), "status")
+        liveness = choices(
+            q.getlist("liveness"), (*LIVENESS_STATES, "none"), "liveness"
+        )
         sessions = await run_in_threadpool(
             store.snapshot,
             lambda: store.list_sessions(
@@ -543,6 +573,10 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
                 workspace=q.get("workspace"),
                 since=q.get("since"),
                 title=q.get("title"),
+                statuses=statuses,
+                open_only=q.get("open") == "1",
+                lease_host=lease_host,
+                liveness=liveness,
                 limit=min(limit, 1000),
             ),
         )
@@ -587,6 +621,32 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
             lambda: store.add_metadata(key, w, body),
         )
         return JSONResponse({"ok": True})
+
+    @authed("append")
+    async def post_status(request: Request, principal: Principal) -> Response:
+        key = session_key(request, principal)
+        status = validate_status_request(await read_json(request))
+        event = await run_in_threadpool(
+            store.existing_authorized,
+            key,
+            principal.host,
+            principal.read,
+            lambda: store.add_status(key, principal.host, status),
+        )
+        response: StatusResponse = {"status": event}
+        return JSONResponse(response)
+
+    @authed("append")
+    async def put_heartbeat(request: Request, principal: Principal) -> Response:
+        heartbeat = validate_heartbeat(await read_json(request, _HEARTBEAT_JSON_LIMIT))
+        response = await run_in_threadpool(
+            store.heartbeat,
+            principal.account,
+            principal.host,
+            principal.read,  # type: ignore[arg-type]
+            heartbeat,
+        )
+        return JSONResponse(response)
 
     @authed("append")
     async def post_surrender(request: Request, principal: Principal) -> Response:
@@ -769,12 +829,14 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         Route("/healthz", healthz, methods=["GET"]),
         Route(f"{API_PREFIX}/whoami", whoami, methods=["GET"]),
         Route(f"{API_PREFIX}/hosts/self", put_host, methods=["PUT"]),
+        Route(f"{API_PREFIX}/hosts/self/heartbeat", put_heartbeat, methods=["PUT"]),
         Route(f"{API_PREFIX}/hosts", get_hosts, methods=["GET"]),
         Route(f"{API_PREFIX}/workspaces", get_workspaces, methods=["GET"]),
         Route(f"{API_PREFIX}/sessions", list_sessions, methods=["GET"]),
         Route(s, get_manifest, methods=["GET"]),
         Route(f"{s}/state", get_state, methods=["GET"]),
         Route(f"{s}/meta", post_meta, methods=["POST"]),
+        Route(f"{s}/status", post_status, methods=["POST"]),
         Route(f"{s}/lease/surrender", post_surrender, methods=["POST"]),
         Route(f"{s}/teleports", post_teleport, methods=["POST"]),
         Route(f"{s}/forks", post_fork, methods=["POST"]),

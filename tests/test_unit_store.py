@@ -12,8 +12,23 @@ from pathlib import Path
 import pytest
 
 import store as store_module
-from hyperspace_protocol import ReadScope
-from store import _MIGRATIONS, Conflict, SessionKey, Store, StoreError, Writer
+from hyperspace_protocol import (
+    HeartbeatRequest,
+    ReadScope,
+    Status,
+    StatusEvent,
+    StatusRequest,
+)
+from store import (
+    _MIGRATIONS,
+    Conflict,
+    NotFound,
+    SessionKey,
+    StaleStatus,
+    Store,
+    StoreError,
+    Writer,
+)
 
 KEY = SessionKey("acct", "claude-code", "s1")
 LAPTOP = Writer("acct", "laptop", "/home/wlritchi/hyperspace")
@@ -755,3 +770,265 @@ def test_blob_promotion_keeps_latest_content(store: Store) -> None:
     assert store.read_blob(KEY, PATH, 2) == b"latest"
     assert store.manifest(KEY)["files"][0]["kind"] == "blob"
     assert store.purge_session(KEY, "test")["blob_versions"] == 2
+
+
+# --- Status and liveness ------------------------------------------------
+
+
+def set_status(
+    store: Store,
+    status: Status = "working",
+    base: int = 0,
+    key: SessionKey = KEY,
+    host: str = "laptop",
+    **extra: str,
+) -> StatusEvent:
+    request: StatusRequest = {
+        "status": status,
+        "source_kind": "hook",
+        "explicit": False,
+        "base_seq": base,
+    }
+    if status == "ready":
+        request["reason"] = "idle"
+    if status == "waiting":
+        request["wake"] = "local"
+    request.update(extra)  # type: ignore[typeddict-item]
+    return store.add_status(key, host, request)
+
+
+def beat(
+    store: Store,
+    host: str,
+    *keys: SessionKey,
+    interval: int = 60,
+    scope: ReadScope = "all",
+    **extra: object,
+) -> int:
+    request: HeartbeatRequest = {
+        "interval": interval,
+        "sessions": [{"harness": k.harness, "session_id": k.session_id} for k in keys],
+    }
+    request.update(extra)  # type: ignore[typeddict-item]
+    return store.heartbeat("acct", host, scope, request)["recorded"]
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock()
+
+
+@pytest.fixture
+def timed(tmp_path: Path, clock: Clock) -> Iterator[Store]:
+    s = Store(tmp_path / "data", clock=clock)
+    yield s
+    s.close()
+
+
+def test_status_first_write_needs_base_zero(store: Store) -> None:
+    with pytest.raises(NotFound):
+        set_status(store)
+    root(store)
+    with pytest.raises(StaleStatus) as err:
+        set_status(store, base=1)
+    assert err.value.code == "stale_status" and err.value.current is None
+    event = set_status(store, note="first")
+    assert event["seq"] == 1 and event["note"] == "first"
+    assert event["source"] == {"kind": "hook", "host": "laptop"}
+    assert event["explicit"] is False
+
+
+def test_status_cas_rejects_stale_base(store: Store) -> None:
+    root(store)
+    first = set_status(store, "ready")
+    with pytest.raises(StaleStatus) as err:
+        set_status(store, "working", base=0)
+    assert err.value.current == first
+    assert set_status(store, "working", base=1)["seq"] == 2
+
+
+def test_status_aba_is_rejected(store: Store) -> None:
+    root(store)
+    set_status(store, "done")
+    set_status(store, "ready", base=1)
+    marked = set_status(store, "done", base=2, host="agent-1")
+    # A writer that saw only the first "done" cannot replace the second one.
+    with pytest.raises(StaleStatus) as err:
+        set_status(store, "working", base=1)
+    assert err.value.current == marked
+    assert marked["source"]["host"] == "agent-1"
+
+
+def test_status_in_state_body_without_excerpt(store: Store) -> None:
+    g = root(store)
+    put(store, g, 0, b"one\n")
+    event = set_status(
+        store,
+        "waiting",
+        note="CI on PR #41",
+        excerpt="I pushed the fix.",
+        source_session="s9",
+    )
+    state = store.session_state(KEY)
+    assert state["status"] == event
+    assert "excerpt" not in state["status"]
+    assert event["wake"] == "local"
+    assert event["source"]["session_id"] == "s9"
+    assert (
+        state["last_append"]
+        == store.manifest(KEY)["files"][0]["generations"][0]["last_append"]
+    )
+
+
+def test_list_has_excerpt(store: Store) -> None:
+    root(store)
+    assert "excerpt" not in store.list_sessions("acct", "laptop", "all")[0]
+    set_status(store, "ready", excerpt="Which backend?")
+    assert store.list_sessions("acct", "laptop", "all")[0]["excerpt"] == (
+        "Which backend?"
+    )
+
+
+def test_liveness_live_stopped_unknown(timed: Store, clock: Clock) -> None:
+    root(timed)
+    assert "liveness" not in timed.session_state(KEY)
+    beat(timed, "laptop", KEY)
+    live = timed.session_state(KEY)["liveness"]
+    assert live["state"] == "live" and live["host"] == "laptop"
+    since = live["since"]
+    clock.t += timedelta(seconds=60)
+    beat(timed, "laptop", KEY)
+    # The run continues, so the start time stays.
+    assert timed.session_state(KEY)["liveness"] == {
+        "state": "live",
+        "host": "laptop",
+        "since": since,
+    }
+    clock.t += timedelta(seconds=200)
+    unknown = timed.session_state(KEY)["liveness"]
+    assert unknown["state"] == "unknown"
+    # After a gap, a new heartbeat starts a new run.
+    beat(timed, "laptop", KEY)
+    again = timed.session_state(KEY)["liveness"]
+    assert again["state"] == "live" and again["since"] > since
+    last = again["since"]
+    beat(timed, "laptop")
+    stopped = timed.session_state(KEY)["liveness"]
+    assert stopped["state"] == "stopped" and stopped["since"] >= last
+    # A heartbeat after a stop also starts a new run.
+    beat(timed, "laptop", KEY)
+    assert timed.session_state(KEY)["liveness"]["since"] > stopped["since"]
+
+
+def test_liveness_follows_the_host_that_listed_last(store: Store) -> None:
+    root(store)
+    beat(store, "laptop", KEY)
+    beat(store, "agent-1", KEY)
+    assert store.session_state(KEY)["liveness"]["host"] == "agent-1"
+
+
+def test_final_heartbeat_stops_sessions(timed: Store, clock: Clock) -> None:
+    root(timed)
+    beat(timed, "laptop", KEY)
+    beat(timed, "laptop", final=True)
+    clock.t += timedelta(hours=1)
+    # It stays stopped, not unknown, after the heartbeat expires.
+    assert timed.session_state(KEY)["liveness"]["state"] == "stopped"
+
+
+def test_heartbeat_close_blocked(store: Store) -> None:
+    root(store)
+    beat(store, "laptop", KEY)
+    reason = "unpushed work in worktree"
+    beat(
+        store,
+        "laptop",
+        unclosed=[
+            {"harness": KEY.harness, "session_id": KEY.session_id, "reason": reason}
+        ],
+    )
+    liveness = store.session_state(KEY)["liveness"]
+    assert liveness["state"] == "stopped" and liveness["close_blocked"] == reason
+
+
+def test_heartbeat_skips_unknown_and_unreadable_sessions(store: Store) -> None:
+    root(store)
+    missing = SessionKey("acct", "claude-code", "missing")
+    assert beat(store, "agent-1", KEY, missing, scope="granted") == 0
+    assert "liveness" not in store.session_state(KEY)
+    assert beat(store, "laptop", KEY, missing, scope="own") == 1
+    assert store.session_state(KEY)["liveness"]["host"] == "laptop"
+
+
+def test_revision_ignores_status_and_heartbeat(store: Store) -> None:
+    g = root(store)
+    put(store, g, 0, b"one\n")
+    revision = store.manifest(KEY)["revision"]
+    set_status(store, "ready")
+    beat(store, "laptop", KEY)
+    assert store.manifest(KEY)["revision"] == revision
+    put(store, g, 4, b"two\n")
+    assert store.manifest(KEY)["revision"] != revision
+
+
+def test_list_filters_status_open_lease_host_liveness(store: Store) -> None:
+    keys = [SessionKey("acct", "claude-code", f"s{n}") for n in range(1, 5)]
+    for key in keys[:3]:
+        put(store, root(store, key=key), 0, b"one\n", key=key)
+    g = root(store, writer=AGENT, key=keys[3])
+    put(store, g, 0, b"one\n", writer=AGENT, key=keys[3])
+    set_status(store, "ready", key=keys[0])
+    set_status(store, "done", key=keys[1])
+    set_status(store, "working", key=keys[3])
+    beat(store, "agent-1", keys[3])
+
+    def ids(**kwargs: object) -> list[str]:
+        return sorted(
+            s["session_id"]
+            for s in store.list_sessions("acct", "laptop", "all", **kwargs)  # type: ignore[arg-type]
+        )
+
+    assert ids(statuses={"ready"}) == ["s1"]
+    assert ids(statuses={"ready", "none"}) == ["s1", "s3"]
+    assert ids(open_only=True) == ["s1", "s3", "s4"]
+    assert ids(lease_host="agent-1") == ["s4"]
+    assert ids(lease_host="laptop", open_only=True) == ["s1", "s3"]
+    assert ids(liveness={"live"}) == ["s4"]
+    assert ids(liveness={"none"}) == ["s1", "s2", "s3"]
+
+
+def test_purge_session_removes_status_and_liveness(store: Store) -> None:
+    root(store)
+    set_status(store, "ready")
+    set_status(store, "done", base=1)
+    beat(store, "laptop", KEY)
+    assert store.status_counts(KEY) == {"status_events": 2, "liveness": 1}
+    result = store.purge_session(KEY, "test")
+    assert result["status_events"] == 2 and result["liveness"] == 1
+    # A new session with the same id starts with no status.
+    root(store)
+    state = store.session_state(KEY)
+    assert "status" not in state and "liveness" not in state
+    assert set_status(store)["seq"] == 1
+
+
+def test_migration_3_on_a_version_2_index(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    db = sqlite3.connect(data / "index.sqlite3")
+    for migration in _MIGRATIONS[:2]:
+        db.executescript(migration)
+    db.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    db.execute("INSERT INTO schema_version VALUES (2)")
+    db.execute(
+        "INSERT INTO sessions (id, account, harness, session_id, created) "
+        "VALUES (1, 'acct', 'claude-code', 's1', 't1')"
+    )
+    db.commit()
+    db.close()
+    with closing(Store(data)) as migrated:
+        version = migrated._db.execute("SELECT version FROM schema_version").fetchone()
+        assert version["version"] == len(_MIGRATIONS) == 3
+        assert "status" not in migrated.session_state(KEY)
+        assert set_status(migrated)["seq"] == 1
+        assert beat(migrated, "laptop", KEY) == 1
