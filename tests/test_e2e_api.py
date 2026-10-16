@@ -128,7 +128,12 @@ def test_auth(env: Env) -> None:
         "host": "agent-1",
         "scopes": ["append", "grant", "read"],
         "read_scope": "granted",
-        "capabilities": ["workspace-utf8", "restore-precondition"],
+        "capabilities": [
+            "workspace-utf8",
+            "restore-precondition",
+            "session-status",
+            "liveness",
+        ],
     }
 
 
@@ -379,3 +384,145 @@ def test_revocation_takes_effect(env: Env) -> None:
     )
     assert env.client.get("/v1/whoami", headers=env.h("agent")).status_code == 401
     assert env.client.get("/v1/whoami", headers=env.h("laptop")).status_code == 200
+
+
+def status_body(base: int = 0, **extra: Any) -> dict[str, Any]:
+    return {
+        "status": "ready",
+        "reason": "idle",
+        "source_kind": "hook",
+        "explicit": False,
+        "base_seq": base,
+        **extra,
+    }
+
+
+def test_whoami_capabilities(env: Env) -> None:
+    capabilities = env.client.get("/v1/whoami", headers=env.h("laptop")).json()[
+        "capabilities"
+    ]
+    assert {"session-status", "liveness"} <= set(capabilities)
+
+
+def test_status_route_scopes(env: Env) -> None:
+    g = new_gen(env, "laptop", WS_LAPTOP)
+    append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)
+    r = env.client.post(f"{S}/status", headers=env.h("reader"), json=status_body())
+    assert r.status_code == 403
+    # A host that cannot read the session gets the same 404 as for a missing
+    # session.
+    hidden = env.client.post(f"{S}/status", headers=env.h("agent"), json=status_body())
+    missing = env.client.post(
+        "/v1/sessions/claude-code/missing/status",
+        headers=env.h("laptop"),
+        json=status_body(),
+    )
+    assert hidden.status_code == missing.status_code == 404
+    assert hidden.json() == missing.json()
+    r = env.client.post(f"{S}/status", headers=env.h("laptop"), json=status_body())
+    assert r.status_code == 200, r.text
+    assert r.json()["status"]["seq"] == 1
+    # A runner with a grant can write.
+    env.client.post(f"{S}/grants", headers=env.h("laptop"), json={"host": "agent-1"})
+    r = env.client.post(
+        f"{S}/status",
+        headers=env.h("agent"),
+        json=status_body(1, status="done", reason=None, explicit=True),
+    )
+    assert r.status_code == 200, r.text
+    event = r.json()["status"]
+    assert event["source"] == {"kind": "hook", "host": "agent-1"}
+    state = env.client.get(f"{S}/state", headers=env.h("laptop")).json()
+    assert state["status"] == event
+    r = env.client.post(
+        f"{S}/status", headers=env.h("laptop"), json=status_body(2, status="busy")
+    )
+    assert r.status_code == 400
+
+
+def test_status_409_body(env: Env) -> None:
+    g = new_gen(env, "laptop", WS_LAPTOP)
+    append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)
+    r = env.client.post(f"{S}/status", headers=env.h("laptop"), json=status_body(3))
+    assert r.status_code == 409
+    assert r.json() == {
+        "error": "stale_status",
+        "detail": "the latest status event is 0",
+    }
+    current = env.client.post(
+        f"{S}/status", headers=env.h("laptop"), json=status_body(note="first")
+    ).json()["status"]
+    r = env.client.post(f"{S}/status", headers=env.h("laptop"), json=status_body())
+    assert r.status_code == 409
+    assert r.json()["error"] == "stale_status"
+    assert r.json()["status"] == current
+
+
+def test_heartbeat_route(env: Env) -> None:
+    g = new_gen(env, "laptop", WS_LAPTOP)
+    append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)
+    ref = {"harness": "claude-code", "session_id": SID}
+    other = {"harness": "claude-code", "session_id": "missing"}
+    r = env.client.put(
+        "/v1/hosts/self/heartbeat",
+        headers=env.h("laptop"),
+        json={"interval": 60, "sessions": [ref, other]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["recorded"] == 1
+    state = env.client.get(f"{S}/state", headers=env.h("laptop")).json()
+    assert state["liveness"]["state"] == "live"
+    assert state["liveness"]["host"] == "laptop"
+    # A runner cannot make a session that it cannot read look live.
+    r = env.client.put(
+        "/v1/hosts/self/heartbeat",
+        headers=env.h("agent"),
+        json={"interval": 60, "sessions": [ref]},
+    )
+    assert r.json()["recorded"] == 0
+    listed = env.client.get(
+        "/v1/sessions?liveness=live&open=1&status=none", headers=env.h("laptop")
+    ).json()["sessions"]
+    assert [s["session_id"] for s in listed] == [SID]
+    r = env.client.get("/v1/sessions?liveness=busy", headers=env.h("laptop"))
+    assert r.status_code == 400
+    r = env.client.put(
+        "/v1/hosts/self/heartbeat", headers=env.h("reader"), json={"interval": 60}
+    )
+    assert r.status_code == 403
+    r = env.client.put(
+        "/v1/hosts/self/heartbeat", headers=env.h("laptop"), json={"interval": 1}
+    )
+    assert r.status_code == 400
+
+
+def test_teleport_after_heartbeat_has_no_stale_snapshot(env: Env) -> None:
+    g = new_gen(env, "laptop", WS_LAPTOP)
+    append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)
+    env.client.post(
+        f"{S}/lease/surrender",
+        headers=env.h("laptop"),
+        json={"reserved_for": "agent-1"},
+    )
+    env.client.post(f"{S}/grants", headers=env.h("laptop"), json={"host": "agent-1"})
+    revision = env.client.get(S, headers=env.h("agent")).json()["revision"]
+    # The old host's launcher and hooks keep working while the restore runs.
+    env.client.put(
+        "/v1/hosts/self/heartbeat",
+        headers=env.h("laptop"),
+        json={
+            "interval": 60,
+            "sessions": [{"harness": "claude-code", "session_id": SID}],
+        },
+    )
+    env.client.post(f"{S}/status", headers=env.h("laptop"), json=status_body())
+    r = env.client.post(
+        f"{S}/teleports",
+        headers=env.h("agent"),
+        json={
+            "workspace": WS_AGENT,
+            "expected_revision": revision,
+            "teleport_id": "t_status",
+        },
+    )
+    assert r.status_code == 200, r.text

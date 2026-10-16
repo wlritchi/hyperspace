@@ -23,7 +23,14 @@ HEADER_WORKSPACE = "Hyperspace-Workspace"
 HEADER_WORKSPACE_UTF8 = "Hyperspace-Workspace-Utf8"
 CAP_WORKSPACE_UTF8 = "workspace-utf8"
 CAP_RESTORE_PRECONDITION = "restore-precondition"
-CAPABILITIES = [CAP_WORKSPACE_UTF8, CAP_RESTORE_PRECONDITION]
+CAP_SESSION_STATUS = "session-status"
+CAP_LIVENESS = "liveness"
+CAPABILITIES = [
+    CAP_WORKSPACE_UTF8,
+    CAP_RESTORE_PRECONDITION,
+    CAP_SESSION_STATUS,
+    CAP_LIVENESS,
+]
 
 # One request carries at most this much uncompressed file data. The client
 # splits larger appends.
@@ -35,6 +42,13 @@ MAX_HARNESS_LENGTH = 32
 MAX_FILE_PATH_LENGTH = 512
 MAX_FILE_PATH_SEGMENTS = 32
 MAX_WORKSPACE_LENGTH = 4096
+# Status notes are one line of characters; excerpts can have more lines.
+MAX_STATUS_NOTE = 300
+MAX_STATUS_EXCERPT = 1000
+MAX_HEARTBEAT_SESSIONS = 1000
+# Heartbeat intervals, in seconds.
+MIN_HEARTBEAT_INTERVAL = 10
+MAX_HEARTBEAT_INTERVAL = 3600
 
 FileKind = Literal["log", "blob"]
 HostKind = Literal["workstation", "runner"]
@@ -44,10 +58,20 @@ GenerationCause = Literal["root", "rewrite", "diverge", "fork"]
 PlacementCause = Literal["start", "move", "teleport", "steal", "diverge"]
 SessionState = Literal["normal", "conflicted"]
 LeaseState = Literal["held", "reserved", "free"]
+Status = Literal["working", "waiting", "ready", "done"]
+ReadyReason = Literal["asked", "idle"]
+WakeKind = Literal["local", "message"]
+StatusSourceKind = Literal["user", "agent", "hook"]
+LivenessState = Literal["live", "stopped", "unknown"]
 
 FILE_KINDS: tuple[FileKind, ...] = ("log", "blob")
 HOST_KINDS: tuple[HostKind, ...] = ("workstation", "runner")
 READ_SCOPES: tuple[ReadScope, ...] = ("own", "granted", "all")
+STATUSES: tuple[Status, ...] = ("working", "waiting", "ready", "done")
+READY_REASONS: tuple[ReadyReason, ...] = ("asked", "idle")
+WAKE_KINDS: tuple[WakeKind, ...] = ("local", "message")
+STATUS_SOURCE_KINDS: tuple[StatusSourceKind, ...] = ("user", "agent", "hook")
+LIVENESS_STATES: tuple[LivenessState, ...] = ("live", "stopped", "unknown")
 
 
 class ValidationError(ValueError):
@@ -178,6 +202,117 @@ def validate_metadata(value: dict[str, Any]) -> SessionMetadata:
     return cast(SessionMetadata, value)
 
 
+def _note(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f"{name} must be a string")
+    if len(value) > MAX_STATUS_NOTE:
+        raise ValidationError(f"{name} is longer than {MAX_STATUS_NOTE} characters")
+    if "\n" in value or "\r" in value:
+        raise ValidationError(f"{name} must be one line")
+    return value
+
+
+def _nonnegative_int(value: object, name: str) -> int:
+    # `bool` is a subclass of `int`, but a JSON `true` is not a number.
+    if type(value) is not int or value < 0:
+        raise ValidationError(f"{name} must be a nonnegative integer")
+    return value
+
+
+def validate_status_request(value: dict[str, Any]) -> StatusRequest:
+    """Check a status write, and return it with only the known fields."""
+    status = value.get("status")
+    if status not in STATUSES:
+        raise ValidationError(f"status must be one of {list(STATUSES)}")
+    request: dict[str, Any] = {"status": status}
+    reason = value.get("reason")
+    if status == "ready":
+        if reason not in READY_REASONS:
+            raise ValidationError(f"reason must be one of {list(READY_REASONS)}")
+        request["reason"] = reason
+    elif reason is not None:
+        raise ValidationError("reason is only for the status ready")
+    wake = value.get("wake")
+    if status == "waiting":
+        if wake not in WAKE_KINDS:
+            raise ValidationError(f"wake must be one of {list(WAKE_KINDS)}")
+        request["wake"] = wake
+    elif wake is not None:
+        raise ValidationError("wake is only for the status waiting")
+    if value.get("note") is not None:
+        request["note"] = _note(value["note"], "note")
+    excerpt = value.get("excerpt")
+    if excerpt is not None:
+        if not isinstance(excerpt, str) or len(excerpt) > MAX_STATUS_EXCERPT:
+            raise ValidationError(
+                f"excerpt must be a string of at most {MAX_STATUS_EXCERPT} characters"
+            )
+        request["excerpt"] = excerpt
+    source_kind = value.get("source_kind")
+    if source_kind not in STATUS_SOURCE_KINDS:
+        raise ValidationError(f"source_kind must be one of {list(STATUS_SOURCE_KINDS)}")
+    request["source_kind"] = source_kind
+    source_session = value.get("source_session")
+    if source_session is not None:
+        if not isinstance(source_session, str):
+            raise ValidationError("source_session must be a string")
+        request["source_session"] = validate_session_id(source_session)
+    explicit = value.get("explicit")
+    if not isinstance(explicit, bool):
+        raise ValidationError("explicit must be a boolean")
+    request["explicit"] = explicit
+    request["base_seq"] = _nonnegative_int(value.get("base_seq"), "base_seq")
+    return cast(StatusRequest, request)
+
+
+def _session_ref(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValidationError("each session must be an object")
+    item = cast(dict[str, Any], value)
+    harness, sid = item.get("harness"), item.get("session_id")
+    if not isinstance(harness, str) or not isinstance(sid, str):
+        raise ValidationError("harness and session_id must be strings")
+    return {
+        "harness": validate_harness(harness),
+        "session_id": validate_session_id(sid),
+    }
+
+
+def validate_heartbeat(value: dict[str, Any]) -> HeartbeatRequest:
+    """Check a heartbeat, and return it with only the known fields."""
+    interval = _nonnegative_int(value.get("interval"), "interval")
+    if not MIN_HEARTBEAT_INTERVAL <= interval <= MAX_HEARTBEAT_INTERVAL:
+        raise ValidationError(
+            f"interval must be {MIN_HEARTBEAT_INTERVAL} to "
+            f"{MAX_HEARTBEAT_INTERVAL} seconds"
+        )
+    request: dict[str, Any] = {"interval": interval}
+    for name in ("sessions", "unclosed"):
+        items = value.get(name, [])
+        if not isinstance(items, list):
+            raise ValidationError(f"{name} must be a list")
+        if len(cast(list[Any], items)) > MAX_HEARTBEAT_SESSIONS:
+            raise ValidationError(
+                f"{name} has more than {MAX_HEARTBEAT_SESSIONS} entries"
+            )
+        refs: list[dict[str, Any]] = []
+        for item in cast(list[Any], items):
+            ref = _session_ref(item)
+            if name == "unclosed":
+                ref["reason"] = _note(
+                    cast(dict[str, Any], item).get("reason"), "reason"
+                )
+            refs.append(ref)
+        if name == "sessions" or refs:
+            request[name] = refs
+    final = value.get("final", False)
+    if not isinstance(final, bool):
+        raise ValidationError("final must be a boolean")
+    if final:
+        request["final"] = True
+    return cast(HeartbeatRequest, request)
+
+
 # --- Bodies -----------------------------------------------------------------
 
 
@@ -231,11 +366,46 @@ class Branch(TypedDict):
     last_append: str
 
 
+class StatusSource(TypedDict):
+    kind: StatusSourceKind
+    # The server sets the host from the credential.
+    host: str
+    # An agent in a different session wrote the event.
+    session_id: NotRequired[str]
+
+
+class StatusEvent(TypedDict):
+    seq: int
+    status: Status
+    # Only with "ready", and required there.
+    reason: NotRequired[ReadyReason]
+    # Only with "waiting", and required there.
+    wake: NotRequired[WakeKind]
+    note: NotRequired[str]
+    source: StatusSource
+    explicit: bool
+    received: str
+
+
+class Liveness(TypedDict):
+    state: LivenessState
+    # The host that last listed the session.
+    host: str
+    since: str
+    # Why the host's launcher did not close the session, if it did not.
+    close_blocked: NotRequired[str]
+
+
 class SessionStateBody(TypedDict):
     state: SessionState
     lease: Lease
     # Present for a conflicted session: the branches with activity.
     branches: NotRequired[list[Branch]]
+    # Absent until the first status event. It has no excerpt.
+    status: NotRequired[StatusEvent]
+    # Absent until a host lists the session in a heartbeat.
+    liveness: NotRequired[Liveness]
+    last_append: NotRequired[str]
 
 
 class AppendResponse(TypedDict):
@@ -340,6 +510,8 @@ class SessionSummary(TypedDict):
     metadata: SessionMetadata
     state: SessionStateBody
     last_placement: NotRequired[Placement]
+    # The excerpt of the latest status event.
+    excerpt: NotRequired[str]
 
 
 class SessionList(TypedDict):
@@ -373,3 +545,54 @@ class ForkResponse(TypedDict):
 
 class GrantRequest(TypedDict):
     host: str
+
+
+class StatusRequest(TypedDict):
+    status: Status
+    reason: NotRequired[ReadyReason]
+    wake: NotRequired[WakeKind]
+    note: NotRequired[str]
+    excerpt: NotRequired[str]
+    source_kind: StatusSourceKind
+    source_session: NotRequired[str]
+    explicit: bool
+    # The seq of the latest event that the writer saw, or 0 if it saw none.
+    base_seq: int
+
+
+class StatusResponse(TypedDict):
+    status: StatusEvent
+
+
+class StaleStatus(TypedDict):
+    """The body of `409 stale_status`."""
+
+    error: Literal["stale_status"]
+    detail: str
+    # The current event, if the session has one.
+    status: NotRequired[StatusEvent]
+
+
+class HeartbeatSession(TypedDict):
+    harness: str
+    session_id: str
+
+
+class UnclosedSession(TypedDict):
+    harness: str
+    session_id: str
+    reason: str
+
+
+class HeartbeatRequest(TypedDict):
+    interval: int
+    sessions: list[HeartbeatSession]
+    unclosed: NotRequired[list[UnclosedSession]]
+    # The launcher stops after this heartbeat.
+    final: NotRequired[bool]
+
+
+class HeartbeatResponse(TypedDict):
+    received: str
+    # The listed sessions that the server recorded.
+    recorded: int

@@ -20,7 +20,7 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Concatenate
 
@@ -33,9 +33,12 @@ from hyperspace_protocol import (
     ForkEvent,
     GenerationCause,
     GenerationInfo,
+    HeartbeatRequest,
+    HeartbeatResponse,
     HostInfo,
     HostRecord,
     Lease,
+    Liveness,
     LogManifest,
     Manifest,
     Placement,
@@ -44,6 +47,8 @@ from hyperspace_protocol import (
     SessionMetadata,
     SessionStateBody,
     SessionSummary,
+    StatusEvent,
+    StatusRequest,
     TeleportEvent,
     ValidationError,
     validate_metadata,
@@ -208,7 +213,45 @@ _MIGRATIONS: list[str] = [
     )
     WHERE harness IS NOT NULL;
     """,
+    # Status events are session data, so they are append-only. Heartbeats
+    # and liveness are current state, and the store overwrites their rows.
+    """
+    CREATE TABLE status_events (
+        session INTEGER NOT NULL REFERENCES sessions (id),
+        seq INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT,
+        wake TEXT,
+        note TEXT,
+        excerpt TEXT,
+        source_kind TEXT NOT NULL,
+        source_host TEXT NOT NULL,
+        source_session TEXT,
+        explicit INTEGER NOT NULL,
+        received TEXT NOT NULL,
+        PRIMARY KEY (session, seq)
+    );
+    CREATE TABLE host_heartbeats (
+        account TEXT NOT NULL,
+        host TEXT NOT NULL,
+        received TEXT NOT NULL,
+        interval INTEGER NOT NULL,
+        final INTEGER NOT NULL,
+        unclosed TEXT NOT NULL,
+        PRIMARY KEY (account, host)
+    );
+    CREATE TABLE session_liveness (
+        session INTEGER NOT NULL REFERENCES sessions (id),
+        host TEXT NOT NULL,
+        first_listed TEXT NOT NULL,
+        last_listed TEXT NOT NULL,
+        PRIMARY KEY (session, host)
+    );
+    """,
 ]
+
+# A heartbeat expires after this many of its intervals.
+HEARTBEAT_EXPIRY = 3
 
 
 class StoreError(Exception):
@@ -233,6 +276,15 @@ class Conflict(StoreError):
         self.generation = generation
         self.length = length
         self.session: SessionStateBody | None = None
+
+
+class StaleStatus(StoreError):
+    """A status write whose base is not the latest status event."""
+
+    def __init__(self, current: StatusEvent | None) -> None:
+        seq = current["seq"] if current is not None else 0
+        super().__init__("stale_status", f"the latest status event is {seq}")
+        self.current = current
 
 
 @dataclass(frozen=True)
@@ -286,8 +338,15 @@ def _gen_from_row(row: sqlite3.Row) -> _Gen:
     )
 
 
+_ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
 def _iso(dt: datetime) -> str:
-    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return dt.astimezone(UTC).strftime(_ISO_FORMAT)
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.strptime(value, _ISO_FORMAT).replace(tzinfo=UTC)
 
 
 def _new_id(prefix: str) -> str:
@@ -1311,11 +1370,218 @@ class Store:
             ).fetchall():
                 branches.extend(self._file_branches(f["id"])[1])
             body["branches"] = branches
+        latest = self._latest_status(session)
+        if latest is not None:
+            body["status"] = latest[0]
+        liveness = self._liveness(row)
+        if liveness is not None:
+            body["liveness"] = liveness
+        if row["last_activity"] is not None:
+            body["last_append"] = row["last_activity"]
         return body
 
     @_locked
     def session_state(self, key: SessionKey) -> SessionStateBody:
         return self._session_state(self._require_session(key)["id"])
+
+    # --- Status and liveness --------------------------------------------
+
+    def _latest_status(self, session: int) -> tuple[StatusEvent, str | None] | None:
+        """The latest status event of a session, and its excerpt."""
+        row = self._db.execute(
+            "SELECT * FROM status_events WHERE session = ? ORDER BY seq DESC LIMIT 1",
+            (session,),
+        ).fetchone()
+        if row is None:
+            return None
+        event: StatusEvent = {
+            "seq": row["seq"],
+            "status": row["status"],
+            "source": {"kind": row["source_kind"], "host": row["source_host"]},
+            "explicit": bool(row["explicit"]),
+            "received": row["received"],
+        }
+        if row["reason"] is not None:
+            event["reason"] = row["reason"]
+        if row["wake"] is not None:
+            event["wake"] = row["wake"]
+        if row["note"] is not None:
+            event["note"] = row["note"]
+        if row["source_session"] is not None:
+            event["source"]["session_id"] = row["source_session"]
+        return event, row["excerpt"]
+
+    def add_status(
+        self, key: SessionKey, host: str, request: StatusRequest
+    ) -> StatusEvent:
+        """Add a status event if `base_seq` is the latest seq.
+
+        The caller checks read access. A sequence number, not the status
+        value, is the base, so that a writer that saw an earlier `done` cannot
+        replace a later `done`.
+        """
+        with self._tx():
+            session = self._require_session(key)["id"]
+            latest = self._latest_status(session)
+            current = latest[0]["seq"] if latest is not None else 0
+            if request["base_seq"] != current:
+                raise StaleStatus(latest[0] if latest is not None else None)
+            self._db.execute(
+                """
+                INSERT INTO status_events
+                (session, seq, status, reason, wake, note, excerpt, source_kind,
+                 source_host, source_session, explicit, received)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session,
+                    current + 1,
+                    request["status"],
+                    request.get("reason"),
+                    request.get("wake"),
+                    request.get("note"),
+                    request.get("excerpt"),
+                    request["source_kind"],
+                    host,
+                    request.get("source_session"),
+                    int(request["explicit"]),
+                    self.now(),
+                ),
+            )
+            added = self._latest_status(session)
+            assert added is not None
+            return added[0]
+
+    def heartbeat(
+        self, account: str, host: str, scope: ReadScope, request: HeartbeatRequest
+    ) -> HeartbeatResponse:
+        """Record the sessions that run on `host` now.
+
+        The store skips a listed session that does not exist or that the host
+        cannot read, with no error, so that a heartbeat is not an existence
+        oracle.
+        """
+        with self._tx():
+            now = self.now()
+            previous = self._db.execute(
+                "SELECT * FROM host_heartbeats WHERE account = ? AND host = ?",
+                (account, host),
+            ).fetchone()
+            recorded = 0
+            for item in request["sessions"]:
+                session = self._session_row(
+                    SessionKey(account, item["harness"], item["session_id"])
+                )
+                if session is None or not self._can_read_row(session, host, scope):
+                    continue
+                row = self._db.execute(
+                    "SELECT * FROM session_liveness WHERE session = ? AND host = ?",
+                    (session["id"], host),
+                ).fetchone()
+                # `first_listed` is the start of the current run on this host.
+                # It stays only if the previous heartbeat listed the session
+                # and had not expired.
+                first = now
+                if (
+                    row is not None
+                    and previous is not None
+                    and row["last_listed"] >= previous["received"]
+                    and not self._expired(previous, now)
+                ):
+                    first = row["first_listed"]
+                self._db.execute(
+                    """
+                    INSERT INTO session_liveness
+                    (session, host, first_listed, last_listed) VALUES (?, ?, ?, ?)
+                    ON CONFLICT (session, host) DO UPDATE SET
+                        first_listed = excluded.first_listed,
+                        last_listed = excluded.last_listed
+                    """,
+                    (session["id"], host, first, now),
+                )
+                recorded += 1
+            self._db.execute(
+                """
+                INSERT INTO host_heartbeats
+                (account, host, received, interval, final, unclosed)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (account, host) DO UPDATE SET
+                    received = excluded.received,
+                    interval = excluded.interval,
+                    final = excluded.final,
+                    unclosed = excluded.unclosed
+                """,
+                (
+                    account,
+                    host,
+                    now,
+                    request["interval"],
+                    int(request.get("final", False)),
+                    json.dumps(request.get("unclosed", [])),
+                ),
+            )
+            return {"received": now, "recorded": recorded}
+
+    @staticmethod
+    def _expired(heartbeat: sqlite3.Row, now: str) -> bool:
+        age = _parse_iso(now) - _parse_iso(heartbeat["received"])
+        return age > timedelta(seconds=HEARTBEAT_EXPIRY * heartbeat["interval"])
+
+    def _liveness(self, session: sqlite3.Row) -> Liveness | None:
+        row = self._db.execute(
+            "SELECT * FROM session_liveness WHERE session = ? "
+            "ORDER BY last_listed DESC LIMIT 1",
+            (session["id"],),
+        ).fetchone()
+        if row is None:
+            return None
+        heartbeat = self._db.execute(
+            "SELECT * FROM host_heartbeats WHERE account = ? AND host = ?",
+            (session["account"], row["host"]),
+        ).fetchone()
+        if heartbeat is None:
+            return None
+        liveness: Liveness
+        if heartbeat["received"] > row["last_listed"]:
+            # A newer heartbeat of the host did not list the session.
+            liveness = {
+                "state": "stopped",
+                "host": row["host"],
+                "since": row["last_listed"],
+            }
+        elif not self._expired(heartbeat, self.now()):
+            liveness = {
+                "state": "live",
+                "host": row["host"],
+                "since": row["first_listed"],
+            }
+        else:
+            liveness = {
+                "state": "unknown",
+                "host": row["host"],
+                "since": heartbeat["received"],
+            }
+        for item in json.loads(heartbeat["unclosed"]):
+            if (
+                item["harness"] == session["harness"]
+                and item["session_id"] == session["session_id"]
+            ):
+                liveness["close_blocked"] = item["reason"]
+        return liveness
+
+    @_locked
+    def status_counts(self, key: SessionKey) -> dict[str, int]:
+        """The numbers of status events and liveness rows of a session."""
+        session = self._require_session(key)["id"]
+        return {
+            name: self._db.execute(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE session = ?", (session,)
+            ).fetchone()["n"]
+            for name, table in (
+                ("status_events", "status_events"),
+                ("liveness", "session_liveness"),
+            )
+        }
 
     # --- Forks ----------------------------------------------------------
 
@@ -1535,6 +1801,12 @@ class Store:
                 ).rowcount
             for table in ("metadata_events", "placements", "teleports", "grants"):
                 self._db.execute(f"DELETE FROM {table} WHERE session = ?", (sid,))
+            status_events = self._db.execute(
+                "DELETE FROM status_events WHERE session = ?", (sid,)
+            ).rowcount
+            liveness = self._db.execute(
+                "DELETE FROM session_liveness WHERE session = ?", (sid,)
+            ).rowcount
             self._db.execute("DELETE FROM files WHERE session = ?", (sid,))
             self._db.execute("DELETE FROM sessions WHERE id = ?", (sid,))
             orphans = self._unreferenced(digests)
@@ -1547,6 +1819,8 @@ class Store:
             "segments": segments,
             "blob_versions": versions,
             "objects": len(orphans),
+            "status_events": status_events,
+            "liveness": liveness,
         }
 
     def purge_generation(
@@ -1683,8 +1957,16 @@ class Store:
                 "source_offset": session["forked_from_offset"],
                 "created": session["created"],
             }
+        # A heartbeat or a status write must not make a restore stale. An
+        # append changes `last_append`, but the files show the append too.
+        state = {
+            name: value
+            for name, value in manifest["state"].items()
+            if name not in ("status", "liveness", "last_append")
+        }
+        hashed = {**manifest, "state": state}
         manifest["revision"] = hashlib.sha256(
-            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+            json.dumps(hashed, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         return manifest
 
@@ -1699,8 +1981,18 @@ class Store:
         workspace: str | None = None,
         since: str | None = None,
         title: str | None = None,
+        statuses: set[str] | None = None,
+        open_only: bool = False,
+        lease_host: str | None = None,
+        liveness: set[str] | None = None,
         limit: int = 200,
     ) -> list[SessionSummary]:
+        """List readable sessions, newest first.
+
+        `statuses` and `liveness` can contain `none`, which matches a session
+        with no status event or with no liveness. `open_only` keeps the
+        sessions whose latest status is not `done`.
+        """
         rows = self._db.execute(
             "SELECT * FROM sessions WHERE account = ? "
             "AND (? IS NULL OR harness = ?) "
@@ -1711,6 +2003,21 @@ class Store:
         out: list[SessionSummary] = []
         for row in rows:
             if not self._can_read_row(row, host, scope):
+                continue
+            if lease_host is not None and (
+                row["lease_state"] != "held" or row["lease_host"] != lease_host
+            ):
+                continue
+            state = self._session_state(row["id"])
+            status = state.get("status")
+            status_name = status["status"] if status is not None else "none"
+            if statuses is not None and status_name not in statuses:
+                continue
+            if open_only and status_name == "done":
+                continue
+            live = state.get("liveness")
+            live_name = live["state"] if live is not None else "none"
+            if liveness is not None and live_name not in liveness:
                 continue
             placements = self._placements(row["id"])
             if on_host is not None and not any(
@@ -1731,10 +2038,13 @@ class Store:
                 "harness": row["harness"],
                 "session_id": row["session_id"],
                 "metadata": metadata,
-                "state": self._session_state(row["id"]),
+                "state": state,
             }
             if placements:
                 summary["last_placement"] = placements[-1]
+            latest = self._latest_status(row["id"])
+            if latest is not None and latest[1] is not None:
+                summary["excerpt"] = latest[1]
             out.append(summary)
             if len(out) >= limit:
                 break

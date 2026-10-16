@@ -65,7 +65,12 @@ def main() -> int:
     try:
         manifest = store.manifest(key)
         if args.kind == "session":
-            what = f"session {args.session_id}: {len(manifest['files'])} files"
+            counts = store.status_counts(key)
+            what = (
+                f"session {args.session_id}: {len(manifest['files'])} files, "
+                f"{counts['status_events']} status events, "
+                f"{counts['liveness']} liveness rows"
+            )
         elif args.kind == "generation":
             what = f"generation {args.generation} of {args.session_id} and its forks"
         else:

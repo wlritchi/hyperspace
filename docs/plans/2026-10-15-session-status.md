@@ -217,6 +217,10 @@ The server treats explicit and automatic writes the same way. The client uses
   keeps the old value. Thus `since` for `live` is the start of the current
   run.
 - `close_blocked` comes from `hb.unclosed` for this session, for any state.
+  The session must have a liveness row for that host: a session that the host
+  never listed in `sessions` shows no `close_blocked`. Step 4 must therefore
+  list a job in at least one heartbeat before it can report it as unclosed, or
+  this rule must change.
 - A final heartbeat (`final: true`) with an empty list makes the host's
   sessions `stopped` at once.
 
@@ -245,19 +249,23 @@ route:
 | Method and path                         | Scope    | Handler                                                                                     |
 | --------------------------------------- | -------- | ------------------------------------------------------------------------------------------- |
 | `POST /sessions/{harness}/{sid}/status` | `append` | `existing_authorized` with the read check, then `add_status`. No workspace header is needed |
-| `PUT /hosts/self/heartbeat`             | `append` | `Store.heartbeat(account, host, request)`                                                   |
+| `PUT /hosts/self/heartbeat`             | `append` | `Store.heartbeat(account, host, scope, request)`, which returns the `HeartbeatResponse`     |
 
 Add `"stale_status": 409` to `_STATUS`. The error handler adds the current
 event to the body, as it adds `generation` and `length` for an append
 conflict.
+
+The usual JSON body limit (64 KiB) is too small for a heartbeat with
+`MAX_HEARTBEAT_SESSIONS` entries in `sessions` and in `unclosed`. The
+heartbeat route reads at most 1 MiB.
 
 **Purge**: `purge_session` also deletes `status_events` and `session_liveness`
 rows of the session. `scripts/purge.py` shows their counts in its dry run.
 
 ### Tests
 
-- `test_unit_protocol.py`: `test_status_request_validation` (parametrized good
-  and bad bodies), `test_heartbeat_validation`.
+- `test_unit_protocol.py`: `test_status_request_valid` and
+  `test_status_request_invalid` (parametrized), `test_heartbeat_validation`.
 - `test_unit_store.py`:
   - `test_status_first_write_needs_base_zero`
   - `test_status_cas_rejects_stale_base` (the error carries the current event)
@@ -265,7 +273,9 @@ rows of the session. `scripts/purge.py` shows their counts in its dry run.
     done's seq fails)
   - `test_status_in_state_body_without_excerpt`, `test_list_has_excerpt`
   - `test_liveness_live_stopped_unknown` (with a fake clock)
+  - `test_liveness_follows_the_host_that_listed_last`
   - `test_final_heartbeat_stops_sessions`
+  - `test_heartbeat_close_blocked`
   - `test_heartbeat_skips_unknown_and_unreadable_sessions`
   - `test_revision_ignores_status_and_heartbeat`
   - `test_list_filters_status_open_lease_host_liveness`

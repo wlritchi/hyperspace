@@ -724,11 +724,13 @@ uncompressed data. The client splits larger appends.
 | ------------------------------------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /whoami`                                                 | any              | Account, host, and scopes of the credential                                                                                                                 |
 | `PUT /hosts/self`                                             | `append`         | Register or update the host's kind and attributes                                                                                                           |
+| `PUT /hosts/self/heartbeat`                                   | `append`         | Replace the host's list of live sessions (see the session status spec)                                                                                      |
 | `GET /hosts`, `GET /workspaces`                               | `read`           | List hosts and workspaces                                                                                                                                   |
-| `GET /sessions?harness=&host=&workspace=&since=&title=`       | `read`           | List readable sessions with their latest metadata and placement                                                                                             |
+| `GET /sessions?harness=&host=&workspace=&since=&title=`       | `read`           | List readable sessions with their latest metadata and placement. Status filters: `status=`, `open=1`, `lease_host=`, `liveness=`                            |
 | `GET /sessions/{harness}/{sid}`                               | `read`           | Manifest: metadata, placements, files, generation tree, heads, blob versions                                                                                |
 | `POST /sessions/{harness}/{sid}/meta`                         | `append`         | Add a metadata event                                                                                                                                        |
-| `GET /sessions/{harness}/{sid}/state`                         | `read`           | Lease holder, state (`normal` or `conflicted`), and branches. Small, for hooks                                                                              |
+| `GET /sessions/{harness}/{sid}/state`                         | `read`           | Lease holder, state (`normal` or `conflicted`), branches, status, and liveness. Small, for hooks                                                            |
+| `POST /sessions/{harness}/{sid}/status`                       | `append`         | Add a status event, if `base_seq` is the latest seq. `409 stale_status` otherwise. Needs read access to the session                                         |
 | `POST /sessions/{harness}/{sid}/lease/surrender`              | `append`         | Surrender the caller's lease, optionally reserved for a named host. `409` if the caller does not hold it                                                    |
 | `POST /sessions/{harness}/{sid}/teleports`                    | `read`, `append` | Take the lease for the caller's host and record a teleport. `409` if the session is conflicted, or a different host holds the lease (unless `steal` is set) |
 | `POST /sessions/{harness}/{sid}/forks`                        | `read`, `append` | Fork a branch; the server returns the new session id                                                                                                        |
@@ -753,6 +755,12 @@ uncompressed data. The client splits larger appends.
   `expected_revision` and `teleport_id` fields. Old clients can omit them
   during this transition. New restore clients require the advertised
   capability and never silently fall back to an unconditional lease change.
+
+The server also advertises `session-status` and `liveness`, for the routes and
+fields of [session status and liveness](2026-10-15-session-status.md). A
+client does not send status events or heartbeats to a server without them. The
+manifest `revision` ignores status, liveness and `last_append`, so that a
+heartbeat or a status write does not make a restore stale.
 
 Upgrade the server before the client. A subsequent release will remove support
 for old clients: the raw workspace header and unconditional teleport requests
@@ -1087,6 +1095,14 @@ Deployment gives the client its configuration: `HYPERSPACE_URL`,
 name), and `HYPERSPACE_HOST_KIND=runner`. If the runner's harness config
 directory does not persist, its entrypoint runs `hyperspace restore --held` at
 boot (see "Leases").
+
+## Later: session status
+
+[Session status and liveness](2026-10-15-session-status.md) adds a status for
+each session (`working`, `waiting`, `ready` or `done`), a liveness from host
+heartbeats, and a launcher on each host. It changes the decision "v1 has no
+skill" (see "Plugin"). The launcher is also the base for the launcher that
+agent-initiated teleport needs.
 
 ## Later: agent-initiated teleport
 
