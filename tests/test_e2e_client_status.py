@@ -5,6 +5,8 @@ server."""
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -49,6 +51,13 @@ from hyperspace_protocol import (
 
 WS = "/home/wlritchi/hyperspace"
 HARNESS = "claude-code"
+NOTICE_SH = (
+    Path(__file__).resolve().parent.parent
+    / "plugin"
+    / "hyperspace"
+    / "hooks"
+    / "notice.sh"
+)
 
 
 @pytest.fixture
@@ -286,6 +295,50 @@ def test_compaction_keeps_the_done_notice_for_the_turn(
     out = run_hook(ctx, path, "SessionStart", source="compact")
     assert "Finish the current step" not in out
     assert "Finish the current step and stop" in post_tool_use(ctx, path)
+
+
+def test_compaction_keeps_the_done_notice_for_notice_sh(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    # The plugin's notice.sh looks for flags in $XDG_STATE_HOME/hyperspace.
+    xdg = tmp_path / "xdg"
+    ctx = context(server.api("laptop"), xdg / "hyperspace", fake, "laptop")
+    try:
+        sid, path = started_session(ctx, fake)
+        fake.write(path, prompt("next"))
+        hook(ctx, fake, sid, "UserPromptSubmit")
+        sync(ctx, path)
+        mark_done_from_desk(server, sid, "merged")
+        refresh_states(ctx, fake.adapter)
+        out = run_hook(ctx, path, "SessionStart", source="compact")
+        assert "Finish the current step" not in out
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+            "XDG_STATE_HOME": str(xdg),
+            "CLAUDE_CONFIG_DIR": str(fake.root),
+            "CLAUDE_CODE_SESSION_ID": sid,
+            "HYPERSPACE_CLI": f"{sys.executable} -m hyperspace_client.cli",
+        }
+        payload = {"hook_event_name": "PostToolUse", "transcript_path": str(path)}
+        done = subprocess.run(
+            [str(NOTICE_SH)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+            timeout=60,
+        )
+        assert (done.returncode, done.stderr) == (0, "")
+        context_text = json.loads(done.stdout)["hookSpecificOutput"][
+            "additionalContext"
+        ]
+        assert "Finish the current step and stop" in context_text
+        assert post_tool_use(ctx, path) == ""
+    finally:
+        ctx.state.close()
 
 
 def test_live_session_gets_an_outside_done_at_its_next_tool_call(
