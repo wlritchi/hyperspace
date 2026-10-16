@@ -509,6 +509,21 @@ def _target(session: str | None) -> str:
         raise Exit(2, str(exc)) from None
 
 
+def _targets(sessions: list[str], by_user: bool) -> list[str]:
+    """The sessions for a status command: the arguments, else the current
+    session. In a backfill turn, only the current session, not as the user."""
+    sids = [_target(s) for s in sessions] or [_target(None)]
+    if os.environ.get(backfill.SELF_ONLY_ENV) == "1" and (
+        by_user or sids != [os.environ.get(SESSION_ENV)]
+    ):
+        raise Exit(
+            2,
+            "in a backfill turn, set only the status of this session, "
+            "with no --by-user",
+        )
+    return sids
+
+
 def _request(
     status: str,
     sid: str,
@@ -618,7 +633,7 @@ def _write_all(
 
 
 def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
-    sid = _target(args.session)
+    (sid,) = _targets([args.session] if args.session else [], args.by_user)
     if args.status is None:
         url, token = cfg.require_server()
         with Api(url, token) as api:
@@ -648,7 +663,7 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def cmd_done(args: argparse.Namespace, cfg: Config) -> int:
-    sids = [_target(s) for s in args.sessions] or [_target(None)]
+    sids = _targets(args.sessions, args.by_user)
     code = 0
     for sid in sids:
         request = _request(
@@ -659,7 +674,7 @@ def cmd_done(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def cmd_reopen(args: argparse.Namespace, cfg: Config) -> int:
-    sid = _target(args.session)
+    (sid,) = _targets([args.session], args.by_user)
     request = _request(
         "ready", sid, reason="idle", wake=None, note=args.note, by_user=args.by_user
     )

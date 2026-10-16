@@ -20,6 +20,7 @@ from _hs import (
     text_reply,
     tool_call,
 )
+from hyperspace_client import backfill
 from hyperspace_client import cli as cli_mod
 from hyperspace_client.api import Api
 from hyperspace_client.cli import (
@@ -28,6 +29,7 @@ from hyperspace_client.cli import (
     _print_status_table,
     _request,
     _target,
+    _targets,
     set_status,
     status_label,
     tail,
@@ -255,6 +257,26 @@ def test_write_for_another_session(
         desk.state.close()
     assert event is not None
     assert event["source"] == {"kind": "agent", "host": "desk", "session_id": other}
+
+
+def test_backfill_turn_sets_only_its_own_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    own = "11111111-1111-1111-1111-111111111111"
+    other = "22222222-2222-2222-2222-222222222222"
+    monkeypatch.setenv(SESSION_ENV, own)
+    assert _targets([other], by_user=True) == [other]
+    monkeypatch.setenv(backfill.SELF_ONLY_ENV, "1")
+    assert _targets([], by_user=False) == [own]
+    assert _targets([own], by_user=False) == [own]
+    for sessions, by_user in (
+        ([other], False),
+        ([own, other], False),
+        ([own, own], False),
+        ([], True),
+    ):
+        with pytest.raises(Exit):
+            _targets(sessions, by_user)
 
 
 def test_write_during_a_long_sync_is_queued(

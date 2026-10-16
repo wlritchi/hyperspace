@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import subprocess
+import tempfile
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -27,7 +28,7 @@ import httpx
 
 from hyperspace_client.adapters.claude_code import ClaudeCode, Job
 from hyperspace_client.api import ApiError, NotFound
-from hyperspace_client.backfill import Runner, run_claude
+from hyperspace_client.backfill import Runner, RunResult, child_env
 from hyperspace_client.state import State
 from hyperspace_client.status import clean_note, printable
 from hyperspace_client.sync import Context
@@ -69,6 +70,9 @@ RESUME_TIMEOUT = 120.0
 MAX_RESUMES = 5
 RESUME_WINDOW = 3600.0
 
+# The most output of `claude --bg` that the launcher reads.
+_MAX_OUTPUT = 64 * 1024
+
 RunRm = Callable[[list[str]], tuple[int, str]]
 
 
@@ -97,6 +101,32 @@ def source_id(config_dir: Path) -> str:
     """The id of a harness config directory: the launcher's lock name, the
     heartbeat's source, and the key of the launcher's state."""
     return hashlib.sha256(str(config_dir.resolve()).encode()).hexdigest()[:16]
+
+
+def run_bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
+    """Run `claude --bg`. It can start the Claude Code daemon, which then
+    keeps the open files of the command and runs every background job. So
+    the output goes to a file, not a pipe that the daemon keeps open, and a
+    timeout stops only the command, not its process group."""
+    with tempfile.TemporaryFile("w+", errors="replace") as out:
+        proc = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=child_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        code: int | None
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            code = None
+        out.seek(0)
+        return RunResult(code, out.read(_MAX_OUTPUT))
 
 
 @contextmanager
@@ -304,7 +334,7 @@ class Launcher:
     claude_args: list[str] = field(default_factory=list[str])
     # The workspace for a held session that has no workspace of its own.
     workspace: str = ""
-    run_claude: Runner = run_claude
+    run_claude: Runner = run_bg
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     # Job name to (state.json mtime, time of the last check).

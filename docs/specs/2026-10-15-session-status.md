@@ -479,8 +479,10 @@ asks the agent to set its status with a note, and to change nothing else.
   `hyperspace done`. No user watches the session, and its transcript can hold
   text from other sources. The resume therefore uses Claude Code's restricted
   mode: it does not load the user's settings or MCP servers, and Bash is the
-  only tool. It skips sessions that are live, that have a status, or whose
-  lease a different host holds.
+  only tool. In the turn, `hyperspace status`, `done` and `reopen` act only on
+  the session of the turn, and not as the user, so text in one transcript
+  cannot change the status of other sessions. It skips sessions that are live,
+  that have a status, or whose lease a different host holds.
 - It records each session that it messages before the resume starts. A second
   run, for example after an interruption, skips these sessions unless
   `--retry` is given. `--dry-run` lists the sessions and messages none.

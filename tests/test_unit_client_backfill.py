@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -26,8 +27,10 @@ from hyperspace_client.backfill import (
     parse_age,
     run,
     run_claude,
+    run_turn,
 )
 from hyperspace_client.cli import build_parser
+from hyperspace_client.launcher import run_bg
 from hyperspace_client.state import State
 from hyperspace_client.sync import Context
 
@@ -118,7 +121,20 @@ def test_run_claude_drops_session_variables(
     report = json.loads(result.output.splitlines()[-1])
     assert report["argv"] == ["--resume", "s1"]
     assert Path(report["cwd"]).resolve() == tmp_path.resolve()
-    assert report["env"] == {"CLAUDE_CODE_SESSION_ID": None, "CLAUDE_JOB_DIR": None}
+    assert report["env"] == {
+        "CLAUDE_CODE_SESSION_ID": None,
+        "CLAUDE_JOB_DIR": None,
+        "HYPERSPACE_STATUS_SELF_ONLY": None,
+    }
+
+
+def test_backfill_turn_limits_status_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "echo")
+    result = run_turn([sys.executable, FAKE], str(tmp_path), 30)
+    report = json.loads(result.output.splitlines()[-1])
+    assert report["env"]["HYPERSPACE_STATUS_SELF_ONLY"] == "1"
 
 
 def test_run_claude_timeout_stops_the_process_group(
@@ -138,7 +154,11 @@ def test_run_claude_timeout_stops_the_process_group(
             os.kill(child, 0)
         except ProcessLookupError:
             break
-        if Path(f"/proc/{child}/stat").read_text().split()[2] == "Z":
+        try:
+            if Path(f"/proc/{child}/stat").read_text().split()[2] == "Z":
+                break
+        except FileNotFoundError:
+            # It stopped after the check above.
             break
         time.sleep(0.1)
     else:
@@ -185,3 +205,45 @@ def test_rate_limit_spacing(tmp_path: Path) -> None:
     record = json.loads(state.get(attempt_key(HARNESS, "s2")) or "{}")
     assert record == {"started": 1120.0, "result": "set"}
     state.close()
+
+
+def _alive_pid(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_run_bg_does_not_wait_for_the_daemon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pidfile = tmp_path / "daemon.pid"
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "daemon")
+    monkeypatch.setenv("FAKE_CLAUDE_PIDFILE", str(pidfile))
+    start = time.monotonic()
+    result = run_bg([sys.executable, FAKE, "--bg"], str(tmp_path), 30)
+    daemon = int(pidfile.read_text())
+    try:
+        assert result.returncode == 0
+        assert "job started" in result.output
+        assert time.monotonic() - start < 15
+        assert _alive_pid(daemon)
+    finally:
+        os.kill(daemon, signal.SIGKILL)
+
+
+def test_run_bg_timeout_stops_only_the_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pidfile = tmp_path / "daemon.pid"
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "hang")
+    monkeypatch.setenv("FAKE_CLAUDE_PIDFILE", str(pidfile))
+    result = run_bg([sys.executable, FAKE, "--bg"], str(tmp_path), 2)
+    daemon = int(pidfile.read_text())
+    try:
+        assert result.returncode is None
+        # The daemon, and the jobs that it runs, are not stopped.
+        assert _alive_pid(daemon)
+    finally:
+        os.kill(daemon, signal.SIGKILL)
