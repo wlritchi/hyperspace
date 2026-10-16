@@ -1362,6 +1362,12 @@ class Store:
             )
 
     def _session_state(self, session: int) -> SessionStateBody:
+        return self._session_state_and_excerpt(session)[0]
+
+    def _session_state_and_excerpt(
+        self, session: int
+    ) -> tuple[SessionStateBody, str | None]:
+        """The state body, and the excerpt of the latest status event."""
         row = self._db.execute(
             "SELECT * FROM sessions WHERE id = ?", (session,)
         ).fetchone()
@@ -1381,7 +1387,7 @@ class Store:
             body["liveness"] = liveness
         if row["last_activity"] is not None:
             body["last_append"] = row["last_activity"]
-        return body
+        return body, latest[1] if latest is not None else None
 
     @_locked
     def session_state(self, key: SessionKey) -> SessionStateBody:
@@ -2043,7 +2049,7 @@ class Store:
                 row["lease_state"] != "held" or row["lease_host"] != lease_host
             ):
                 continue
-            state = self._session_state(row["id"])
+            state, excerpt = self._session_state_and_excerpt(row["id"])
             status = state.get("status")
             status_name = status["status"] if status is not None else "none"
             if statuses is not None and status_name not in statuses:
@@ -2077,9 +2083,8 @@ class Store:
             }
             if placements:
                 summary["last_placement"] = placements[-1]
-            latest = self._latest_status(row["id"])
-            if latest is not None and latest[1] is not None:
-                summary["excerpt"] = latest[1]
+            if excerpt is not None:
+                summary["excerpt"] = excerpt
             out.append(summary)
             if len(out) >= limit:
                 break
