@@ -541,7 +541,10 @@ The code follows this step, with these changes and additions:
   session during one sync). An explicit write tries once more, but an agent's
   write does not write over an explicit `done` from someone else; the CLI then
   exits 1 and the agent gets the notice.
-- If the current status is `done`, only `UserPromptSubmit` writes.
+- If the current status is `done`, only `UserPromptSubmit` writes. This
+  explicit reopen also drops the pending `done` notices, so that the hook does
+  not print "Finish the current step and stop" for the prompt that reopens the
+  session (for example after a sweep of the stopped session saw the mark).
 - Events with `agent_id` (a subagent's tool calls) do not change the status.
 - `turn_declared` is cleared at `Stop` and at `UserPromptSubmit`, so that a
   declaration lasts one turn also when a turn starts with no prompt.

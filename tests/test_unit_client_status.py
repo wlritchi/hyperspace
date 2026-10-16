@@ -187,6 +187,20 @@ def test_notice_flag_follows_notices(tmp_path: Path) -> None:
     assert not flag.exists()
 
 
+def test_drop_notices_keeps_other_kinds(tmp_path: Path) -> None:
+    state = State(tmp_path)
+    flag = state.notice_flag(SID)
+    state.add_notice("claude-code", SID, "status", "marked done")
+    state.add_notice("claude-code", SID, "lease", "lease lost")
+    state.drop_notices("claude-code", SID, "status")
+    assert flag.exists()
+    assert state.take_notices("claude-code", SID) == ["lease lost"]
+    state.add_notice("claude-code", SID, "status", "marked done again")
+    state.drop_notices("claude-code", SID, "status")
+    assert not flag.exists()
+    assert state.take_notices("claude-code", SID) == []
+
+
 def test_session_columns_survive_a_round_trip(tmp_path: Path) -> None:
     state = State(tmp_path)
     record = state.session("claude-code", SID)
