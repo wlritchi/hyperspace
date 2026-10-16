@@ -496,6 +496,57 @@ def test_launcher_start_fails_at_once_for_a_bad_credential(
     assert (code, sleeps, ran) == (1, [], [])
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        # For example, a token with a newline is not a valid header value.
+        httpx.LocalProtocolError("Illegal header value"),
+        httpx.UnsupportedProtocol("Request URL has an unsupported protocol"),
+        httpx.TooManyRedirects("Exceeded maximum allowed redirects."),
+        httpx.ProxyError("407 Proxy Authentication Required"),
+        httpx.DecodingError("Error -3 while decompressing data"),
+        PermissionError("permission denied"),
+    ],
+)
+def test_launcher_start_fails_at_once_for_a_local_error(
+    monkeypatch: pytest.MonkeyPatch, server: Server, tmp_path: Path, error: Exception
+) -> None:
+    code, sleeps, ran = start_launcher(
+        monkeypatch, server, tmp_path, ["--runner"], register_host=[error]
+    )
+    assert (code, sleeps, ran) == (1, [], [])
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (httpx.ConnectError("refused"), True),
+        (httpx.ConnectTimeout("timeout"), True),
+        (httpx.ReadTimeout("timeout"), True),
+        (httpx.WriteTimeout("timeout"), True),
+        (httpx.PoolTimeout("timeout"), True),
+        (httpx.ReadError("reset"), True),
+        (httpx.WriteError("broken pipe"), True),
+        (httpx.RemoteProtocolError("Server disconnected"), True),
+        (ApiError(500, "error"), True),
+        (ApiError(503, "unavailable"), True),
+        (ApiError(408, "timeout"), True),
+        (ApiError(429, "rate_limited"), True),
+        (ApiError(400, "bad_request"), False),
+        (ApiError(401, "unauthorized"), False),
+        (ApiError(403, "forbidden"), False),
+        (ApiError(404, "not_found"), False),
+        (httpx.LocalProtocolError("Illegal header value"), False),
+        (httpx.UnsupportedProtocol("unsupported"), False),
+        (httpx.TooManyRedirects("redirects"), False),
+        (httpx.InvalidURL("invalid"), False),
+        (OSError("no space left on device"), False),
+    ],
+)
+def test_temporary_errors(error: Exception, expected: bool) -> None:
+    assert launcher_mod.temporary(error) is expected
+
+
 def test_workstation_launcher_start_does_not_wait(
     monkeypatch: pytest.MonkeyPatch, server: Server, tmp_path: Path
 ) -> None:

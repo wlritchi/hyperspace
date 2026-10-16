@@ -51,6 +51,34 @@ def test_the_environment_and_a_file_come_before_the_keyring(
     assert fake_keyring.reads == 0
 
 
+@pytest.mark.parametrize(
+    "token", ["a\nb", "a\rb", "a b", "a\tb", "a\x00b", "a\x7fb", "t\u00f6ken"]
+)
+def test_a_token_with_whitespace_or_a_control_character_is_refused(
+    tmp_path: Path, token: str
+) -> None:
+    # Such a token is not a valid header value, and each request would fail.
+    none = tmp_path / "none.toml"
+    env = {"HYPERSPACE_URL": URL, "XDG_CONFIG_HOME": str(tmp_path)}
+    with pytest.raises(ConfigError, match="HYPERSPACE_TOKEN"):
+        load({**env, "HYPERSPACE_TOKEN": token}, none)
+    token_file = tmp_path / "token"
+    token_file.write_text(token + "\n")
+    with pytest.raises(ConfigError, match=str(token_file)):
+        load({**env, "HYPERSPACE_TOKEN_FILE": str(token_file)}, none)
+    # Whitespace around the token is not part of it.
+    cfg = load({**env, "HYPERSPACE_TOKEN": " hs_a-b_c \n"}, none)
+    assert cfg.token == "hs_a-b_c"
+
+
+def test_a_token_from_the_cache_is_checked(
+    tmp_path: Path, token_cache: MemoryCache
+) -> None:
+    token_cache.items[NAME] = "from\ncache"
+    with pytest.raises(ConfigError, match="token cache"):
+        cfg_with(tmp_path, keyring_use="interactive").require_server()
+
+
 def test_the_cache_comes_before_the_keyring(
     tmp_path: Path, fake_keyring: MemoryKeyring, token_cache: MemoryCache
 ) -> None:

@@ -129,7 +129,8 @@ class Config:
                     f"{config_dir() / 'config.toml'}"
                 )
             token, self.token_source = found
-            self.token = token
+            where = "the token cache" if self.token_source == "cache" else "the keyring"
+            self.token = check_token(token, where)
             return self.url, token
         return self.url, self.token
 
@@ -169,6 +170,17 @@ def check_claude_args(value: object) -> list[str]:
     return args
 
 
+def check_token(token: str, where: str) -> str:
+    """Return `token`. Raise unless it has only visible ASCII characters,
+    because another character makes each request fail."""
+    if not all("!" <= c <= "~" for c in token):
+        raise ConfigError(
+            f"the token from {where} contains a space, a control character, "
+            "or a character that is not ASCII"
+        )
+    return token
+
+
 def _read_token(path: Path) -> str:
     try:
         token = path.expanduser().read_text().strip()
@@ -176,7 +188,7 @@ def _read_token(path: Path) -> str:
         raise ConfigError(f"cannot read the token file {path}: {exc}") from None
     if not token:
         raise ConfigError(f"the token file {path} is empty")
-    return token
+    return check_token(token, f"the token file {path}")
 
 
 def load(env: dict[str, str] | None = None, path: Path | None = None) -> Config:
@@ -193,7 +205,7 @@ def load(env: dict[str, str] | None = None, path: Path | None = None) -> Config:
     if url:
         cfg.url = check_url(str(url))
     if env.get("HYPERSPACE_TOKEN"):
-        cfg.token = env["HYPERSPACE_TOKEN"].strip()
+        cfg.token = check_token(env["HYPERSPACE_TOKEN"].strip(), "HYPERSPACE_TOKEN")
         cfg.token_source = "environment"
     else:
         token_file = env.get("HYPERSPACE_TOKEN_FILE") or data.get("token_file")

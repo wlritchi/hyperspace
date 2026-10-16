@@ -61,9 +61,10 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
 [session status spec](specs/2026-10-15-session-status.md). The launcher:
 
 1. Registers the host. If the server is not available, it waits and tries
-   again, from 5 seconds to at most 5 minutes between tries. A bad credential
-   (`unauthorized` or `forbidden`), or no server URL, stops it at once with an
-   error.
+   again, from 5 seconds to at most 5 minutes between tries. A permanent error
+   stops it at once with an error: a bad credential (`unauthorized` or
+   `forbidden`), no server URL, a token with a space or a control character,
+   or a local error in the request, for example a redirect loop.
 2. Restores each session whose lease the runner holds and that has no local
    copy (the same as `hyperspace restore --held`). If the server is not
    available, or a restore fails, the launcher tries again at later ticks,

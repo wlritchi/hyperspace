@@ -307,13 +307,14 @@ def close_after_exit(
 
 def temporary(exc: Exception) -> bool:
     """True if a request can succeed later with no change: a network error, a
-    server error, or a rate limit. An error such as a bad credential is not
-    temporary."""
+    timeout, an incorrect response from the server, a server error, or a rate
+    limit. A local error, for example a bad credential, an invalid token or
+    URL, or a redirect loop, is not temporary."""
     if isinstance(exc, ApiError):
         return exc.status >= 500 or exc.status in (408, 429)
-    if isinstance(exc, httpx.UnsupportedProtocol):
-        return False
-    return isinstance(exc, (httpx.HTTPError, OSError))
+    return isinstance(
+        exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+    )
 
 
 def connect(
