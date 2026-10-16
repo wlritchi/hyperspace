@@ -163,8 +163,7 @@ def on_hook(
     want = transition(event, payload, known(state, record), in_flight)
     # An explicit declaration applies to one turn.
     if event in ("Stop", "UserPromptSubmit") and record.turn_declared:
-        record.turn_declared = False
-        state.save_session(record)
+        state.set_turn_declared(harness, session_id, False)
     if want is not None:
         # The write is based on what the hook saw, not on what the sync sees
         # when it sends the write later.
@@ -225,7 +224,7 @@ def observe(
             )
     else:
         record.done_seen = None
-    state.save_session(record)
+    state.save_status(record.harness, record.session_id, saved, record.done_seen)
 
 
 # --- Writes ------------------------------------------------------------------------------
