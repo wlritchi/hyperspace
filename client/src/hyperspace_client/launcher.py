@@ -31,9 +31,10 @@ from hyperspace_client.api import ApiError, NotFound
 from hyperspace_client.backfill import Runner, RunResult, child_env
 from hyperspace_client.state import State
 from hyperspace_client.status import clean_note, printable
-from hyperspace_client.sync import Context
+from hyperspace_client.sync import Context, register_host
 from hyperspace_client.teleport import TeleportError, back_up, restore_held
 from hyperspace_protocol import (
+    CAP_LIVENESS,
     MAX_HEARTBEAT_SESSIONS,
     HeartbeatRequest,
     SessionSummary,
@@ -72,6 +73,12 @@ RESUME_WINDOW = 3600.0
 # After a failed restore of held sessions, the next one is after one tick
 # interval. The wait doubles after each failure, to at most this time.
 RESTORE_RETRY_MAX = 3600.0
+
+# With --runner or --stay, the launcher waits this long after a start error
+# that can be temporary, then tries again. The wait doubles after each error,
+# to at most START_RETRY_MAX.
+START_RETRY = 5.0
+START_RETRY_MAX = 300.0
 
 # The most output of `claude --bg` that the launcher reads.
 _MAX_OUTPUT = 64 * 1024
@@ -296,6 +303,41 @@ def close_after_exit(
         return
     if reason is not None:
         record_refusal(ctx.state, adapter, job, reason)
+
+
+def temporary(exc: Exception) -> bool:
+    """True if a request can succeed later with no change: a network error, a
+    server error, or a rate limit. An error such as a bad credential is not
+    temporary."""
+    if isinstance(exc, ApiError):
+        return exc.status >= 500 or exc.status in (408, 429)
+    if isinstance(exc, httpx.UnsupportedProtocol):
+        return False
+    return isinstance(exc, (httpx.HTTPError, OSError))
+
+
+def connect(
+    ctx: Context,
+    kind: str,
+    retry: bool,
+    sleep: Callable[[float], None] | None = None,
+) -> bool:
+    """Register the host. Return True if the server supports liveness. With
+    `retry`, wait and try again after a temporary error, for a runner that
+    starts before the server is available."""
+    delay = START_RETRY
+    while True:
+        try:
+            register_host(ctx, kind)
+            return ctx.api.has_capability(CAP_LIVENESS)
+        except (ApiError, httpx.HTTPError, OSError) as exc:
+            if not retry or not temporary(exc):
+                raise
+            log.warning(
+                "launcher: start: %s: %s; again in %d s", type(exc).__name__, exc, delay
+            )
+        (sleep or time.sleep)(delay)
+        delay = min(delay * 2, START_RETRY_MAX)
 
 
 def needs_process(summary: SessionSummary, host: str, running: bool) -> str | None:

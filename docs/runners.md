@@ -60,12 +60,16 @@ The entrypoint runs `hyperspace launcher --runner` as its main process, in the
 runner's workspace, in place of its own supervisor. See "Launcher" in the
 [session status spec](specs/2026-10-15-session-status.md). The launcher:
 
-1. Restores each session whose lease the runner holds and that has no local
+1. Registers the host. If the server is not available, it waits and tries
+   again, from 5 seconds to at most 5 minutes between tries. A bad credential
+   (`unauthorized` or `forbidden`), or no server URL, stops it at once with an
+   error.
+2. Restores each session whose lease the runner holds and that has no local
    copy (the same as `hyperspace restore --held`). If the server is not
    available, or a restore fails, the launcher tries again at later ticks,
    after 1, 2, 4 minutes and so on, to at most one hour between tries, until a
    restore has no failure. A session resumes after its restore.
-2. Resumes each held session that needs a process: a session that was
+3. Resumes each held session that needs a process: a session that was
    `working` when the runner stopped, and a session that is `waiting` for an
    event that only its process can receive (`wake: local`). It runs
    `claude <args> --bg --resume <session id> <message>` in the session's
@@ -74,11 +78,11 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
    runner itself (for example from a different harness config directory). The
    message tells the agent that the runner restarted, and that its crons,
    Monitors and background tasks stopped.
-3. Does not resume a session that is `ready`, `done`, `waiting` with
+4. Does not resume a session that is `ready`, `done`, `waiting` with
    `wake: message`, or that has no status. The user, or a message, wakes these
    sessions. Sessions from before the session status feature have no status
    until the backfill gives them one (`hyperspace backfill-status`).
-4. Each minute: sends the heartbeat, closes the background jobs of `done`
+5. Each minute: sends the heartbeat, closes the background jobs of `done`
    sessions with `claude rm`, and resumes again a held session that needs a
    process and does not run. It resumes one session at most 5 times in an
    hour.

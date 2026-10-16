@@ -18,7 +18,7 @@ import pytest
 from _hs import FakeClaude, Server, make_server, prompt, text_reply
 from hyperspace_client import launcher as launcher_mod
 from hyperspace_client.adapters.claude_code import ClaudeCode
-from hyperspace_client.api import ApiError
+from hyperspace_client.api import Api, ApiError
 from hyperspace_client.backfill import RunResult
 from hyperspace_client.cli import _hook_heartbeat, main, status_label
 from hyperspace_client.config import Config, ConfigError, load
@@ -26,6 +26,7 @@ from hyperspace_client.launcher import (
     MAX_RESUMES,
     RESUME_WAITING,
     RESUME_WORKING,
+    START_RETRY,
     Launcher,
     close_after_exit,
     close_job,
@@ -407,6 +408,115 @@ def test_off_switch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     # With no server URL, a launcher that did not stop at once would fail.
     assert main(["launcher", "--stay"]) == 0
     assert not (tmp_path / "state" / "hyperspace" / "locks").exists()
+
+
+class Flaky:
+    """Make the first calls of a method of `api` raise `errors`, in order."""
+
+    def __init__(self, api: Api, name: str, *errors: Exception) -> None:
+        self.real = getattr(api, name)
+        self.errors = list(errors)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self.errors:
+            raise self.errors.pop(0)
+        return self.real(*args, **kwargs)
+
+
+def start_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+    server: Server,
+    tmp_path: Path,
+    argv: list[str],
+    **errors: list[Exception],
+) -> tuple[int, list[float], list[str]]:
+    """Run `hyperspace launcher` with the in-process server, where the API
+    methods in `errors` fail first. Return the exit code, the sleeps, and
+    the modes of the launcher that ran."""
+    for name, value in {
+        "XDG_STATE_HOME": str(tmp_path / "xdg"),
+        "HYPERSPACE_CONFIG": str(tmp_path / "none.toml"),
+        "HYPERSPACE_URL": "http://127.0.0.1:9",
+        "HYPERSPACE_TOKEN": "unused",
+        "HYPERSPACE_HOST": "laptop",
+        "HYPERSPACE_HOST_KIND": "runner",
+        "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
+    }.items():
+        monkeypatch.setenv(name, value)
+    api = server.api("laptop")
+    for name, failures in errors.items():
+        monkeypatch.setattr(api, name, Flaky(api, name, *failures))
+
+    def context(cfg: Config, state: State) -> Context:
+        return Context(api=api, state=state, adapter=ClaudeCode(), host=cfg.host)
+
+    sleeps: list[float] = []
+    ran: list[str] = []
+
+    def run(self: Launcher, max_ticks: int | None = None) -> int:
+        ran.append("runner" if self.runner else "workstation")
+        return 0
+
+    monkeypatch.setattr("hyperspace_client.cli._context", context)
+    monkeypatch.setattr(Launcher, "run", run)
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    return main(["launcher", *argv]), sleeps, ran
+
+
+@pytest.mark.parametrize("argv", [["--runner"], ["--stay"]])
+def test_launcher_waits_for_the_server_at_start(
+    monkeypatch: pytest.MonkeyPatch, server: Server, tmp_path: Path, argv: list[str]
+) -> None:
+    code, sleeps, ran = start_launcher(
+        monkeypatch,
+        server,
+        tmp_path,
+        argv,
+        register_host=[httpx.ConnectError("refused"), ApiError(502, "bad_gateway")],
+        whoami=[httpx.ReadTimeout("timeout")],
+    )
+    assert code == 0
+    assert ran == ["runner" if argv == ["--runner"] else "workstation"]
+    assert sleeps == [START_RETRY, 2 * START_RETRY, 4 * START_RETRY]
+
+
+def test_launcher_start_fails_at_once_for_a_bad_credential(
+    monkeypatch: pytest.MonkeyPatch, server: Server, tmp_path: Path
+) -> None:
+    code, sleeps, ran = start_launcher(
+        monkeypatch,
+        server,
+        tmp_path,
+        ["--runner"],
+        register_host=[ApiError(401, "unauthorized")],
+    )
+    assert (code, sleeps, ran) == (1, [], [])
+
+
+def test_workstation_launcher_start_does_not_wait(
+    monkeypatch: pytest.MonkeyPatch, server: Server, tmp_path: Path
+) -> None:
+    code, sleeps, ran = start_launcher(
+        monkeypatch,
+        server,
+        tmp_path,
+        [],
+        register_host=[httpx.ConnectError("refused")],
+    )
+    assert (code, sleeps, ran) == (1, [], [])
+
+
+def test_launcher_start_needs_a_server_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HYPERSPACE_CONFIG", str(tmp_path / "none.toml"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.delenv("HYPERSPACE_URL", raising=False)
+    sleeps: list[float] = []
+    monkeypatch.setattr("time.sleep", sleeps.append)
+    assert main(["launcher", "--runner"]) == 2
+    assert sleeps == []
 
 
 def test_run_rm_reports_the_output(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -812,8 +812,11 @@ def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
                 return 0
             ctx = _context(cfg, state)
             try:
-                register_host(ctx, cfg.host_kind)
-                if not ctx.api.has_capability(CAP_LIVENESS):
+                # A runner's main process must not stop when the server is
+                # not available for a short time at its start.
+                if not launcher.connect(
+                    ctx, cfg.host_kind, retry=args.stay or args.runner
+                ):
                     log.warning("launcher: the server does not support liveness")
                     return 0
                 return launcher.Launcher(

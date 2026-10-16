@@ -1009,6 +1009,21 @@ without it.
   `test_failed_boot_restore_is_retried` (a failed list and a failed session
   restore), `test_restore_retry_backs_off`,
   `test_boot_restores_held_sessions`.
+- **Start errors**: `cmd_launcher` called `register_host` and `has_capability`
+  before `Launcher.run`, and an error stopped the launcher. On a runner whose
+  server was not available at the pod's start, the entrypoint exited 1 and the
+  pod restarted in a loop. Now `launcher.connect` makes these calls. With
+  `--runner` or `--stay`, it waits and tries again after a temporary error
+  (`launcher.temporary`: a network error other than `UnsupportedProtocol`, a
+  5xx, 408 or 429), from `START_RETRY` (5 s), doubling to at most
+  `START_RETRY_MAX` (5 minutes). It raises at once for other errors, for
+  example `401 unauthorized` or `403 forbidden`, and a missing URL or token
+  stops `_context` before it. A workstation launcher does not wait: the next
+  SessionStart hook starts it again. Tests:
+  `test_launcher_waits_for_the_server_at_start`,
+  `test_launcher_start_fails_at_once_for_a_bad_credential`,
+  `test_workstation_launcher_start_does_not_wait`,
+  `test_launcher_start_needs_a_server_url`.
 
 ## Step 6: outside this repo
 
