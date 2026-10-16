@@ -14,7 +14,7 @@ import signal
 import subprocess
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -56,6 +56,10 @@ RESTRICTIONS = (
 # session must not get them, or `hyperspace status` would act on the wrong
 # session.
 _SESSION_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_JOB_DIR")
+# Set for a backfill turn: `hyperspace status`, `done` and `reopen` then act
+# only on the session of the turn, and not as the user. The allow rules
+# permit the commands with any arguments.
+SELF_ONLY_ENV = "HYPERSPACE_STATUS_SELF_ONLY"
 _AGE = re.compile(r"(\d+(?:\.\d+)?)([smhdw])")
 _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86_400, "w": 604_800}
 # After a timeout, the time that the process group gets to stop after SIGTERM.
@@ -98,14 +102,28 @@ class RunResult:
 Runner = Callable[[list[str], str, float], RunResult]
 
 
-def run_claude(argv: list[str], cwd: str, timeout: float) -> RunResult:
+def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment for a `claude` that this client starts."""
+    env = {k: v for k, v in os.environ.items() if k not in _SESSION_VARS}
+    env.update(extra or {})
+    return env
+
+
+def run_turn(argv: list[str], cwd: str, timeout: float) -> RunResult:
+    """Run one backfill turn: `run_claude`, with status writes limited to
+    the session of the turn."""
+    return run_claude(argv, cwd, timeout, {SELF_ONLY_ENV: "1"})
+
+
+def run_claude(
+    argv: list[str], cwd: str, timeout: float, env: Mapping[str, str] | None = None
+) -> RunResult:
     """Run a headless Claude Code turn. After `timeout` seconds, stop its
     whole process group, because Claude Code starts child processes."""
-    env = {k: v for k, v in os.environ.items() if k not in _SESSION_VARS}
     proc = subprocess.Popen(
         argv,
         cwd=cwd,
-        env=env,
+        env=child_env(env),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -244,7 +262,7 @@ def run(
     rate: float,
     timeout: float,
     report: Callable[[str], None],
-    runner: Runner = run_claude,
+    runner: Runner = run_turn,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Counter[str]:

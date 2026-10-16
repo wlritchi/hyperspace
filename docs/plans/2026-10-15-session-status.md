@@ -905,6 +905,49 @@ The code follows this step, with these changes:
   `test_resume_needs_a_local_copy_and_workspace`,
   `test_boot_restores_held_sessions`, `test_launcher_claude_args_config`.
 
+## Fixes after review
+
+A review of steps 1 to 5 found these problems. Each fix has a test that fails
+without it.
+
+- **Close of a reopened session**: the backup before `claude rm` can send a
+  queued write that reopens the session. `close_job` now refuses while a
+  queued write that is not `done` waits, and asks the server for the status
+  again after the backup. The SessionEnd trigger also refuses while such a
+  write waits. Tests: `test_close_skips_a_queued_reopen`,
+  `test_close_asks_again_after_the_backup`,
+  `test_session_end_keeps_a_job_with_a_queued_reopen`.
+- **Heartbeat source**: a heartbeat has an optional `source`, the first 16 hex
+  digits of the SHA-256 of the resolved config directory path
+  (`launcher.source_id`, which also names the launcher lock).
+  `host_heartbeats` and `session_liveness` have a `source` column in their
+  primary keys, and `_liveness` reads the heartbeat of the row's source.
+  Migration 3 changed in place, because it is not released. The launcher keeps
+  refused jobs under `launcher_unclosed:<source>`. Test:
+  `test_config_dirs_of_one_host_keep_their_own_liveness`.
+- **Writes during a long sync**: `set_status` queues the write if it does not
+  get the sync lock in `STATUS_LOCK_WAIT`. `State.save_session` is an upsert
+  that does not change `status`, `done_seen` and `turn_declared` of a row that
+  exists. `State.save_status` (which never replaces a higher `seq`) and
+  `State.set_turn_declared` write them. Tests:
+  `test_write_during_a_long_sync_is_queued`,
+  `test_a_stale_record_does_not_undo_status_fields`.
+- **Backfill scope**: `backfill.run_turn` sets
+  `HYPERSPACE_STATUS_SELF_ONLY=1`. Then `status`, `done` and `reopen` accept
+  only the session in `CLAUDE_CODE_SESSION_ID`, one target, and no
+  `--by-user`. Tests: `test_backfill_turn_limits_status_writes`,
+  `test_backfill_turn_sets_only_its_own_status`.
+- **`claude --bg`**: the launcher runs it with `launcher.run_bg`. The output
+  goes to a temporary file, the launcher waits for the command and not for the
+  end of its output, and a timeout stops only the command, because the Claude
+  Code daemon that it starts can keep the output open and runs every job.
+  Tests: `test_run_bg_does_not_wait_for_the_daemon`,
+  `test_run_bg_timeout_stops_only_the_command`.
+- **Live sessions**: `ClaudeCode.live_sessions()` skips invalid session ids,
+  because the server refuses a heartbeat with one. Test:
+  `test_live_sessions_skips_invalid_ids`.
+- **Lists**: `list_sessions` reads the latest status event once for each row.
+
 ## Step 6: outside this repo
 
 - **subspace**: treat the webhook response by HTTP status (2xx accepted, 4xx
