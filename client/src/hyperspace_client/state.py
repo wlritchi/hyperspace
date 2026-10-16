@@ -7,6 +7,7 @@ makes sure that only one process syncs a session at a time.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -106,6 +107,13 @@ _ADDED_COLUMNS = {
 }
 # Wait between two tries for a lock that another process holds.
 _LOCK_POLL = 0.1
+# The longest wait to set WAL mode, for the file lock and the change
+# together. It is less than the shortest hook timeout in the plugin.
+_WAL_TIMEOUT = 5.0
+# The change to WAL mode is fast, thus the tries for its lock are frequent.
+_WAL_POLL = 0.01
+# The errors from `flock` if the file system does not support it.
+_NO_FLOCK = frozenset({errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOLCK})
 
 
 @dataclass
@@ -163,12 +171,16 @@ LEASE_FIELDS = ("lease_state", "lease_host", "state", "state_updated")
 
 
 class State:
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, wal_timeout: float = _WAL_TIMEOUT) -> None:
         self.directory = directory
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._db = sqlite3.connect(directory / "state.sqlite3", timeout=30)
         self._db.row_factory = sqlite3.Row
-        self._use_wal()
+        try:
+            self._use_wal(wal_timeout)
+        except BaseException:
+            self._db.close()
+            raise
         self._db.execute("PRAGMA busy_timeout = 30000")
         # In WAL mode, NORMAL keeps the file consistent after a crash. A
         # power loss can lose the last cursor saves; the next sync then
@@ -179,20 +191,70 @@ class State:
         # table untouched, but never reuse them: sync adopts remote bytes.
         self._add_columns()
 
-    def _use_wal(self) -> None:
+    def _use_wal(self, timeout: float) -> None:
         """Set WAL mode. If two connections change the mode of a new file at
         the same time, one can fail at once with "database is locked",
         without the busy timeout. Thus a file lock makes the changes occur
-        one at a time."""
-        if self._db.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
-            return
-        lock = self.directory / "state.sqlite3.lock"
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        one at a time. The lock and the change wait at most `timeout`
+        seconds together, so that a hook does not stop at its timeout; after
+        that, raise TimeoutError."""
+        deadline = time.monotonic() + timeout
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            self._db.execute("PRAGMA journal_mode = WAL")
-        finally:
-            os.close(fd)
+            self._busy_until(deadline)
+            if self._is_wal():
+                return
+            lock = self.directory / "state.sqlite3.lock"
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                while not self._try_flock(fd, lock):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(self._busy_message(timeout))
+                    time.sleep(min(_WAL_POLL, max(0.0, deadline - time.monotonic())))
+                    # Another opener can set the mode while this one waits.
+                    self._busy_until(deadline)
+                    if self._is_wal():
+                        return
+                self._busy_until(deadline)
+                self._db.execute("PRAGMA journal_mode = WAL")
+            finally:
+                os.close(fd)
+        except sqlite3.OperationalError as exc:
+            if exc.sqlite_errorcode & 0xFF != sqlite3.SQLITE_BUSY:
+                raise
+            raise TimeoutError(self._busy_message(timeout)) from exc
+
+    def _is_wal(self) -> bool:
+        # A connection keeps the journal mode that it read last. A read of
+        # the file header gets the current mode.
+        self._db.execute("PRAGMA schema_version").fetchone()
+        return self._db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+    def _busy_until(self, deadline: float) -> None:
+        """Set the busy timeout to the time until `deadline`."""
+        ms = max(0, int((deadline - time.monotonic()) * 1000))
+        self._db.execute(f"PRAGMA busy_timeout = {ms}")
+
+    @staticmethod
+    def _try_flock(fd: int, path: Path) -> bool:
+        """Lock `fd` exclusively. Return False if another process holds the
+        lock."""
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        except OSError as exc:
+            if exc.errno in _NO_FLOCK:
+                raise OSError(
+                    exc.errno, f"{path}: the file system does not support flock"
+                ) from exc
+            raise
+        return True
+
+    def _busy_message(self, timeout: float) -> str:
+        return (
+            f"{self.directory / 'state.sqlite3'}: the state database is busy: "
+            f"WAL mode is not set after {timeout:g} s"
+        )
 
     def _missing_columns(self) -> list[tuple[str, str, str]]:
         """The table, name and definition of each added column that the
