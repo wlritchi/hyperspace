@@ -469,17 +469,17 @@ A heartbeat applies only to the credential's own host.
   If it adds one, the client can close a `done` job at detach, as U3 asks, and
   not when the daemon stops the job.
 
-## Open questions
+## Resolved questions
 
-1. Does Claude Code set `CLAUDE_CODE_SESSION_ID` in the shell tool's
-   environment of a foreground session? It is set in a background job, and
-   `hyperspace status` with no session id uses it. If a foreground session
-   does not have it, the plugin must give the agent the session id in a
-   different way.
-2. How does a launcher start a background job for an existing session id when
-   the runner's harness config directory did not persist and there is no job
-   state? `claude --bg --resume` forks a new id.
-3. Does the SessionEnd hook run when the Claude Code daemon stops an idle job?
-   The sweep makes the design correct without it; the hook only makes the
-   close faster.
-4. The heartbeat interval, and the stalled limit.
+- `CLAUDE_CODE_SESSION_ID` is set in the shell tool's environment of every
+  Claude Code session, foreground and background.
+- A launcher resumes a session as a background job with
+  `claude --bg --resume <sid>`, in the session's workspace. Claude Code then
+  continues the session under the same id. If the session already runs, Claude
+  Code starts a copy under a new id, so the launcher first checks that the
+  session does not run on the host. Hyperspace never writes Claude Code's job
+  state.
+- Tests will show whether the SessionEnd hook runs when the Claude Code daemon
+  stops an idle job. The sweep makes the design correct without it.
+- The heartbeat interval is 60 seconds, so a heartbeat expires after 3
+  minutes. The stalled limit is 30 minutes. Both are configurable.
