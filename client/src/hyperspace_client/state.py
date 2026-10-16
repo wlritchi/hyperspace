@@ -526,21 +526,38 @@ class State:
                     (harness, session_id, kind, text, time.time(), key),
                 )
 
-    def take_notices(self, harness: str, session_id: str) -> list[str]:
+    def take_notices(
+        self, harness: str, session_id: str, keep: str | None = None
+    ) -> list[str]:
+        """Return the pending notices and mark them as delivered. Notices of
+        the kind `keep` stay pending, and their flag file stays."""
         # Remove the flag first: a notice that arrives during the read keeps
         # a new flag.
-        self.notice_flag(session_id).unlink(missing_ok=True)
+        flag = self.notice_flag(session_id)
+        flag.unlink(missing_ok=True)
         with self._db:
             rows = self._db.execute(
-                "SELECT id, text FROM notices WHERE harness = ? AND session_id = ? "
-                "AND delivered = 0 ORDER BY id",
+                "SELECT id, kind, text FROM notices WHERE harness = ? "
+                "AND session_id = ? AND delivered = 0 ORDER BY id",
                 (harness, session_id),
             ).fetchall()
-            for r in rows:
+            taken = [r for r in rows if r[1] != keep]
+            for r in taken:
                 self._db.execute(
                     "UPDATE notices SET delivered = 1 WHERE id = ?", (r[0],)
                 )
-        return [str(r[1]) for r in rows]
+        if len(taken) < len(rows):
+            flag.touch()
+        return [str(r[2]) for r in taken]
+
+    def has_notice(self, harness: str, session_id: str, kind: str) -> bool:
+        """Whether a notice of `kind` is pending."""
+        row = self._db.execute(
+            "SELECT 1 FROM notices WHERE harness = ? AND session_id = ? "
+            "AND kind = ? AND delivered = 0",
+            (harness, session_id, kind),
+        ).fetchone()
+        return row is not None
 
     def drop_notices(self, harness: str, session_id: str, kind: str) -> None:
         """Mark the pending notices of `kind` as delivered, with no output.

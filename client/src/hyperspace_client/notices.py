@@ -9,6 +9,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from typing import cast
 
 import httpx
 
@@ -19,6 +20,7 @@ from hyperspace_client.api import ApiError
 from hyperspace_client.state import LEASE_FIELDS, SessionRecord, State
 from hyperspace_client.sync import Context, _matching_prefix
 from hyperspace_client.teleport import move_aside
+from hyperspace_protocol import StatusEvent
 
 log = logging.getLogger("hyperspace")
 
@@ -54,7 +56,18 @@ def session_start_notice(
         parts.append(adapter.move_notice(host, record.workspace, host, cwd))
     if source == "resume":
         state.put(_resumed_key(session), str(time.time()))
-    parts.extend(state.take_notices(session.harness, session.session_id))
+    # A done notice tells the agent to stop its turn, but no turn runs at a
+    # start. Keep it pending: the prompt that reopens the session drops it,
+    # and a turn that continues after a compaction gets it at its next tool
+    # call. Until then, tell the agent only of the mark.
+    done = record.status
+    if (
+        done is not None
+        and done.get("status") == "done"
+        and state.has_notice(session.harness, session.session_id, "status")
+    ):
+        parts.append(status.done_start_notice(cast(StatusEvent, done)))
+    parts.extend(state.take_notices(session.harness, session.session_id, "status"))
     return "\n\n".join(parts)
 
 

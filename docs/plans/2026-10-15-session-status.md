@@ -564,6 +564,12 @@ The code follows this step, with these changes and additions:
   text, so that a sync that sees the same problem again does not repeat it. A
   `done` notice uses the event's `seq`, so that each new `done` mark gives one
   notice, also when its host, source and note are the same as an earlier mark.
+- `SessionStart` does not print a pending `done` notice ("Finish the current
+  step and stop"), because no turn runs at a start. The notice stays pending,
+  and `SessionStart` prints only that the session is marked done and that a
+  new prompt reopens it. After a resume, the prompt that reopens the session
+  drops the notice. After a compaction in a turn, the next tool call of the
+  turn gets it.
 - `hyperspace ls --status STATUS` (repeatable) shows sessions with a status,
   for example `done` sessions that are not closed, which `--open` leaves out.
   `hyperspace status` with no `STATUS` shows the status and the liveness.
