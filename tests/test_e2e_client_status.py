@@ -4,6 +4,7 @@ server."""
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,6 +35,8 @@ from hyperspace_client.cli import (
     status_label,
     tail,
 )
+from hyperspace_client.config import Config
+from hyperspace_client.hooks import handle, notices
 from hyperspace_client.notices import refresh_states
 from hyperspace_client.state import State
 from hyperspace_client.status import on_hook, send_wanted
@@ -218,6 +221,105 @@ def test_prompt_that_reopens_drops_the_done_notice(
     sync(ctx, path)
     event = server_status(ctx.api, sid)
     assert (event["status"], event["explicit"]) == ("working", True)
+
+
+def run_hook(ctx: Context, path: Path, event: str, **payload: Any) -> str:
+    """Run the hook command for `event` as the plugin does, with no server
+    URL (so no resume check) and no detached processes."""
+    cfg = Config(host=ctx.host, state_dir=ctx.state.directory)
+    body = {"hook_event_name": event, "transcript_path": str(path), "cwd": WS}
+    started: list[list[str]] = []
+    return handle({**body, **payload}, cfg, start=started.append)
+
+
+def post_tool_use(ctx: Context, path: Path) -> str:
+    """The plugin's synchronous PostToolUse notice hook."""
+    cfg = Config(host=ctx.host, state_dir=ctx.state.directory)
+    return notices(
+        {"hook_event_name": "PostToolUse", "transcript_path": str(path)}, cfg
+    )
+
+
+def mark_done_from_desk(server: Server, sid: str, note: str) -> None:
+    desk = server.api("desk")
+    desk.add_status(
+        HARNESS,
+        sid,
+        {
+            "status": "done",
+            "source_kind": "user",
+            "explicit": True,
+            "note": note,
+            "base_seq": server_status(desk, sid)["seq"],
+        },
+    )
+
+
+def test_resume_does_not_tell_the_agent_to_stop(
+    server: Server, ctx: Context, fake: FakeClaude
+) -> None:
+    sid, path = started_session(ctx, fake)
+    mark_done_from_desk(server, sid, "merged")
+    # The sweep sees the mark while the session is stopped.
+    refresh_states(ctx, fake.adapter)
+    out = run_hook(ctx, path, "SessionStart", source="resume")
+    assert "desk marked this session done" in out and "merged" in out
+    assert "Finish the current step" not in out
+    # The user's prompt reopens the session, so no done notice follows.
+    fake.write(path, prompt("continue"))
+    assert run_hook(ctx, path, "UserPromptSubmit") == ""
+    assert post_tool_use(ctx, path) == ""
+    assert not ctx.state.notice_flag(sid).exists()
+
+
+def test_compaction_keeps_the_done_notice_for_the_turn(
+    server: Server, ctx: Context, fake: FakeClaude
+) -> None:
+    sid, path = started_session(ctx, fake)
+    fake.write(path, prompt("next"))
+    hook(ctx, fake, sid, "UserPromptSubmit")
+    sync(ctx, path)
+    mark_done_from_desk(server, sid, "merged")
+    refresh_states(ctx, fake.adapter)
+    # A compaction in the turn starts the session again. The turn continues,
+    # so its next tool call gets the done notice.
+    out = run_hook(ctx, path, "SessionStart", source="compact")
+    assert "Finish the current step" not in out
+    assert "Finish the current step and stop" in post_tool_use(ctx, path)
+
+
+def test_live_session_gets_an_outside_done_at_its_next_tool_call(
+    server: Server, ctx: Context, fake: FakeClaude
+) -> None:
+    sid, path = started_session(ctx, fake)
+    fake.write(path, prompt("next"))
+    hook(ctx, fake, sid, "UserPromptSubmit")
+    sync(ctx, path)
+    assert post_tool_use(ctx, path) == ""
+    mark_done_from_desk(server, sid, "merged")
+    # The append response of the next checkpoint tells the client of the mark.
+    fake.write(path, tool_call())
+    hook(ctx, fake, sid, "PreToolUse", tool_name="Bash")
+    sync(ctx, path)
+    out = json.loads(post_tool_use(ctx, path))
+    context = out["hookSpecificOutput"]["additionalContext"]
+    assert "desk marked this session done" in context
+    assert "Finish the current step and stop" in context
+    assert post_tool_use(ctx, path) == ""
+
+
+def test_agent_gets_no_notice_for_its_own_done(
+    ctx: Context, fake: FakeClaude, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid, path = started_session(ctx, fake)
+    monkeypatch.setenv(SESSION_ENV, sid)
+    request = _request("done", sid, reason=None, wake=None, note="all", by_user=False)
+    event = set_status(ctx, sid, request)
+    assert event is not None and event["status"] == "done"
+    sync(ctx, path)
+    refresh_states(ctx, fake.adapter)
+    assert post_tool_use(ctx, path) == ""
+    assert not ctx.state.notice_flag(sid).exists()
 
 
 def test_status_cli_defaults_to_env_session(
