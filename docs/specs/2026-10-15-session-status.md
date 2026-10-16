@@ -275,8 +275,8 @@ Lists combine status and liveness into the states of U6:
   stalled is a hint in the list, not a status.
 
 On a workstation, an idle session at its prompt fires no hooks. The heartbeat
-therefore comes from a host process, not from hooks: on a runner, the
-launcher; on a workstation, a periodic job that runs `hyperspace heartbeat`.
+therefore comes from the launcher, a host process (see "Launcher"), and not
+from hooks.
 
 Liveness is current state, not history. The server keeps the latest heartbeat
 of each host and overwrites it. This is the same as the lease. The append-only
@@ -318,31 +318,71 @@ Two triggers do step 4:
 - The SessionEnd hook of a background job (`CLAUDE_JOB_DIR` is set) whose
   status is `done` starts a detached process that waits for the job's process
   to stop, syncs, and runs `claude rm`.
-- A sweep, in the launcher on a runner and in the heartbeat process on a
-  workstation, finds jobs that are not live and whose session is `done`. This
-  catches a session that was marked `done` from a different host after its job
-  stopped, and a SessionEnd hook that did not run.
+- A sweep in the launcher finds jobs that are not live and whose session is
+  `done`. This catches a session that was marked `done` from a different host
+  after its job stopped, and a SessionEnd hook that did not run.
 
-## Runner launcher
+## Launcher
 
-A runner gets a long-running _launcher_. It replaces the "newest job in the
-workspace" rule of the current runner entrypoint. At boot it:
+`hyperspace launcher` is a long-running process, one for each host. It
+replaces the supervisor of the current runner entrypoint, and it is the base
+for later work that starts sessions on a host with no user action, for example
+agent-initiated teleport (main spec, "Later"). It:
+
+- sends the heartbeat;
+- closes `done` jobs (see "Closing a done session");
+- resumes sessions that need a process (runner mode only);
+- receives wake requests (see "Messages to a session").
+
+A lock in the client state directory makes sure that only one launcher runs
+for each host and harness config directory. The SessionStart and SessionEnd
+hooks do not talk to the launcher. They send their extra heartbeat to the
+server directly, with the full list of live sessions from the adapter. Thus
+the hooks need no channel to the launcher, and two heartbeats that cross give
+the same result.
+
+If the launcher stops while sessions run, its heartbeat expires and their
+liveness becomes `unknown`. The next SessionStart hook starts the launcher
+again.
+
+### Workstation mode
+
+The SessionStart hook starts the launcher as a detached process if it does not
+run, in the same way that it starts a checkpoint. When no session has run on
+the host for 10 minutes, the launcher sends a last heartbeat with an empty
+list and stops. The sessions of the host then show as `stopped`, not
+`unknown`.
+
+The launcher gets its token as the checkpoint that the SessionStart hook
+starts does: it can read the keyring once, when it starts at a session start
+or resume (main spec, "Credentials"). After that it uses the token cache. Each
+heartbeat reads the cache, so the cache does not expire while the launcher
+runs.
+
+This mode needs no service manager, so it works on each OS where the hooks
+work. A user who wants the launcher all the time, for example for later work
+that receives sessions with no user action, can run
+`hyperspace launcher --stay` from a systemd user unit, a launchd agent, or the
+Task Scheduler. The client documents an example for systemd and launchd.
+
+### Runner mode
+
+On a runner, the image's entrypoint runs `hyperspace launcher --runner` as its
+main process, and it does not stop when no session runs. At boot it:
 
 1. Runs `hyperspace restore --held` (main spec, "Leases").
 2. Lists the sessions whose lease it holds, with their status and liveness.
 3. Resumes each session that is interrupted, or that is `waiting` with wake
-   `local`, as a background job. It does not resume a session that is `ready`,
+   `local`, as a background job, with `claude --bg --resume <sid>` in the
+   session's workspace. It does not resume a session that is `ready`,
    `waiting` with wake `message`, or `done` (R1, R2, R3).
 
-While it runs, the launcher:
+While it runs, it does not resume a job that the Claude Code daemon stopped if
+its session is `done`, or if no event needs a process (R2, R3). A runner with
+no session to resume runs only the launcher.
 
-- sends the heartbeat;
-- closes `done` jobs (see "Closing a done session");
-- does not respawn a job that the Claude Code daemon stopped if its session is
-  `done`, or if no event needs a process (R2, R3);
-- receives wake requests (see "Messages to a session").
-
-A runner with no session to resume runs only the launcher.
+The launcher reads the Claude Code flags for a resume (model, agent, and
+channels) from its configuration. The runner image gives that configuration.
 
 ## Messages to a session
 
@@ -407,7 +447,9 @@ asks the agent to set its status with a note, and to change nothing else.
 - On a workstation, the command resumes each session for one turn with
   `claude --resume <sid> -p`, with permission only for `hyperspace status`. It
   skips sessions that are live.
-- On a runner, the message goes through subspace and the launcher.
+- On a runner, the same command runs on the runner, for example with
+  `kubectl exec`. It needs the client in the runner image, but no launcher and
+  no subspace.
 - The rate limit counts sessions per hour. A resume writes the whole session
   context to the prompt cache, so a large backlog can exceed the account's
   usage limits. Set the rate to stay within them.
