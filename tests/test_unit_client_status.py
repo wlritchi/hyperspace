@@ -6,10 +6,15 @@ Code" in the plan (docs/plans/2026-10-15-session-status.md)."""
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
 import os
 import sqlite3
 import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -357,18 +362,113 @@ def test_simultaneous_first_opens_of_a_new_file(tmp_path: Path) -> None:
 
     # The race is in the change to WAL mode. It does not occur in each
     # round, thus the test has many rounds.
+    # The threads are daemon threads and each round has a deadline, so that
+    # a thread that does not stop cannot stop the test run.
     for round_ in range(100):
         start = threading.Barrier(8, timeout=10)
         threads = [
-            threading.Thread(target=open_state, args=(tmp_path / str(round_), start))
+            threading.Thread(
+                target=open_state, args=(tmp_path / str(round_), start), daemon=True
+            )
             for _ in range(8)
         ]
         for thread in threads:
             thread.start()
+        deadline = time.monotonic() + 15
         for thread in threads:
-            thread.join(timeout=30)
-            assert not thread.is_alive()
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            assert not thread.is_alive(), round_
         assert errors == [], round_
+
+
+def _delete_mode_file(directory: Path) -> None:
+    directory.mkdir()
+    db = sqlite3.connect(directory / "state.sqlite3")
+    db.execute("CREATE TABLE t (x)")
+    db.commit()
+    db.close()
+
+
+@contextmanager
+def _wal_lock(directory: Path) -> Iterator[None]:
+    """Hold the lock for the change to WAL mode, as another opener does."""
+    fd = os.open(directory / "state.sqlite3.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def test_an_open_does_not_wait_past_its_deadline_for_the_wal_lock(
+    tmp_path: Path,
+) -> None:
+    _delete_mode_file(tmp_path / "s")
+    with _wal_lock(tmp_path / "s"):
+        began = time.monotonic()
+        with pytest.raises(TimeoutError, match="the state database is busy"):
+            State(tmp_path / "s", wal_timeout=0.3)
+        assert time.monotonic() - began < 2
+    # After the lock is free, the open sets WAL mode.
+    State(tmp_path / "s", wal_timeout=0.3).close()
+    db = sqlite3.connect(tmp_path / "s" / "state.sqlite3")
+    assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    db.close()
+
+
+def test_an_open_does_not_wait_past_its_deadline_for_the_change(
+    tmp_path: Path,
+) -> None:
+    _delete_mode_file(tmp_path / "s")
+    # A reader of a file in DELETE mode stops the change to WAL mode.
+    reader = sqlite3.connect(tmp_path / "s" / "state.sqlite3", isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM t").fetchall()
+    try:
+        began = time.monotonic()
+        with pytest.raises(TimeoutError, match="the state database is busy"):
+            State(tmp_path / "s", wal_timeout=0.3)
+        assert time.monotonic() - began < 2
+    finally:
+        reader.close()
+
+
+def test_an_open_that_waits_for_the_wal_lock_uses_the_mode_of_another(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _delete_mode_file(tmp_path / "s")
+    is_wal = State._is_wal  # pyright: ignore[reportPrivateUsage]
+    checks: list[bool] = []
+
+    def other_sets_wal_then_check(self: State) -> bool:
+        # At the second check, the first try for the lock failed. Then the
+        # opener that holds the lock sets WAL mode.
+        if len(checks) == 1:
+            other = sqlite3.connect(tmp_path / "s" / "state.sqlite3")
+            assert other.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+            other.close()
+        checks.append(is_wal(self))
+        return checks[-1]
+
+    monkeypatch.setattr(State, "_is_wal", other_sets_wal_then_check)
+    # The lock stays held, so this open cannot set the mode itself.
+    with _wal_lock(tmp_path / "s"):
+        State(tmp_path / "s", wal_timeout=5).close()
+    assert checks == [False, True]
+
+
+def test_an_open_on_a_file_system_without_flock_names_the_problem(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _delete_mode_file(tmp_path / "s")
+
+    def no_flock(fd: int, operation: int) -> None:
+        raise OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+
+    monkeypatch.setattr(fcntl, "flock", no_flock)
+    with pytest.raises(OSError, match="does not support flock") as info:
+        State(tmp_path / "s")
+    assert info.value.errno == errno.ENOSYS
 
 
 def test_session_columns_survive_a_round_trip(tmp_path: Path) -> None:

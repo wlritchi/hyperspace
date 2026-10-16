@@ -84,16 +84,19 @@ def handle(
     if session is None:
         return ""
     if event in STATUS_EVENTS:
-        state = State(cfg.state_dir)
         try:
-            on_hook(state, adapter, session.harness, session.session_id, event, payload)
+            state = State(cfg.state_dir)
+            try:
+                on_hook(
+                    state, adapter, session.harness, session.session_id, event, payload
+                )
+            finally:
+                state.close()
         except Exception as exc:  # noqa: BLE001
             # The status must not stop the backup.
             log.warning(
                 "%s: status: %s: %s", session.session_id, type(exc).__name__, exc
             )
-        finally:
-            state.close()
 
     # At a session start or resume, the user is there to answer a passphrase
     # prompt, so these syncs can read the keyring (see "Credentials").

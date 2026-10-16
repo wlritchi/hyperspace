@@ -573,7 +573,11 @@ The code follows this step, with these changes and additions:
 - If the file is not in WAL mode, `State` changes the mode while it holds a
   file lock, `state.sqlite3.lock`. Two connections that change the mode of a
   new file at the same time can otherwise fail at once with "database is
-  locked", without the busy timeout.
+  locked", without the busy timeout. The lock wait and the change wait at most
+  5 seconds together, less than a hook's timeout. While an opener waits for
+  the lock, it reads the mode again, because another opener can set it. After
+  5 seconds, `State` raises `TimeoutError` ("the state database is busy"); a
+  hook logs the error and does not fail the session.
 - `SessionStart` does not print a pending `done` notice ("Finish the current
   step and stop"), because no turn runs at a start. The notice stays pending,
   and `SessionStart` prints only that the session is marked done and that a
