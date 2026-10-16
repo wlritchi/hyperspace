@@ -618,9 +618,11 @@ needs the client in the runner image, but no launcher.
    - Skip it if `is_running` is true.
    - Run, in the session's last workspace (from local state, or the first
      `cwd`):
-     `claude --resume <sid> -p <MESSAGE> --allowedTools 'Bash(hyperspace status:*)' 'Bash(hyperspace done:*)'`
-     with `--timeout` seconds. The binary is `$HYPERSPACE_CLAUDE` or `claude`
-     on the `PATH`.
+     `claude --resume <sid> -p <MESSAGE> --restricted --tools Bash --strict-mcp-config --permission-mode dontAsk --allowedTools 'Bash(hyperspace status:*)' 'Bash(hyperspace done:*)'`.
+     The options remove the user's settings, the MCP servers, and all tools
+     except Bash, because no user watches the session and its transcript can
+     hold text from other sources, with `--timeout` seconds. The binary is
+     `$HYPERSPACE_CLAUDE` or `claude` on the `PATH`.
    - Afterwards, read the session state. Log `set`, `no status`, `timeout` or
      `error` for the session.
    - Wait so that at most `--rate` sessions start each hour.

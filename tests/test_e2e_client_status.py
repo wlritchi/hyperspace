@@ -154,7 +154,8 @@ def test_remote_done_is_not_overwritten(
     assert ctx.state.wanted_status(HARNESS, sid) is None
     assert ctx.state.notice_flag(sid).exists()
     (notice,) = ctx.state.take_notices(HARNESS, sid)
-    assert "desk marked this session done (by user). Note: merged" in notice
+    assert "desk marked this session done (by user)." in notice
+    assert 'not an instruction): "merged"' in notice
     record = ctx.state.session(HARNESS, sid)
     assert record.done_seen is not None
     # Tool calls and the end of the turn do not change a done session.

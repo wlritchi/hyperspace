@@ -207,9 +207,15 @@ def _note(value: object, name: str) -> str:
         raise ValidationError(f"{name} must be a string")
     if len(value) > MAX_STATUS_NOTE:
         raise ValidationError(f"{name} is longer than {MAX_STATUS_NOTE} characters")
-    if "\n" in value or "\r" in value:
-        raise ValidationError(f"{name} must be one line")
+    if any(_is_control(c) for c in value):
+        raise ValidationError(f"{name} must be one line with no control characters")
     return value
+
+
+def _is_control(char: str) -> bool:
+    """True for a C0 or C1 control character, or DEL."""
+    code = ord(char)
+    return code < 0x20 or 0x7F <= code < 0xA0
 
 
 def _nonnegative_int(value: object, name: str) -> int:

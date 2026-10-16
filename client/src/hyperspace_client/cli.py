@@ -29,7 +29,7 @@ from hyperspace_client.credentials import CredentialError
 from hyperspace_client.hooks import handle, notices
 from hyperspace_client.notices import after_sync, refresh_states
 from hyperspace_client.state import State
-from hyperspace_client.status import clean_note, seq, write
+from hyperspace_client.status import clean_note, printable, seq, write
 from hyperspace_client.sync import Context, Syncer, register_host
 from hyperspace_client.teleport import TeleportError, fork, restore, send
 from hyperspace_protocol import (
@@ -294,6 +294,7 @@ def cmd_hook(args: argparse.Namespace, cfg: Config) -> int:
 def _print_table(rows: list[list[str]]) -> None:
     if not rows:
         return
+    rows = [[printable(c) for c in r] for r in rows]
     widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     for r in rows:
         print("  ".join(c.ljust(w) for c, w in zip(r, widths, strict=True)).rstrip())
@@ -441,7 +442,7 @@ def cmd_show(args: argparse.Namespace, cfg: Config) -> int:
     state = manifest["state"]
     lease = state["lease"]
     print(f"session   {manifest['session_id']}")
-    print(f"title     {meta.get('title', '-')}")
+    print(f"title     {printable(meta.get('title', '-'))}")
     print(f"state     {state['state']}")
     print(f"lease     {lease['state']} {lease.get('host', '')} since {lease['since']}")
     print("placements:")
@@ -555,7 +556,7 @@ def _status_line(event: StatusEvent) -> str:
         by += f" (session {source['session_id']})"
     note = event.get("note")
     note = f": {note}" if note else ""
-    return f"{_event_label(event)}{note} [{by}, {event['received'][:16]}]"
+    return printable(f"{_event_label(event)}{note} [{by}, {event['received'][:16]}]")
 
 
 def _write_all(
@@ -668,7 +669,7 @@ def cmd_tail(args: argparse.Namespace, cfg: Config) -> int:
     sid = _target(args.session)
     url, token = cfg.require_server()
     with Api(url, token) as api:
-        print(tail(api, sid, args.n))
+        print(printable(tail(api, sid, args.n)))
     return 0
 
 
