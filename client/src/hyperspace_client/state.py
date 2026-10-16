@@ -168,7 +168,7 @@ class State:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._db = sqlite3.connect(directory / "state.sqlite3", timeout=30)
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode = WAL")
+        self._use_wal()
         self._db.execute("PRAGMA busy_timeout = 30000")
         # In WAL mode, NORMAL keeps the file consistent after a crash. A
         # power loss can lose the last cursor saves; the next sync then
@@ -178,6 +178,21 @@ class State:
         # Legacy cursors have no trustworthy server identity. Leave their
         # table untouched, but never reuse them: sync adopts remote bytes.
         self._add_columns()
+
+    def _use_wal(self) -> None:
+        """Set WAL mode. If two connections change the mode of a new file at
+        the same time, one can fail at once with "database is locked",
+        without the busy timeout. Thus a file lock makes the changes occur
+        one at a time."""
+        if self._db.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+            return
+        lock = self.directory / "state.sqlite3.lock"
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self._db.execute("PRAGMA journal_mode = WAL")
+        finally:
+            os.close(fd)
 
     def _missing_columns(self) -> list[tuple[str, str, str]]:
         """The table, name and definition of each added column that the

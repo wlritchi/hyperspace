@@ -345,6 +345,32 @@ def test_a_writer_does_not_stop_the_open_of_an_up_to_date_file(
     assert errors == []
 
 
+def test_simultaneous_first_opens_of_a_new_file(tmp_path: Path) -> None:
+    errors: list[BaseException] = []
+
+    def open_state(directory: Path, start: threading.Barrier) -> None:
+        try:
+            start.wait()
+            State(directory).close()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    # The race is in the change to WAL mode. It does not occur in each
+    # round, thus the test has many rounds.
+    for round_ in range(100):
+        start = threading.Barrier(8, timeout=10)
+        threads = [
+            threading.Thread(target=open_state, args=(tmp_path / str(round_), start))
+            for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive()
+        assert errors == [], round_
+
+
 def test_session_columns_survive_a_round_trip(tmp_path: Path) -> None:
     state = State(tmp_path)
     record = state.session("claude-code", SID)
