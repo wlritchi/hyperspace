@@ -181,6 +181,10 @@ def on_hook(
         # when it sends the write later.
         want["base_seq"] = seq(record.status)
         state.want_status(harness, session_id, want)
+        if event == "UserPromptSubmit" and want["explicit"]:
+            # The prompt reopens a done session. A done notice that the agent
+            # did not get is not true now.
+            state.drop_notices(harness, session_id, "status")
 
 
 # --- Status events from the server ---------------------------------------------------

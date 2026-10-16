@@ -34,6 +34,7 @@ from hyperspace_client.cli import (
     status_label,
     tail,
 )
+from hyperspace_client.notices import refresh_states
 from hyperspace_client.state import State
 from hyperspace_client.status import on_hook, send_wanted
 from hyperspace_client.sync import Context, Syncer
@@ -187,6 +188,35 @@ def test_done_then_prompt_reopens(
     assert event.get("note") == "reopened by a prompt"
     # A mark from this host by the user does not give a notice to itself.
     assert ctx.state.take_notices(HARNESS, sid) == []
+
+
+def test_prompt_that_reopens_drops_the_done_notice(
+    server: Server, ctx: Context, fake: FakeClaude
+) -> None:
+    sid, path = started_session(ctx, fake)
+    desk = server.api("desk")
+    desk.add_status(
+        HARNESS,
+        sid,
+        {
+            "status": "done",
+            "source_kind": "user",
+            "explicit": True,
+            "base_seq": server_status(desk, sid)["seq"],
+        },
+    )
+    # The user resumes the session here. The sweep at the start learns of
+    # the mark and queues the notice.
+    refresh_states(ctx, fake.adapter)
+    assert ctx.state.notice_flag(sid).exists()
+    # The first prompt reopens the session, so the notice is not true now.
+    fake.write(path, prompt("continue"))
+    hook(ctx, fake, sid, "UserPromptSubmit")
+    assert not ctx.state.notice_flag(sid).exists()
+    assert ctx.state.take_notices(HARNESS, sid) == []
+    sync(ctx, path)
+    event = server_status(ctx.api, sid)
+    assert (event["status"], event["explicit"]) == ("working", True)
 
 
 def test_status_cli_defaults_to_env_session(

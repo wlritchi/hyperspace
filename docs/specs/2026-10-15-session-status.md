@@ -301,7 +301,8 @@ When a session becomes `done` (by the agent, by `/done`, or from a different
 host):
 
 1. The session continues its current turn. A hook gives the main agent, not a
-   subagent, a notice if the mark came from outside (A3).
+   subagent, a notice if the mark came from outside (A3). A prompt that
+   reopens the session (U5) drops a notice that the agent did not get yet.
 2. The UI shows that the session is `done`. It does not close the session.
 3. A foreground session closes when the user closes the UI. Nothing more is
    necessary.

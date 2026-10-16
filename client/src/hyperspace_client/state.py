@@ -524,6 +524,26 @@ class State:
                 )
         return [str(r[1]) for r in rows]
 
+    def drop_notices(self, harness: str, session_id: str, kind: str) -> None:
+        """Mark the pending notices of `kind` as delivered, with no output.
+        Keep the flag only if a different notice is pending."""
+        # Remove the flag first, as `take_notices` does.
+        flag = self.notice_flag(session_id)
+        flag.unlink(missing_ok=True)
+        with self._db:
+            self._db.execute(
+                "UPDATE notices SET delivered = 1 WHERE harness = ? "
+                "AND session_id = ? AND kind = ? AND delivered = 0",
+                (harness, session_id, kind),
+            )
+            pending = self._db.execute(
+                "SELECT 1 FROM notices WHERE harness = ? AND session_id = ? "
+                "AND delivered = 0",
+                (harness, session_id),
+            ).fetchone()
+        if pending is not None:
+            flag.touch()
+
     # --- Wanted status -------------------------------------------------------------
 
     def want_status(self, harness: str, session_id: str, body: dict[str, Any]) -> None:
