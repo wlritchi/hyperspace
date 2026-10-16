@@ -549,7 +549,10 @@ The code follows this step, with these changes and additions:
   excerpt is the text of the last message: the text blocks after the last tool
   call or tool result.
 - `notice.sh` runs `hyperspace hook --notices`, which only prints the notices.
-  The flag file is `$XDG_STATE_HOME/hyperspace/notify/<session id>`.
+  For a subagent's tool call (`agent_id` in the payload), it prints nothing
+  and keeps the notices, because the context goes to the subagent and not to
+  the main agent. The flag file is
+  `$XDG_STATE_HOME/hyperspace/notify/<session id>`.
 - `hyperspace ls --status STATUS` (repeatable) shows sessions with a status,
   for example `done` sessions that are not closed, which `--open` leaves out.
   `hyperspace status` with no `STATUS` shows the status and the liveness.
