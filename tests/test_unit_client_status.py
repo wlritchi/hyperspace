@@ -43,6 +43,12 @@ def _wants(result: dict[str, Any] | None) -> tuple[Any, ...] | None:
 
 ASK = {"tool_name": "AskUserQuestion"}
 BASH = {"tool_name": "Bash"}
+DECLARED = {
+    "status": "waiting",
+    "wake": "local",
+    "source_kind": "agent",
+    "explicit": True,
+}
 
 
 @pytest.mark.parametrize(
@@ -86,7 +92,6 @@ BASH = {"tool_name": "Bash"}
             0,
             None,
         ),
-        ("Stop", {}, ("working", None), True, 0, None),
         ("Stop", {}, ("done", None), False, 0, None),
         ("Stop", {}, ("working", None), False, 2, ("waiting", "local", False)),
         ("Stop", {}, ("working", None), False, 0, ("ready", "idle", False)),
@@ -105,13 +110,25 @@ def test_transition_table(
     in_flight: int,
     expected: tuple[Any, ...] | None,
 ) -> None:
-    result = transition(event, payload, Known(*current, declared), in_flight)
+    known = Known(*current, DECLARED if declared else None)
+    result = transition(event, payload, known, in_flight)
     assert _wants(result) == expected
     if result is not None and event == "Stop":
         assert result[WITH_EXCERPT] is True
     if result is not None and result["explicit"]:
         assert result["source_kind"] == "user"
         assert result["note"] == "reopened by a prompt"
+
+
+def test_stop_keeps_the_declaration() -> None:
+    # The declaration is the current status.
+    assert transition("Stop", {}, Known("waiting", None, DECLARED, True), 0) is None
+    # A question or a permission prompt in the turn replaced it.
+    for current in (("working", None), ("ready", "asked")):
+        result = transition("Stop", {}, Known(*current, DECLARED), 2)
+        assert result == DECLARED
+    # A `done` from outside stays.
+    assert transition("Stop", {}, Known("done", None, DECLARED, True), 0) is None
 
 
 def test_wanted_status_keeps_latest(tmp_path: Path) -> None:
@@ -136,19 +153,24 @@ def test_known_prefers_the_queued_write(tmp_path: Path) -> None:
     state.save_session(record)
     assert known(state, record).status == "working"
     state.want_status("claude-code", SID, {"status": "ready", "reason": "asked"})
-    assert known(state, record) == Known("ready", "asked", False)
+    assert known(state, record) == Known("ready", "asked")
 
 
 def test_declaration_lasts_one_turn(tmp_path: Path) -> None:
     state = State(tmp_path)
     adapter = ClaudeCode(tmp_path / "claude")
     record = state.session("claude-code", SID)
-    record.status = {"seq": 1, "status": "waiting", "wake": "message"}
-    record.turn_declared = True
+    record.status = {
+        "seq": 1,
+        "status": "waiting",
+        "wake": "message",
+        "explicit": True,
+    }
+    record.declared = {**DECLARED, "wake": "message"}
     state.save_session(record)
     on_hook(state, adapter, "claude-code", SID, "Stop", {})
     assert state.wanted_status("claude-code", SID) is None
-    assert not state.session("claude-code", SID).turn_declared
+    assert state.session("claude-code", SID).declared is None
     # The next Stop with no declaration sets `ready`.
     on_hook(state, adapter, "claude-code", SID, "Stop", {})
     queued = state.wanted_status("claude-code", SID)
@@ -169,13 +191,13 @@ def test_session_columns_survive_a_round_trip(tmp_path: Path) -> None:
     state = State(tmp_path)
     record = state.session("claude-code", SID)
     record.status = {"seq": 2, "status": "done", "explicit": True}
-    record.turn_declared = True
+    record.declared = DECLARED
     record.done_seen = 12.5
     state.save_session(record)
     state.close()
     again = State(tmp_path).session("claude-code", SID)
     assert again.status == record.status
-    assert again.turn_declared and again.done_seen == 12.5
+    assert again.declared == DECLARED and again.done_seen == 12.5
 
 
 def test_in_flight_reads_job_state(
@@ -313,12 +335,12 @@ def test_a_stale_record_does_not_undo_status_fields(tmp_path: Path) -> None:
         # A sync loads the record; then a hook and the CLI change the status
         # fields; then the sync saves its older copy.
         stale = state.session("claude-code", SID)
-        state.set_turn_declared("claude-code", SID, True)
+        state.set_declared("claude-code", SID, DECLARED)
         state.save_status("claude-code", SID, {"seq": 4, "status": "waiting"}, None)
         stale.lease_state = "held"
         state.save_session(stale)
         after = state.session("claude-code", SID)
-        assert after.lease_state == "held" and after.turn_declared
+        assert after.lease_state == "held" and after.declared == DECLARED
         assert after.status == {"seq": 4, "status": "waiting"}
         # An older event does not replace a newer one.
         state.save_status("claude-code", SID, {"seq": 3, "status": "ready"}, None)

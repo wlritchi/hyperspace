@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS wanted_status (
 _SESSION_COLUMNS = {
     "held_lease": "INTEGER NOT NULL DEFAULT 0",
     "status": "TEXT",
-    "turn_declared": "INTEGER NOT NULL DEFAULT 0",
+    "declared": "TEXT",
     "done_seen": "REAL",
 }
 # Wait between two tries for a lock that another process holds.
@@ -147,8 +147,9 @@ class SessionRecord:
     held_lease: bool = False
     # The latest status event that the client saw from the server.
     status: dict[str, Any] | None = None
-    # True after an explicit status write from the agent in the current turn.
-    turn_declared: bool = False
+    # The explicit status write from the agent in the current turn, without
+    # `base_seq`, or None.
+    declared: dict[str, Any] | None = None
     # The time when the client first saw the status `done`.
     done_seen: float | None = None
 
@@ -335,7 +336,7 @@ class State:
             last_placement=row["last_placement"],
             held_lease=bool(row["held_lease"]),
             status=json.loads(row["status"]) if row["status"] else None,
-            turn_declared=bool(row["turn_declared"]),
+            declared=json.loads(row["declared"]) if row["declared"] else None,
             done_seen=row["done_seen"],
         )
 
@@ -348,9 +349,9 @@ class State:
         changed after this process read them.
 
         For a row that exists, this does not change `status`, `done_seen`
-        and `turn_declared`: hooks and the CLI change them while a sync holds
-        an older copy of the record. Use `save_status` and
-        `set_turn_declared` for them."""
+        and `declared`: hooks and the CLI change them while a sync holds an
+        older copy of the record. Use `save_status` and `set_declared` for
+        them."""
         values: dict[str, object] = {
             "workspace": record.workspace,
             "transcript": record.transcript,
@@ -371,7 +372,7 @@ class State:
             inserted = {
                 **values,
                 "status": json.dumps(record.status) if record.status else None,
-                "turn_declared": int(record.turn_declared),
+                "declared": json.dumps(record.declared) if record.declared else None,
                 "done_seen": record.done_seen,
             }
         else:
@@ -414,16 +415,19 @@ class State:
                 (harness, session_id, json.dumps(status), done_seen),
             )
 
-    def set_turn_declared(self, harness: str, session_id: str, value: bool) -> None:
+    def set_declared(
+        self, harness: str, session_id: str, request: dict[str, Any] | None
+    ) -> None:
+        value = json.dumps(request) if request else None
         with self._db:
             self._db.execute(
                 """
-                INSERT INTO sessions (harness, session_id, turn_declared)
+                INSERT INTO sessions (harness, session_id, declared)
                 VALUES (?, ?, ?)
                 ON CONFLICT (harness, session_id) DO UPDATE SET
-                    turn_declared = excluded.turn_declared
+                    declared = excluded.declared
                 """,
-                (harness, session_id, int(value)),
+                (harness, session_id, value),
             )
 
     def known_sessions(self) -> list[SessionRecord]:

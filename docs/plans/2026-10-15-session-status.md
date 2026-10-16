@@ -927,9 +927,9 @@ without it.
   `test_config_dirs_of_one_host_keep_their_own_liveness`.
 - **Writes during a long sync**: `set_status` queues the write if it does not
   get the sync lock in `STATUS_LOCK_WAIT`. `State.save_session` is an upsert
-  that does not change `status`, `done_seen` and `turn_declared` of a row that
+  that does not change `status`, `done_seen` and `declared` of a row that
   exists. `State.save_status` (which never replaces a higher `seq`) and
-  `State.set_turn_declared` write them. Tests:
+  `State.set_declared` write them. Tests:
   `test_write_during_a_long_sync_is_queued`,
   `test_a_stale_record_does_not_undo_status_fields`.
 - **Backfill scope**: `backfill.run_turn` sets
@@ -947,6 +947,14 @@ without it.
   because the server refuses a heartbeat with one. Test:
   `test_live_sessions_skips_invalid_ids`.
 - **Lists**: `list_sessions` reads the latest status event once for each row.
+- **Declaration and a prompt in one turn**: a question or a permission prompt
+  after a declaration writes `ready`, reason `asked`, and the next tool call
+  writes `working`. Then the Stop hook wrote nothing, so the session stayed
+  `working`. The `turn_declared` flag is now `sessions.declared`: the JSON of
+  the declared request (`State.set_declared`). At Stop, if the declaration is
+  set and the latest known status is not explicit, the hook queues the
+  declaration again, as an explicit write. Test:
+  `test_declaration_holds_over_a_prompt_in_the_turn`.
 
 ## Step 6: outside this repo
 

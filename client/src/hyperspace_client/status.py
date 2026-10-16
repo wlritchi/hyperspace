@@ -57,20 +57,28 @@ _NO_CAPABILITY_LOG = 86_400
 
 @dataclass(frozen=True)
 class Known:
-    """What the client knows of the status: the queued write if there is
-    one, else the latest event from the server."""
+    """What the client knows of the status. `status`, `reason` and
+    `explicit` come from the queued write if there is one, else from the
+    latest event from the server. `declared` is the agent's declaration in
+    the current turn, or None."""
 
     status: str | None
     reason: str | None
-    turn_declared: bool
+    declared: dict[str, Any] | None = None
+    explicit: bool = False
 
 
 def known(state: State, record: SessionRecord) -> Known:
     queued = state.wanted_status(record.harness, record.session_id)
     latest: dict[str, Any] | None = queued[0] if queued else record.status
     if latest is None:
-        return Known(None, None, record.turn_declared)
-    return Known(latest.get("status"), latest.get("reason"), record.turn_declared)
+        return Known(None, None, record.declared)
+    return Known(
+        latest.get("status"),
+        latest.get("reason"),
+        record.declared,
+        bool(latest.get("explicit")),
+    )
 
 
 def _want(
@@ -128,7 +136,7 @@ def transition(
     if event == "PreToolUse":
         if tool == _ASK_TOOL:
             return _want("ready", reason="asked")
-        if current in ("ready", "waiting") and not known.turn_declared:
+        if current in ("ready", "waiting") and known.declared is None:
             # A turn that started with no prompt, for example from a cron.
             return _want("working")
         return None
@@ -141,8 +149,12 @@ def transition(
             return _want("ready", reason="asked")
         return None
     if event == "Stop":
-        if known.turn_declared:
-            return None
+        if known.declared is not None:
+            if known.explicit:
+                return None
+            # A question or a permission prompt replaced the declaration in
+            # this turn. The declaration applies again when the turn ends.
+            return {**known.declared}
         if in_flight > 0:
             return _want("waiting", wake="local", excerpt=True)
         return _want("ready", reason="idle", excerpt=True)
@@ -162,8 +174,8 @@ def on_hook(
     in_flight = adapter.in_flight() if event == "Stop" else 0
     want = transition(event, payload, known(state, record), in_flight)
     # An explicit declaration applies to one turn.
-    if event in ("Stop", "UserPromptSubmit") and record.turn_declared:
-        state.set_turn_declared(harness, session_id, False)
+    if event in ("Stop", "UserPromptSubmit") and record.declared is not None:
+        state.set_declared(harness, session_id, None)
     if want is not None:
         # The write is based on what the hook saw, not on what the sync sees
         # when it sends the write later.
