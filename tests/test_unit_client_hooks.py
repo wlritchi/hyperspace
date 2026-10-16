@@ -242,3 +242,20 @@ def test_notices_mode(cfg: Config) -> None:
     }
     assert notices(payload, cfg) == ""
     assert not (cfg.state_dir / "notify" / SID).exists()
+
+
+def test_notices_skip_a_subagent(cfg: Config) -> None:
+    state = State(cfg.state_dir)
+    state.add_notice("claude-code", SID, "status", "[hyperspace] marked done")
+    state.close()
+    sub = {
+        "hook_event_name": "PostToolUse",
+        "transcript_path": TRANSCRIPT,
+        "agent_id": "a1b2c3",
+    }
+    # The notice is for the main agent. A subagent's tool call leaves it.
+    assert notices(sub, cfg) == ""
+    assert (cfg.state_dir / "notify" / SID).exists()
+    main = {"hook_event_name": "PostToolUse", "transcript_path": TRANSCRIPT}
+    out = json.loads(notices(main, cfg))
+    assert out["hookSpecificOutput"]["additionalContext"] == "[hyperspace] marked done"

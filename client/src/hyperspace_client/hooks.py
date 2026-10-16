@@ -190,6 +190,10 @@ def _close_if_done(cfg: Config, harness: str, session_id: str, start: Detach) ->
 def notices(payload: dict[str, Any], cfg: Config) -> str:
     """The pending notices of the session, as additional context for the
     agent, or "" if there are none."""
+    if payload.get("agent_id"):
+        # The context goes to the subagent. Keep the notices for the main
+        # agent's next tool call or prompt.
+        return ""
     transcript = _str(payload, "transcript_path")
     session = (
         ClaudeCode().session_for_transcript(Path(transcript)) if transcript else None
