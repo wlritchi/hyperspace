@@ -558,6 +558,12 @@ The code follows this step, with these changes and additions:
   and keeps the notices, because the context goes to the subagent and not to
   the main agent. The flag file is
   `$XDG_STATE_HOME/hyperspace/notify/<session id>`.
+- A notice has an optional key in the `notices` table. `add_notice` does not
+  add a notice if an earlier notice of the same kind, delivered or not, has
+  the same key; with no key, the text is the key. A lease notice uses its
+  text, so that a sync that sees the same problem again does not repeat it. A
+  `done` notice uses the event's `seq`, so that each new `done` mark gives one
+  notice, also when its host, source and note are the same as an earlier mark.
 - `hyperspace ls --status STATUS` (repeatable) shows sessions with a status,
   for example `done` sessions that are not closed, which `--open` leaves out.
   `hyperspace status` with no `STATUS` shows the status and the liveness.

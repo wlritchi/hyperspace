@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from hyperspace_client.status import (
     clean_note,
     done_notice,
     known,
+    observe,
     on_hook,
     printable,
     transition,
@@ -199,6 +201,67 @@ def test_drop_notices_keeps_other_kinds(tmp_path: Path) -> None:
     state.drop_notices("claude-code", SID, "status")
     assert not flag.exists()
     assert state.take_notices("claude-code", SID) == []
+
+
+def _done(seq: int, host: str = "desk", note: str = "merged") -> StatusEvent:
+    return {
+        "seq": seq,
+        "status": "done",
+        "note": note,
+        "source": {"kind": "user", "host": host},
+        "explicit": True,
+        "received": "2026-10-16T00:00:00Z",
+    }
+
+
+def test_each_done_mark_gives_one_notice(tmp_path: Path) -> None:
+    state = State(tmp_path)
+    record = state.session("claude-code", SID)
+    observe(state, record, _done(3), "laptop")
+    assert len(state.take_notices("claude-code", SID)) == 1
+    # A stale record sees the same event again: no second notice.
+    observe(state, state.session("claude-code", SID), _done(3), "laptop")
+    stale = state.session("claude-code", SID)
+    stale.status = None
+    observe(state, stale, _done(3), "laptop")
+    assert state.take_notices("claude-code", SID) == []
+    # The session is reopened and then marked done again with the same note.
+    reopen: StatusEvent = {
+        "seq": 4,
+        "status": "working",
+        "source": {"kind": "user", "host": "laptop"},
+        "explicit": True,
+        "received": "2026-10-16T00:00:00Z",
+    }
+    observe(state, record, reopen, "laptop")
+    observe(state, record, _done(5), "laptop")
+    (notice,) = state.take_notices("claude-code", SID)
+    assert "desk marked this session done" in notice
+    # A lease notice that is the same as an earlier one does not repeat.
+    state.add_notice("claude-code", SID, "lease", "lease lost")
+    assert state.take_notices("claude-code", SID) == ["lease lost"]
+    state.add_notice("claude-code", SID, "lease", "lease lost")
+    assert state.take_notices("claude-code", SID) == []
+
+
+def test_notices_table_from_an_older_client(tmp_path: Path) -> None:
+    db = sqlite3.connect(tmp_path / "state.sqlite3")
+    db.execute(
+        "CREATE TABLE notices (id INTEGER PRIMARY KEY, harness TEXT NOT NULL, "
+        "session_id TEXT NOT NULL, kind TEXT NOT NULL, text TEXT NOT NULL, "
+        "created REAL NOT NULL, delivered INTEGER NOT NULL DEFAULT 0)"
+    )
+    db.execute(
+        "INSERT INTO notices (harness, session_id, kind, text, created) "
+        "VALUES ('claude-code', ?, 'lease', 'lease lost', 1.0)",
+        (SID,),
+    )
+    db.commit()
+    db.close()
+    state = State(tmp_path)
+    state.add_notice("claude-code", SID, "lease", "lease lost")
+    state.add_notice("claude-code", SID, "status", "marked done", key="seq:3")
+    assert state.take_notices("claude-code", SID) == ["lease lost", "marked done"]
 
 
 def test_session_columns_survive_a_round_trip(tmp_path: Path) -> None:
