@@ -570,6 +570,10 @@ The code follows this step, with these changes and additions:
   file at the same time; the second waits for the lock and then sees the
   columns. The first read of the columns does not lock, so that the open of an
   up-to-date file does not wait for an unrelated writer.
+- If the file is not in WAL mode, `State` changes the mode while it holds a
+  file lock, `state.sqlite3.lock`. Two connections that change the mode of a
+  new file at the same time can otherwise fail at once with "database is
+  locked", without the busy timeout.
 - `SessionStart` does not print a pending `done` notice ("Finish the current
   step and stop"), because no turn runs at a start. The notice stays pending,
   and `SessionStart` prints only that the session is marked done and that a
