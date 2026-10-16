@@ -7,6 +7,8 @@ the real ~/.claude are never used."""
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,11 +36,12 @@ from hyperspace_client.launcher import (
     load_unclosed,
     needs_process,
     record_refusal,
+    run_bg,
     run_rm,
 )
 from hyperspace_client.state import State
 from hyperspace_client.sync import Context, Syncer
-from hyperspace_client.teleport import HeldRestore
+from hyperspace_client.teleport import HeldRestore, TeleportError, restore
 from hyperspace_protocol import SessionStateBody, SessionSummary
 
 WS = "/home/wlritchi/hyperspace"
@@ -896,3 +899,94 @@ def test_launcher_claude_args_config(tmp_path: Path) -> None:
     ):
         with pytest.raises(ConfigError):
             load({"HYPERSPACE_LAUNCHER_CLAUDE_ARGS": bad}, none)
+
+
+def test_pending_restore_blocks_the_resume(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = tmp_path / "ws"
+    sid = held_session(ctx, fake, ws)
+    set_status(ctx, sid, "working")
+    teleport = ctx.api.teleport
+
+    def lost(*args: Any) -> Any:
+        raise httpx.ReadTimeout("timeout")
+
+    # A restore writes the files, but cannot confirm its teleport request.
+    monkeypatch.setattr(ctx.api, "teleport", lost)
+    with pytest.raises(TeleportError, match="confirmation"):
+        restore(ctx, host, sid, str(ws))
+    assert ctx.state.get(f"restore_pending:{HARNESS}:{sid}")
+    assert host.find_transcripts(sid)
+    bg = Bg()
+    clock = Clock()
+    run = runner(ctx, host, bg, clock)
+    # The restore retry fails again. The runner does not resume.
+    run.tick()
+    assert ctx.state.get(f"restore_pending:{HARNESS}:{sid}")
+    assert bg.calls == []
+    # The restore retry confirms the restore. The runner resumes.
+    monkeypatch.setattr(ctx.api, "teleport", teleport)
+    clock.t += 60
+    run.tick()
+    assert not ctx.state.get(f"restore_pending:{HARNESS}:{sid}")
+    assert [(argv[5], cwd) for argv, cwd in bg.calls] == [(sid, str(ws))]
+
+
+def test_no_resume_while_another_process_holds_the_session_lock(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    bg = Bg()
+    run = runner(ctx, host, bg, Clock())
+    # For example, a restore or a sync of the session.
+    other = State(tmp_path / "state")
+    try:
+        with other.try_lock(HARNESS, sid) as locked:
+            assert locked
+            run.tick()
+            assert bg.calls == []
+    finally:
+        other.close()
+    run.tick()
+    assert [argv[5] for argv, _ in bg.calls] == [sid]
+
+
+def test_resume_holds_the_session_lock_only_through_the_launch(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    pidfile = tmp_path / "daemon.pid"
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "daemon")
+    monkeypatch.setenv("FAKE_CLAUDE_PIDFILE", str(pidfile))
+    held: list[bool] = []
+
+    def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
+        with ctx.state.try_lock(HARNESS, sid) as free:
+            held.append(not free)
+        # The fake starts a daemon that continues to run, as `claude --bg` can.
+        return run_bg([sys.executable, FAKE, *argv[1:]], cwd, timeout)
+
+    run = runner(ctx, host, Bg(), Clock())
+    run.run_claude = bg
+    run.tick()
+    daemon = int(pidfile.read_text())
+    try:
+        assert held == [True]
+        # The daemon must not keep the lock, because the hooks of the session
+        # need it.
+        with ctx.state.try_lock(HARNESS, sid) as free:
+            assert free
+        os.kill(daemon, 0)
+    finally:
+        os.kill(daemon, signal.SIGKILL)

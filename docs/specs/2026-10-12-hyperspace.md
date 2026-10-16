@@ -435,7 +435,8 @@ credential: the server ties the teleport id to the target host and workspace.
 Thus a restore with a new credential for the same host, for example after an
 authentication failure, reconciles the request. While pending, every
 synchronous prompt check blocks, even without a credential or a fresh resume
-check, and sync does not upload the files.
+check, sync does not upload the files, and a runner's launcher does not resume
+the session.
 
 A replay of a committed teleport is refused if the session is now conflicted
 (`409 teleport_committed_conflict`) or its lease moved again

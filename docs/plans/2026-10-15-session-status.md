@@ -1017,6 +1017,24 @@ without it.
   `test_failed_boot_restore_is_retried` (a failed list and a failed session
   restore), `test_restore_retry_backs_off`,
   `test_boot_restores_held_sessions`.
+- **Resume during a restore**: `Launcher.resume` did not check the
+  pending-restore marker or take the session's sync lock. When a restore wrote
+  the files but could not confirm its teleport request, the retry at the tick
+  failed again and the same tick resumed the session. Its UserPromptSubmit
+  hook then blocked each prompt, and later restores refused while the process
+  ran. A resume could also start while an independent restore held the session
+  lock. Now `resume` takes the sync lock with `try_lock` (no wait) and holds
+  it through the checks and `claude --bg`. With the lock held by another
+  process, or with a pending-restore marker, it does not resume, and the next
+  tick tries again. The lock is free when `claude --bg` returns. The new
+  process does not get the lock (the file descriptor is not inheritable), and
+  its hooks take the lock with no wait (`try_lock` in the sync and the
+  checkpoint) or a limited wait (`STATUS_LOCK_WAIT` in `hyperspace status`),
+  so the hold cannot deadlock with them. A hook that runs during the hold
+  skips its sync, and a later hook syncs. Tests:
+  `test_pending_restore_blocks_the_resume`,
+  `test_no_resume_while_another_process_holds_the_session_lock`,
+  `test_resume_holds_the_session_lock_only_through_the_launch`.
 - **Start errors**: `cmd_launcher` called `register_host` and `has_capability`
   before `Launcher.run`, and an error stopped the launcher. On a runner whose
   server was not available at the pod's start, the entrypoint exited 1 and the

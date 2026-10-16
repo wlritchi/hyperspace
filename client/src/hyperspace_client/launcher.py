@@ -444,7 +444,9 @@ class Launcher:
 
     def resume(self, sid: str, prompt: str) -> bool:
         """Resume a session as a background job, in the workspace that this
-        host recorded for it. Return True if `claude --bg` succeeded."""
+        host recorded for it. Do not resume while its restore is pending, or
+        while another process holds its sync lock. Return True if
+        `claude --bg` succeeded."""
         now = self.clock()
         recent = self._resumes.setdefault(sid, deque[float]())
         while recent and now - recent[0] >= RESUME_WINDOW:
@@ -452,23 +454,36 @@ class Launcher:
         if len(recent) >= MAX_RESUMES:
             log.info("%s: resumed %d times in an hour; not again", sid, len(recent))
             return False
-        workspace = self.ctx.state.session(self.adapter.harness, sid).workspace
-        # Only a session with a local transcript under this id, so that the
-        # id is a valid file name and `claude --resume` finds the session.
-        if (
-            not workspace
-            or not os.path.isabs(workspace)
-            or not os.path.isdir(workspace)
-            or not self.adapter.find_transcripts(sid)
-        ):
-            log.warning("%s: not resumed: no local copy or no workspace", sid)
-            return False
-        # Claude Code starts a copy under a new id if the session runs.
-        if self.adapter.is_running(sid):
-            return False
-        recent.append(now)
-        argv = [self.claude, *self.claude_args, "--bg", "--resume", sid, prompt]
-        result = self.run_claude(argv, workspace, RESUME_TIMEOUT)
+        harness = self.adapter.harness
+        # Hold the session's sync lock from the checks until `claude --bg`
+        # returns, so that no restore or sync starts between them. The new
+        # process does not inherit the lock, and its hooks wait for the lock
+        # only for a limited time.
+        with self.ctx.state.try_lock(harness, sid) as locked:
+            if not locked:
+                log.info("%s: not resumed: a sync or a restore of it runs", sid)
+                return False
+            if self.ctx.state.get(f"restore_pending:{harness}:{sid}"):
+                # The restore retry must complete the restore first.
+                log.info("%s: not resumed: its restore is not complete", sid)
+                return False
+            workspace = self.ctx.state.session(harness, sid).workspace
+            # Only a session with a local transcript under this id, so that
+            # the id is a valid file name and `claude --resume` finds it.
+            if (
+                not workspace
+                or not os.path.isabs(workspace)
+                or not os.path.isdir(workspace)
+                or not self.adapter.find_transcripts(sid)
+            ):
+                log.warning("%s: not resumed: no local copy or no workspace", sid)
+                return False
+            # Claude Code starts a copy under a new id if the session runs.
+            if self.adapter.is_running(sid):
+                return False
+            recent.append(now)
+            argv = [self.claude, *self.claude_args, "--bg", "--resume", sid, prompt]
+            result = self.run_claude(argv, workspace, RESUME_TIMEOUT)
         if result.returncode == 0:
             log.info("%s: resumed in %s", sid, workspace)
             return True
