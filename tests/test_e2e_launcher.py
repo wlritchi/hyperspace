@@ -475,12 +475,17 @@ def test_launcher_waits_for_the_server_at_start(
         server,
         tmp_path,
         argv,
-        register_host=[httpx.ConnectError("refused"), ApiError(502, "bad_gateway")],
+        register_host=[
+            httpx.ConnectError("refused"),
+            # The HTTPS proxy is not available.
+            httpx.ProxyError("503 Service Unavailable"),
+            ApiError(502, "bad_gateway"),
+        ],
         whoami=[httpx.ReadTimeout("timeout")],
     )
     assert code == 0
     assert ran == ["runner" if argv == ["--runner"] else "workstation"]
-    assert sleeps == [START_RETRY, 2 * START_RETRY, 4 * START_RETRY]
+    assert sleeps == [START_RETRY, 2 * START_RETRY, 4 * START_RETRY, 8 * START_RETRY]
 
 
 def test_launcher_start_fails_at_once_for_a_bad_credential(
@@ -504,6 +509,7 @@ def test_launcher_start_fails_at_once_for_a_bad_credential(
         httpx.UnsupportedProtocol("Request URL has an unsupported protocol"),
         httpx.TooManyRedirects("Exceeded maximum allowed redirects."),
         httpx.ProxyError("407 Proxy Authentication Required"),
+        httpx.ProxyError("Invalid username/password"),
         httpx.DecodingError("Error -3 while decompressing data"),
         PermissionError("permission denied"),
     ],
@@ -528,6 +534,13 @@ def test_launcher_start_fails_at_once_for_a_local_error(
         (httpx.ReadError("reset"), True),
         (httpx.WriteError("broken pipe"), True),
         (httpx.RemoteProtocolError("Server disconnected"), True),
+        (httpx.ProxyError("502 Bad Gateway"), True),
+        (httpx.ProxyError("503 Service Unavailable"), True),
+        (httpx.ProxyError("504 Gateway Timeout"), True),
+        (httpx.ProxyError("Proxy Server could not connect: Connection refused."), True),
+        (httpx.ProxyError("407 Proxy Authentication Required"), False),
+        (httpx.ProxyError("407"), False),
+        (httpx.ProxyError("Invalid username/password"), False),
         (ApiError(500, "error"), True),
         (ApiError(503, "unavailable"), True),
         (ApiError(408, "timeout"), True),

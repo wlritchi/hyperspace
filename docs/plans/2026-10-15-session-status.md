@@ -1060,18 +1060,26 @@ without it.
   temporary: `TimeoutException` (connect, read, write and pool timeouts),
   `NetworkError` and `RemoteProtocolError`, and a 5xx, 408 or 429. Other
   errors, for example `LocalProtocolError`, `UnsupportedProtocol`,
-  `TooManyRedirects`, `ProxyError`, `DecodingError` or a local `OSError`, stop
-  the launcher at once. Also, `config.check_token` refuses a token with a
-  character that is not visible ASCII (a space, a control character, or a
-  character that is not ASCII), from the environment, a token file, the token
-  cache or the keyring. The launcher's read of the token cache before each
-  tick also checks a new token. If the check fails, the launcher keeps its
-  current token and logs a warning. Tests:
-  `test_launcher_start_fails_at_once_for_a_local_error`,
+  `TooManyRedirects`, `DecodingError` or a local `OSError`, stop the launcher
+  at once. Also, `config.check_token` refuses a token with a character that is
+  not visible ASCII (a space, a control character, or a character that is not
+  ASCII), from the environment, a token file, the token cache or the keyring.
+  The launcher's read of the token cache before each tick also checks a new
+  token. If the check fails, the launcher keeps its current token and logs a
+  warning. Tests: `test_launcher_start_fails_at_once_for_a_local_error`,
   `test_temporary_errors`,
   `test_a_token_with_whitespace_or_a_control_character_is_refused`,
   `test_a_token_from_the_cache_is_checked`,
   `test_the_launcher_refuses_a_bad_token_from_the_cache`.
+- **Proxy errors**: `launcher.temporary` treated each `httpx.ProxyError` as a
+  local error. Through an HTTPS proxy (`HTTPS_PROXY`), httpcore raises
+  `ProxyError` for each CONNECT response that is not 2xx, also for a 502, 503
+  or 504 while the proxy is not available, so a runner stopped at once. Now a
+  `ProxyError` is temporary, except a refused proxy credential: a message that
+  starts with the status `407`, or the SOCKS message
+  `Invalid username/password`. Tests: `test_temporary_errors`,
+  `test_launcher_waits_for_the_server_at_start`,
+  `test_launcher_start_fails_at_once_for_a_local_error`.
 
 ## Step 6: outside this repo
 
