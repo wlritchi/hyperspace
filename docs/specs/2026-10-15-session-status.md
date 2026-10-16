@@ -437,9 +437,12 @@ session's sync lock from its checks until `claude --bg` returns, so that no
 restore or sync starts between the checks and the start. If another process
 holds the lock, the launcher tries again at the next tick. The session's
 process does not get the lock, and its hooks do not wait for it without a
-limit, so the hold cannot block the new session. The first message tells the
-agent that the runner restarted, and, for a `waiting` session, that its crons,
-Monitors and background tasks stopped.
+limit, so the hold cannot block the new session. A checkpoint that a hook
+starts during the hold does not sync. Thus, when the launcher releases the
+lock, also after a failure or a timeout of `claude --bg`, it starts a
+checkpoint if the session is dirty (main spec, "Checkpoint scheduling"). The
+first message tells the agent that the runner restarted, and, for a `waiting`
+session, that its crons, Monitors and background tasks stopped.
 
 The launcher reads the Claude Code options for a resume (model, agent, and
 channels) from `launcher_claude_args`, or from

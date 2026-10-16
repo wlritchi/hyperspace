@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from collections import deque
@@ -87,11 +88,25 @@ _SOCKS_AUTH = "Invalid username/password"
 _MAX_OUTPUT = 64 * 1024
 
 RunRm = Callable[[list[str]], tuple[int, str]]
+Detach = Callable[[list[str]], None]
 
 
 def off() -> bool:
     """True if `HYPERSPACE_LAUNCHER=off`: no launcher, and no heartbeats."""
     return os.environ.get(OFF_ENV, "").strip().lower() in ("off", "0", "false", "no")
+
+
+def detach(args: list[str]) -> None:
+    """Start the CLI with `args` in its own session, with no terminal or
+    pipes, so that it outlives the hook and the harness session."""
+    subprocess.Popen(
+        [sys.executable, "-m", "hyperspace_client.cli", *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
 
 
 def run_rm(argv: list[str]) -> tuple[int, str]:
@@ -392,6 +407,8 @@ class Launcher:
     # The workspace for a held session that has no workspace of its own.
     workspace: str = ""
     run_claude: Runner = run_bg
+    # Starts a CLI command in the background, for a trailing checkpoint.
+    start: Detach = detach
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     # Job name to (state.json mtime, time of the last check).
@@ -469,7 +486,7 @@ class Launcher:
         # returns, so that no restore or sync starts between them. The new
         # process does not inherit the lock, and its hooks wait for the lock
         # only for a limited time.
-        with self.ctx.state.try_lock(harness, sid) as locked:
+        with self._hold(sid) as locked:
             if not locked:
                 log.info("%s: not resumed: a sync or a restore of it runs", sid)
                 return False
@@ -500,6 +517,35 @@ class Launcher:
         first = next(iter(printable(result.output).splitlines()), "")
         log.warning("%s: resume failed (%s): %s", sid, result.returncode, first)
         return False
+
+    @contextmanager
+    def _hold(self, sid: str) -> Iterator[bool]:
+        """Hold the session's sync lock as `try_lock` does. After the release,
+        start a checkpoint if the session is dirty. A checkpoint that started
+        during the hold did not get the lock, so it did not sync. No other
+        process syncs for its mark (see "Checkpoint scheduling" in the
+        spec)."""
+        locked = False
+        try:
+            with self.ctx.state.try_lock(self.adapter.harness, sid) as locked:
+                yield locked
+        finally:
+            if locked:
+                self._checkpoint_if_dirty(sid)
+
+    def _checkpoint_if_dirty(self, sid: str) -> None:
+        harness = self.adapter.harness
+        if self.ctx.state.dirty_since(harness, sid) is None:
+            return
+        # A dirty session has a transcript path, because the checkpoint sync
+        # records the path before it marks the session.
+        transcript = self.ctx.state.session(harness, sid).transcript
+        if not transcript:
+            return
+        try:
+            self.start(["--quiet", "sync", "--checkpoint", "--transcript", transcript])
+        except OSError as exc:
+            log.warning("%s: no checkpoint after the resume: %s", sid, exc)
 
     def tick(self) -> list[str]:
         """One heartbeat and one sweep, and in runner mode the restores and

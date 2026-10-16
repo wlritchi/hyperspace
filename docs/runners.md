@@ -79,11 +79,12 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
    `claude <args> --bg --resume <session id> <message>` in the session's
    workspace, after it checks that the session does not run. It holds the
    session's sync lock from these checks until `claude --bg` returns, and it
-   does not resume a session while a sync or a restore of it runs. It does not
-   resume a session that the server shows as `live` on any host, also on the
-   runner itself (for example from a different harness config directory). The
-   message tells the agent that the runner restarted, and that its crons,
-   Monitors and background tasks stopped.
+   does not resume a session while a sync or a restore of it runs. If the
+   session changed during the hold, the launcher then starts a checkpoint. It
+   does not resume a session that the server shows as `live` on any host, also
+   on the runner itself (for example from a different harness config
+   directory). The message tells the agent that the runner restarted, and that
+   its crons, Monitors and background tasks stopped.
 4. Does not resume a session that is `ready`, `done`, `waiting` with
    `wake: message`, or that has no status. The user, or a message, wakes these
    sessions. Sessions from before the session status feature have no status

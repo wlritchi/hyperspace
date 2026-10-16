@@ -25,9 +25,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
-import sys
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -65,28 +62,15 @@ CHECKPOINT_EVENTS = frozenset(
 SWEEP_EVERY = "3600"
 UNLOCK_SOURCES = frozenset({"startup", "resume"})
 
-Detach = Callable[[list[str]], None]
-
-
-def detach(args: list[str]) -> None:
-    """Start the CLI with `args` in its own session, with no terminal or
-    pipes, so that it outlives the hook and the harness session."""
-    subprocess.Popen(
-        [sys.executable, "-m", "hyperspace_client.cli", *args],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-    )
-
 
 def _str(payload: dict[str, Any], key: str) -> str | None:
     value = payload.get(key)
     return value if isinstance(value, str) and value else None
 
 
-def handle(payload: dict[str, Any], cfg: Config, start: Detach = detach) -> str:
+def handle(
+    payload: dict[str, Any], cfg: Config, start: launcher.Detach = launcher.detach
+) -> str:
     """Act on one hook event. Return the text for the hook's stdout."""
     event = _str(payload, "hook_event_name")
     transcript = _str(payload, "transcript_path")
@@ -170,7 +154,9 @@ def handle(payload: dict[str, Any], cfg: Config, start: Detach = detach) -> str:
     return ""
 
 
-def _close_if_done(cfg: Config, harness: str, session_id: str, start: Detach) -> None:
+def _close_if_done(
+    cfg: Config, harness: str, session_id: str, start: launcher.Detach
+) -> None:
     """At the end of a background job whose session is `done`, close the
     job when its process stops. Claude Code sets `CLAUDE_JOB_DIR` only in
     a background job."""
