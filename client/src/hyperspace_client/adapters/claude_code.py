@@ -24,6 +24,7 @@ from hyperspace_client.adapters import (
     decode_segment,
     encode_segment,
 )
+from hyperspace_protocol import MAX_STATUS_EXCERPT
 
 HARNESS = "claude-code"
 TRANSCRIPT = "transcript.jsonl"
@@ -48,6 +49,10 @@ _SERVER_KEYS = (
 
 
 _SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}")
+# The excerpt comes from the end of the transcript only.
+_EXCERPT_WINDOW = 256 * 1024
+# One line of `format_tail` for a tool call shows at most this much input.
+_TOOL_SUMMARY = 100
 
 # Record types that name a session but hold no conversation. Claude Code
 # writes a transcript with only these records for the id of a background
@@ -197,6 +202,46 @@ def is_prompt(record: dict[str, Any]) -> bool:
             for i in items
         )
     return False
+
+
+def _blocks(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """The content blocks of a record's message. A string content is one
+    text block."""
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        return []
+    items: list[Any] = content  # pyright: ignore[reportUnknownVariableType]
+    return [i for i in items if isinstance(i, dict)]
+
+
+def _text(record: dict[str, Any]) -> str:
+    """The text blocks of a record, without thinking blocks."""
+    return "\n".join(
+        str(b["text"])
+        for b in _blocks(record)
+        if b.get("type") == "text" and isinstance(b.get("text"), str)
+    ).strip()
+
+
+def _is_assistant(record: dict[str, Any]) -> bool:
+    return record.get("type") == "assistant" and not record.get("isSidechain")
+
+
+def _tool_line(block: dict[str, Any]) -> str:
+    raw: Any = block.get("input")
+    summary = ""
+    if isinstance(raw, dict):
+        fields: dict[str, Any] = raw  # pyright: ignore[reportUnknownVariableType]
+        values = [str(v) for v in fields.values() if isinstance(v, str | int)]
+        summary = " ".join(" ".join(values).split())
+    if len(summary) > _TOOL_SUMMARY:
+        summary = summary[: _TOOL_SUMMARY - 1] + "…"
+    return f"  [tool] {block.get('name', '?')} {summary}".rstrip()
 
 
 def tool_calls(record: dict[str, Any]) -> int:
@@ -416,6 +461,27 @@ class ClaudeCode:
             index.setdefault(session.session_id, []).append(session.transcript)
         return index
 
+    def live_sessions(self) -> list[str]:
+        """The ids of the sessions that a live Claude Code process on this
+        host has.
+
+        Claude Code writes `<config dir>/sessions/<pid>.json` for each
+        process, with the session id and the process start time (field 22 of
+        /proc/<pid>/stat), so a reused pid does not count."""
+        sessions = self.config_dir / "sessions"
+        if not sessions.is_dir():
+            return []
+        live: list[str] = []
+        for path in sorted(sessions.glob("*.json")):
+            try:
+                record: dict[str, Any] = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            sid = record.get("sessionId")
+            if isinstance(sid, str) and sid not in live and _alive(record):
+                live.append(sid)
+        return live
+
     def is_running(self, session_id: str) -> bool:
         """True if a live Claude Code process on this host can write the
         session's transcript.
@@ -487,6 +553,95 @@ class ClaudeCode:
             except OSError:
                 continue
         return found
+
+    # --- Status ------------------------------------------------------------------
+
+    @staticmethod
+    def in_flight() -> int:
+        """The number of tasks that run in this background job: shells,
+        subagents, Monitors and crons. A hook process has the job's
+        environment. Claude Code says that the job state is not a stable
+        interface, so a missing variable, file or field gives 0."""
+        job_dir = os.environ.get("CLAUDE_JOB_DIR")
+        if not job_dir:
+            return 0
+        try:
+            state: Any = json.loads((Path(job_dir) / "state.json").read_text())
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(state, dict):
+            return 0
+        flight: Any = state.get("inFlight")  # pyright: ignore[reportUnknownMemberType]
+        if not isinstance(flight, dict):
+            return 0
+        tasks: Any = flight.get("tasks")  # pyright: ignore[reportUnknownMemberType]
+        return tasks if type(tasks) is int and tasks > 0 else 0
+
+    @staticmethod
+    def excerpt(transcript: Path) -> str | None:
+        """The text of the agent's last message: the text blocks of the
+        main-chain assistant records after the last prompt, read from the end
+        of the transcript."""
+        try:
+            with open(transcript, "rb") as f:
+                start = max(0, f.seek(0, os.SEEK_END) - _EXCERPT_WINDOW)
+                f.seek(start)
+                data = f.read()
+        except OSError:
+            return None
+        if start:
+            data = data[data.find(b"\n") + 1 :]
+        # Claude Code writes each content block of a message as a record.
+        # A tool call or a tool result is between two messages.
+        parts: list[str] = []
+        for record in reversed(_records(data)):
+            if is_prompt(record):
+                break
+            if record.get("type") == "user" and parts:
+                break
+            if not _is_assistant(record):
+                continue
+            if parts and tool_calls(record):
+                break
+            text = _text(record)
+            if text:
+                parts.append(text)
+        if not parts:
+            return None
+        text = "\n\n".join(reversed(parts))
+        if len(text) > MAX_STATUS_EXCERPT:
+            text = text[: MAX_STATUS_EXCERPT - 1] + "…"
+        return text
+
+    @staticmethod
+    def format_tail(data: bytes, turns: int) -> str:
+        """The last `turns` turns of a transcript, as text: each prompt and
+        each message of the agent in full, and one line for each tool call.
+        `data` can start in the middle of a record."""
+        records = _records(data)
+        starts = [i for i, r in enumerate(records) if is_prompt(r)]
+        first = starts[-turns] if 0 < turns <= len(starts) else 0
+        lines: list[str] = []
+        for record in records[first:]:
+            if is_prompt(record):
+                stamp = record.get("timestamp")
+                head = f"> user ({stamp})" if isinstance(stamp, str) else "> user"
+                lines += ["", head, _text(record)]
+            elif _is_assistant(record):
+                text = _text(record)
+                if text:
+                    lines += ["", text]
+                lines += [
+                    _tool_line(b)
+                    for b in _blocks(record)
+                    if b.get("type") == "tool_use"
+                ]
+        return "\n".join(lines).strip("\n")
+
+    @staticmethod
+    def prompts(data: bytes) -> int:
+        """The number of prompts in `data`."""
+        return sum(1 for r in _records(data) if is_prompt(r))
 
     @staticmethod
     def fork_records(data: bytes, old_id: str, new_id: str) -> bytes:

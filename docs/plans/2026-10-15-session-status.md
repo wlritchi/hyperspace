@@ -494,12 +494,72 @@ recorded in the test module docstring, before the step is done:
    `PostToolUse` fires after the user answers.
 4. A hook process has `CLAUDE_JOB_DIR` in a background job.
 5. A synchronous `PostToolUse` hook's `additionalContext` reaches the model.
+6. A hook process has `CLAUDE_CODE_SESSION_ID`. `notice.sh` uses it for its
+   fast path.
+7. Claude Code lists the plugin's `/done` command and both skills. Prettier
+   wraps their `description` over several lines, which is valid YAML.
 
 Live checks use the real `~/.claude`, because the Claude Code credentials are
 there. Follow the memory note on the live test hazard: use a throwaway server,
 make the sweep a no-op (pre-set `last_sweep` in the test state, or a
 `HYPERSPACE_CLI` wrapper that drops `--all`), and afterwards check that every
 session in `~/.claude/projects` is still there.
+
+The step 2 code does not depend on one answer where that is cheap. All
+assumptions 1 to 3 are in `status.transition`:
+
+- Fact 1: a `PreToolUse` with the status `ready` or `waiting`, and no
+  declaration in the turn, also sets `working`. Thus a turn that a cron starts
+  shows as `working` also with no `UserPromptSubmit`. But only a prompt
+  reopens a `done` session: if a cron turn fires no `UserPromptSubmit`, a cron
+  does not reopen it (U5).
+- Fact 2: with a different payload, a permission prompt does not set `ready`;
+  the turn stays `working`.
+- Fact 4: without `CLAUDE_JOB_DIR`, the Stop hook sets `ready`, not `waiting`
+  with wake `local`.
+- Fact 6: without `CLAUDE_CODE_SESSION_ID`, `notice.sh` runs the CLI when any
+  session has a flag, and the CLI reads the session from the hook's JSON.
+
+These seven checks are open. The user does them, because they need live Claude
+Code sessions.
+
+### Step 2 as built
+
+The code follows this step, with these changes and additions:
+
+- A queued write keeps `base_seq`: the `seq` of the status that the hook saw.
+  The sync sends it on that base, not on the newest status that the sync saw
+  in the append responses. Otherwise a stale `working` would write over a
+  `done` from outside, because the append response tells the client of the
+  `done` before the queued write goes out.
+- An automatic write that gets `409 stale_status` tries once more only when
+  the current event is an automatic write of this host (two hooks of one
+  session during one sync). An explicit write tries once more, but an agent's
+  write does not write over an explicit `done` from someone else; the CLI then
+  exits 1 and the agent gets the notice.
+- If the current status is `done`, only `UserPromptSubmit` writes.
+- Events with `agent_id` (a subagent's tool calls) do not change the status.
+- `turn_declared` is cleared at `Stop` and at `UserPromptSubmit`, so that a
+  declaration lasts one turn also when a turn starts with no prompt.
+- The sync, not the hook, reads the excerpt, when it sends the write. The
+  excerpt is the text of the last message: the text blocks after the last tool
+  call or tool result.
+- `notice.sh` runs `hyperspace hook --notices`, which only prints the notices.
+  The flag file is `$XDG_STATE_HOME/hyperspace/notify/<session id>`.
+- `hyperspace ls --status STATUS` (repeatable) shows sessions with a status,
+  for example `done` sessions that are not closed, which `--open` leaves out.
+  `hyperspace status` with no `STATUS` shows the status and the liveness.
+  `hyperspace tail` takes the current session when no id is given.
+- A CLI write for a different session that has a local copy also saves the
+  event in that session's local record.
+- The test dependencies have no `pytest-mock`. The send and retry tests use
+  the in-process server instead of mocks. `tests/conftest.py` removes
+  `CLAUDE_CODE_SESSION_ID` and `CLAUDE_JOB_DIR`, so that the tests behave the
+  same inside a Claude Code session.
+- Test names: the stale-write tests are in `test_e2e_client_status.py`
+  (`test_remote_done_is_not_overwritten`,
+  `test_agent_does_not_write_over_an_outside_done`,
+  `test_status_cli_defaults_to_env_session`).
 
 ### Tests
 

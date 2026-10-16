@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from hyperspace_client.config import Config
-from hyperspace_client.hooks import handle
+from hyperspace_client.hooks import handle, notices
 from hyperspace_client.state import State
 
 SID = "11111111-1111-1111-1111-111111111111"
@@ -105,7 +105,7 @@ def test_user_prompt_prints_notices(cfg: Config) -> None:
 @pytest.mark.parametrize(
     "payload",
     [
-        {"hook_event_name": "Notification"},
+        {"hook_event_name": "SubagentStart"},
         {"hook_event_name": "SomeFutureEvent"},
         {"hook_event_name": "Stop", "transcript_path": "/not-a-session.txt"},
         {"hook_event_name": "Stop", "transcript_path": ""},
@@ -140,3 +140,47 @@ def test_hook_command_never_fails(tmp_path: Path) -> None:
         )
         assert done.returncode == 0, done.stderr
         assert done.stdout == "" and done.stderr == ""
+
+
+def test_hook_records_wanted_status(cfg: Config) -> None:
+    _, started = run(cfg, hook_event_name="UserPromptSubmit")
+    assert started[0][:3] == ["--quiet", "sync", "--checkpoint"]
+    state = State(cfg.state_dir)
+    queued = state.wanted_status("claude-code", SID)
+    assert queued is not None
+    assert queued[0]["status"] == "working" and queued[0]["base_seq"] == 0
+    state.close()
+    run(cfg, hook_event_name="Stop")
+    state = State(cfg.state_dir)
+    queued = state.wanted_status("claude-code", SID)
+    assert queued is not None and queued[0]["reason"] == "idle"
+    state.close()
+
+
+def test_notification_event_is_handled(cfg: Config) -> None:
+    out, started = run(
+        cfg, hook_event_name="Notification", notification_type="permission_prompt"
+    )
+    assert out == ""
+    assert started[0][-2:] == ["--event", "Notification"]
+    state = State(cfg.state_dir)
+    queued = state.wanted_status("claude-code", SID)
+    assert queued is not None and queued[0]["reason"] == "asked"
+    state.close()
+
+
+def test_notices_mode(cfg: Config) -> None:
+    payload = {"hook_event_name": "PostToolUse", "transcript_path": TRANSCRIPT}
+    assert notices(payload, cfg) == ""
+    state = State(cfg.state_dir)
+    state.add_notice("claude-code", SID, "status", "[hyperspace] marked done")
+    state.close()
+    out = json.loads(notices(payload, cfg))
+    assert out == {
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "[hyperspace] marked done",
+        }
+    }
+    assert notices(payload, cfg) == ""
+    assert not (cfg.state_dir / "notify" / SID).exists()

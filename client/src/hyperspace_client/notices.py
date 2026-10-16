@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 
+from hyperspace_client import status
 from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import ApiError
@@ -239,6 +240,7 @@ def refresh_states(ctx: Context, adapter: ClaudeCode) -> int:
                 record.lease_state, record.lease_host, record.state = new
                 record.state_updated = time.time()
                 ctx.state.save_session(record)
+            status.observe(ctx.state, record, summary["state"].get("status"), ctx.host)
             if _problem(record, ctx.host) is None:
                 continue
             # Also for a state that did not change: a session that ran during an

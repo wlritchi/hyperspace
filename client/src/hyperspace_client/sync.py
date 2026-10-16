@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+from hyperspace_client import status
 from hyperspace_client.adapters import Adapter, LocalFile, LocalSession
 from hyperspace_client.api import Api, ApiError, AppendConflict
 from hyperspace_client.state import (
@@ -545,10 +546,14 @@ class Syncer:
         fields = ("workspace", "transcript", "metadata", "sent_metadata")
         if self.result.session is not None:
             _note_session_state(record, self.result.session, self.ctx.host)
+            status.observe(
+                state, record, self.result.session.get("status"), self.ctx.host
+            )
             fields += (*LEASE_FIELDS, "held_lease")
         # Only the columns that this sync sets: a hook that does not hold the
         # lock can save a newer lease state during the sync.
         state.save_session(record, fields)
+        status.send_wanted(self.ctx, self.session)
         return self.result
 
 

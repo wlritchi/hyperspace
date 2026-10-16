@@ -12,6 +12,10 @@ client. See "Plugin" in the spec.
 | Other events in `CHECKPOINT_EVENTS` | Start a checkpoint                   |
 | Any other event            | Nothing                                       |
 
+Events in `STATUS_EVENTS` also queue a status write (see `status.py`), which
+the checkpoint sends. With `--notices`, the hook only prints the pending
+notices for the agent, for the plugin's synchronous PostToolUse hook.
+
 Checkpoints and sweeps run in a detached process, so that the hook returns
 at once and the work outlives the session.
 """
@@ -37,6 +41,7 @@ from hyperspace_client.notices import (
     session_start_notice,
 )
 from hyperspace_client.state import State
+from hyperspace_client.status import STATUS_EVENTS, on_hook
 from hyperspace_client.sync import Context
 
 log = logging.getLogger("hyperspace")
@@ -52,6 +57,7 @@ CHECKPOINT_EVENTS = frozenset(
         "PostCompact",
         "Stop",
         "SessionEnd",
+        "Notification",
     }
 )
 SWEEP_EVERY = "3600"
@@ -91,6 +97,17 @@ def handle(payload: dict[str, Any], cfg: Config, start: Detach = detach) -> str:
     session = adapter.session_for_transcript(Path(transcript))
     if session is None:
         return ""
+    if event in STATUS_EVENTS:
+        state = State(cfg.state_dir)
+        try:
+            on_hook(state, adapter, session.harness, session.session_id, event, payload)
+        except Exception as exc:  # noqa: BLE001
+            # The status must not stop the backup.
+            log.warning(
+                "%s: status: %s: %s", session.session_id, type(exc).__name__, exc
+            )
+        finally:
+            state.close()
 
     # At a session start or resume, the user is there to answer a passphrase
     # prompt, so these syncs can read the keyring (see "Credentials").
@@ -143,3 +160,28 @@ def handle(payload: dict[str, Any], cfg: Config, start: Detach = detach) -> str:
             return json.dumps(decision)
         return "\n\n".join(notices)
     return ""
+
+
+def notices(payload: dict[str, Any], cfg: Config) -> str:
+    """The pending notices of the session, as additional context for the
+    agent, or "" if there are none."""
+    transcript = _str(payload, "transcript_path")
+    session = (
+        ClaudeCode().session_for_transcript(Path(transcript)) if transcript else None
+    )
+    if session is None:
+        return ""
+    state = State(cfg.state_dir)
+    try:
+        texts = state.take_notices(session.harness, session.session_id)
+    finally:
+        state.close()
+    if not texts:
+        return ""
+    output = {
+        "hookSpecificOutput": {
+            "hookEventName": _str(payload, "hook_event_name") or "PostToolUse",
+            "additionalContext": "\n\n".join(texts),
+        }
+    }
+    return json.dumps(output)

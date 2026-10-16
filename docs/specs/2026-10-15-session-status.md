@@ -421,12 +421,16 @@ The CLI gives the overview stories their commands:
 - `hyperspace ls --open [--json]`: every session that is not `done`, with
   status, reason or wake kind, note, source, liveness, host, workspace, title,
   last activity, and excerpt (O1, U1, U2).
-- `hyperspace tail <sid> [-n N]`: the last N turns of the active branch. The
+- `hyperspace ls --status STATUS`: sessions with a status (repeatable), for
+  example `done` to find sessions that are done but not closed.
+- `hyperspace tail [<sid>] [-n N]`: the last N turns of the active branch. The
   adapter formats the records on the client (O2).
-- `hyperspace status <sid> <status> [--note TEXT] [--wake KIND]`, with the
-  short forms `hyperspace done <sid>...` and `hyperspace reopen <sid>` (U4,
-  O3). With no session id, the command applies to the current session, from
-  `CLAUDE_CODE_SESSION_ID` (A1, A2).
+- `hyperspace status [STATUS] [--session SID] [--reason R] [--wake W] [--note TEXT] [--by-user]`,
+  with the short forms `hyperspace done [<sid>...]` and
+  `hyperspace reopen <sid>` (U4, O3). With no `STATUS`, it shows the status.
+  With no session id, the command applies to the current session, from
+  `CLAUDE_CODE_SESSION_ID` (A1, A2). The source is `agent` when the command
+  runs in a Claude Code session, and `user` otherwise or with `--by-user`.
 
 The plugin adds:
 

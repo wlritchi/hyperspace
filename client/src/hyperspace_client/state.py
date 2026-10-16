@@ -85,7 +85,23 @@ CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS wanted_status (
+    harness TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created REAL NOT NULL,
+    PRIMARY KEY (harness, session_id)
+);
 """
+# Columns added after the first release, with their definitions.
+_SESSION_COLUMNS = {
+    "held_lease": "INTEGER NOT NULL DEFAULT 0",
+    "status": "TEXT",
+    "turn_declared": "INTEGER NOT NULL DEFAULT 0",
+    "done_seen": "REAL",
+}
+# Wait between two tries for a lock that another process holds.
+_LOCK_POLL = 0.1
 
 
 @dataclass
@@ -129,6 +145,12 @@ class SessionRecord:
     # True after the client saw this host hold the lease. Only a host
     # that held the lease and lost it moves its local copy aside.
     held_lease: bool = False
+    # The latest status event that the client saw from the server.
+    status: dict[str, Any] | None = None
+    # True after an explicit status write from the agent in the current turn.
+    turn_declared: bool = False
+    # The time when the client first saw the status `done`.
+    done_seen: float | None = None
 
 
 # The columns that the server's session state sets.
@@ -151,10 +173,9 @@ class State:
         # Legacy cursors have no trustworthy server identity. Leave their
         # table untouched, but never reuse them: sync adopts remote bytes.
         columns = {r[1] for r in self._db.execute("PRAGMA table_info(sessions)")}
-        if "held_lease" not in columns:
-            self._db.execute(
-                "ALTER TABLE sessions ADD COLUMN held_lease INTEGER NOT NULL DEFAULT 0"
-            )
+        for name, definition in _SESSION_COLUMNS.items():
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE sessions ADD COLUMN {name} {definition}")
         self._db.commit()
 
     def close(self) -> None:
@@ -181,6 +202,17 @@ class State:
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+    @contextmanager
+    def lock(self, harness: str, session_id: str, timeout: float) -> Iterator[bool]:
+        """As `try_lock`, but wait at most `timeout` seconds for the lock."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self.try_lock(harness, session_id) as locked:
+                if locked or time.monotonic() >= deadline:
+                    yield locked
+                    return
+            time.sleep(_LOCK_POLL)
 
     # --- Cursors -------------------------------------------------------------
 
@@ -302,6 +334,9 @@ class State:
             sent_metadata=json.loads(row["sent_metadata"]),
             last_placement=row["last_placement"],
             held_lease=bool(row["held_lease"]),
+            status=json.loads(row["status"]) if row["status"] else None,
+            turn_declared=bool(row["turn_declared"]),
+            done_seen=row["done_seen"],
         )
 
     def save_session(
@@ -322,6 +357,9 @@ class State:
             "sent_metadata": json.dumps(record.sent_metadata),
             "last_placement": record.last_placement,
             "held_lease": int(record.held_lease),
+            "status": json.dumps(record.status) if record.status else None,
+            "turn_declared": int(record.turn_declared),
+            "done_seen": record.done_seen,
         }
         if fields is None:
             if record == self.session(record.harness, record.session_id):
@@ -397,7 +435,15 @@ class State:
         body: dict[str, Any] = json.loads(row[1])
         return body
 
+    def notice_flag(self, session_id: str) -> Path:
+        """A file that exists while the session has notices to deliver. The
+        plugin's notice hook checks it with no Python process."""
+        return self.directory / "notify" / session_id
+
     def add_notice(self, harness: str, session_id: str, kind: str, text: str) -> None:
+        flag = self.notice_flag(session_id)
+        flag.parent.mkdir(exist_ok=True)
+        flag.touch()
         with self._db:
             exists = self._db.execute(
                 "SELECT 1 FROM notices WHERE harness = ? AND session_id = ? "
@@ -412,6 +458,9 @@ class State:
                 )
 
     def take_notices(self, harness: str, session_id: str) -> list[str]:
+        # Remove the flag first: a notice that arrives during the read keeps
+        # a new flag.
+        self.notice_flag(session_id).unlink(missing_ok=True)
         with self._db:
             rows = self._db.execute(
                 "SELECT id, text FROM notices WHERE harness = ? AND session_id = ? "
@@ -423,6 +472,47 @@ class State:
                     "UPDATE notices SET delivered = 1 WHERE id = ?", (r[0],)
                 )
         return [str(r[1]) for r in rows]
+
+    # --- Wanted status -------------------------------------------------------------
+
+    def want_status(self, harness: str, session_id: str, body: dict[str, Any]) -> None:
+        """Queue a status write. It replaces a write that is still queued."""
+        with self._db:
+            self._db.execute(
+                "INSERT OR REPLACE INTO wanted_status VALUES (?, ?, ?, ?)",
+                (harness, session_id, json.dumps(body), time.time()),
+            )
+
+    def wanted_status(
+        self, harness: str, session_id: str
+    ) -> tuple[dict[str, Any], float] | None:
+        """The queued status write and the time it was queued."""
+        row = self._db.execute(
+            "SELECT body, created FROM wanted_status WHERE harness = ? AND session_id = ?",
+            (harness, session_id),
+        ).fetchone()
+        if row is None:
+            return None
+        body: dict[str, Any] = json.loads(row[0])
+        return body, float(row[1])
+
+    def drop_wanted_status(
+        self, harness: str, session_id: str, created: float | None = None
+    ) -> None:
+        """Remove the queued write. With `created`, remove it only if no newer
+        write replaced it."""
+        with self._db:
+            if created is None:
+                self._db.execute(
+                    "DELETE FROM wanted_status WHERE harness = ? AND session_id = ?",
+                    (harness, session_id),
+                )
+            else:
+                self._db.execute(
+                    "DELETE FROM wanted_status WHERE harness = ? AND session_id = ? "
+                    "AND created <= ?",
+                    (harness, session_id, created),
+                )
 
     # --- Key-value ---------------------------------------------------------------
 

@@ -11,8 +11,10 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any, cast
 
 import httpx
 
@@ -20,15 +22,25 @@ from hyperspace_client import config as config_mod
 from hyperspace_client import credentials
 from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
-from hyperspace_client.api import Api, ApiError
+from hyperspace_client.api import Api, ApiError, NotFound
 from hyperspace_client.checkpoint import checkpoint
 from hyperspace_client.config import Config, ConfigError
 from hyperspace_client.credentials import CredentialError
-from hyperspace_client.hooks import handle
+from hyperspace_client.hooks import handle, notices
 from hyperspace_client.notices import after_sync, refresh_states
 from hyperspace_client.state import State
+from hyperspace_client.status import clean_note, seq, write
 from hyperspace_client.sync import Context, Syncer, register_host
 from hyperspace_client.teleport import TeleportError, fork, restore, send
+from hyperspace_protocol import (
+    CAP_SESSION_STATUS,
+    SessionStateBody,
+    SessionSummary,
+    StatusEvent,
+    ValidationError,
+    validate_session_id,
+    validate_status_request,
+)
 
 log = logging.getLogger("hyperspace")
 # Before logging is set up (for example, on a bad config file), a warning
@@ -40,6 +52,14 @@ _START_EVENTS = ("SessionStart",)
 # Errors that apply to the credential, not to one session, so that the next
 # session of a sweep gets the same error.
 CREDENTIAL_ERRORS = frozenset({"unauthorized", "forbidden", "rate_limited"})
+# Claude Code sets this in the environment of the session's tools and hooks.
+SESSION_ENV = "CLAUDE_CODE_SESSION_ID"
+# The longest wait for the sync lock of the current session.
+STATUS_LOCK_WAIT = 10.0
+# `tail` reads the end of a transcript in windows that start at this size.
+TAIL_WINDOW = 512 * 1024
+# The order of `ls --open`: sessions that need the user first.
+_RANK = {"ready": 0, "interrupted": 1, "stalled": 1, "working": 2, "waiting": 3}
 
 
 class Exit(Exception):
@@ -262,7 +282,8 @@ def cmd_hook(args: argparse.Namespace, cfg: Config) -> int:
     try:
         payload = json.load(sys.stdin)
         if isinstance(payload, dict):
-            text = handle(payload, cfg)  # pyright: ignore[reportUnknownArgumentType]
+            body = cast(dict[str, Any], payload)
+            text = notices(body, cfg) if args.notices else handle(body, cfg)
             if text:
                 print(text)
     except Exception as exc:  # noqa: BLE001
@@ -278,18 +299,118 @@ def _print_table(rows: list[list[str]]) -> None:
         print("  ".join(c.ljust(w) for c, w in zip(r, widths, strict=True)).rstrip())
 
 
+def _time(value: str) -> float:
+    return datetime.fromisoformat(value).timestamp()
+
+
+def _age(seconds: float) -> str:
+    for size, unit in ((86_400, "d"), (3600, "h"), (60, "m")):
+        if seconds >= size:
+            return f"{int(seconds // size)}{unit}"
+    return f"{max(0, int(seconds))}s"
+
+
+def _event_label(event: StatusEvent | None) -> str:
+    if event is None:
+        return "-"
+    return ":".join(
+        str(x) for x in (event["status"], event.get("reason"), event.get("wake")) if x
+    )
+
+
+def status_label(state: SessionStateBody, now: float, stalled_after: float) -> str:
+    """The STATUS column: the status, or a state that combines status and
+    liveness (see "Liveness" in the session status spec)."""
+    event = state.get("status")
+    live = state.get("liveness")
+    label = _event_label(event)
+    if live is not None and event is not None:
+        blocked = live.get("close_blocked")
+        if event["status"] == "done" and blocked:
+            return f"done, not closed: {blocked}"
+        if event["status"] == "working" and live["state"] == "stopped":
+            return "interrupted"
+        last = state.get("last_append")
+        if (
+            event["status"] == "working"
+            and live["state"] == "live"
+            and last is not None
+            and now - _time(last) > stalled_after
+        ):
+            return "stalled"
+    if live is not None and live["state"] == "unknown":
+        return f"{label}, unknown since {live['since'][11:16]}"
+    return label
+
+
+def _rank(summary: SessionSummary, label: str) -> int:
+    word = label.split(":", 1)[0].split(",", 1)[0]
+    if word == "-":
+        return 4
+    return _RANK.get(word, 5)
+
+
+def _note(summary: SessionSummary) -> str:
+    event = summary["state"].get("status")
+    note = (event or {}).get("note") or (summary.get("excerpt") or "")
+    lines = note.strip().splitlines()
+    return lines[0][:80] if lines else ""
+
+
+def _print_status_table(sessions: list[SessionSummary], stalled_after: float) -> None:
+    now = time.time()
+    rows: list[tuple[int, float, list[str]]] = []
+    for s in sessions:
+        state = s["state"]
+        label = status_label(state, now, stalled_after)
+        live = state.get("liveness")
+        lease = state["lease"]
+        host = (
+            live["host"]
+            if live is not None and live["state"] == "live"
+            else lease.get("host", "-")
+        )
+        last = state.get("last_append")
+        when = _time(last) if last else 0.0
+        rows.append(
+            (
+                _rank(s, label),
+                -when,
+                [
+                    s["session_id"],
+                    label,
+                    f"{host}:{s['metadata'].get('workspace', '-')}",
+                    _age(now - when) if last else "-",
+                    (s["metadata"].get("title") or "")[:40],
+                    _note(s),
+                ],
+            )
+        )
+    rows.sort(key=lambda r: (r[0], r[1]))
+    header = ["SESSION", "STATUS", "WHERE", "AGE", "TITLE", "NOTE"]
+    _print_table([header] + [r[2] for r in rows])
+
+
 def cmd_ls(args: argparse.Namespace, cfg: Config) -> int:
     url, token = cfg.require_server()
+    with_status = args.open or bool(args.status)
     with Api(url, token) as api:
+        if with_status:
+            api.require_capability(CAP_SESSION_STATUS)
         sessions = api.sessions(
             harness=args.harness or "",
             host=args.host or "",
             workspace=args.workspace or "",
             title=args.title or "",
             limit=str(args.limit),
+            open="1" if args.open else "",
+            status=args.status or [],
         )
     if args.json:
         print(json.dumps(sessions, indent=2))
+        return 0
+    if with_status:
+        _print_status_table(sessions, args.stalled_after * 60)
         return 0
     rows = [["SESSION", "LEASE", "STATE", "LAST ACTIVE", "WORKSPACE", "TITLE"]]
     for s in sessions:
@@ -345,6 +466,209 @@ def cmd_show(args: argparse.Namespace, cfg: Config) -> int:
         print("conflicting branches:")
         for b in branches:
             print(f"  {b['generation']}  {b['host']}  activity {b['activity']}")
+    return 0
+
+
+def _target(session: str | None) -> str:
+    """The session to act on: the argument, else the current session."""
+    sid = session or os.environ.get(SESSION_ENV)
+    if not sid:
+        raise Exit(2, f"give a session id; {SESSION_ENV} is not set")
+    try:
+        return validate_session_id(sid)
+    except ValidationError as exc:
+        raise Exit(2, str(exc)) from None
+
+
+def _request(
+    status: str,
+    sid: str,
+    *,
+    reason: str | None,
+    wake: str | None,
+    note: str | None,
+    by_user: bool,
+) -> dict[str, Any]:
+    """An explicit status write from the CLI. The source is the agent when
+    the command runs in a Claude Code session, unless `by_user` is set."""
+    current = os.environ.get(SESSION_ENV)
+    if status == "ready" and reason is None:
+        reason = "idle"
+    body: dict[str, Any] = {
+        "status": status,
+        "source_kind": "agent" if current and not by_user else "user",
+        "explicit": True,
+        "base_seq": 0,
+    }
+    if reason is not None:
+        body["reason"] = reason
+    if wake is not None:
+        body["wake"] = wake
+    note = clean_note(note)
+    if note is not None:
+        body["note"] = note
+    if current and current != sid:
+        body["source_session"] = current
+    try:
+        validate_status_request(body)
+    except ValidationError as exc:
+        raise Exit(2, str(exc)) from None
+    del body["base_seq"]
+    return body
+
+
+def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent | None:
+    """Write an explicit status. For the current session, hold its sync lock
+    (or wait for it a short time), replace any queued write, and mark the
+    turn as declared, so that the Stop hook keeps this status. Return the
+    event, or None if the write was dropped or queued."""
+    harness = ClaudeCode.harness
+    state = ctx.state
+    if sid != os.environ.get(SESSION_ENV):
+        base = seq(ctx.api.state(harness, sid).get("status"))
+        # A session with a copy on this host keeps its saved status current,
+        # so that its hooks base their writes on this event.
+        local = state.session(harness, sid)
+        return write(
+            ctx, harness, sid, request, base, local if local.transcript else None
+        )
+    with state.lock(harness, sid, STATUS_LOCK_WAIT):
+        state.drop_wanted_status(harness, sid)
+        record = state.session(harness, sid)
+        try:
+            event = write(ctx, harness, sid, request, seq(record.status), record)
+        except NotFound:
+            # The server does not have the session yet. The next sync sends
+            # the write.
+            state.want_status(harness, sid, {**request, "base_seq": 0})
+            event = None
+        record = state.session(harness, sid)
+        record.turn_declared = True
+        state.save_session(record)
+        return event
+
+
+def _status_line(event: StatusEvent) -> str:
+    source = event["source"]
+    by = f"{source['kind']} on {source['host']}"
+    if "session_id" in source:
+        by += f" (session {source['session_id']})"
+    note = event.get("note")
+    note = f": {note}" if note else ""
+    return f"{_event_label(event)}{note} [{by}, {event['received'][:16]}]"
+
+
+def _write_all(
+    cfg: Config, sids: list[str], request: dict[str, Any], args: argparse.Namespace
+) -> int:
+    def run(ctx: Context, adapter: ClaudeCode) -> int:
+        ctx.api.require_capability(CAP_SESSION_STATUS)
+        failed = 0
+        for sid in sids:
+            event = set_status(ctx, sid, request)
+            if event is None and ctx.state.wanted_status(adapter.harness, sid):
+                print(f"{sid}: queued {request['status']} until the next sync")
+            elif event is None:
+                current = ctx.api.state(adapter.harness, sid).get("status")
+                print(
+                    f"{sid}: not changed; the status is "
+                    f"{_status_line(current) if current else 'unset'}",
+                    file=sys.stderr,
+                )
+                failed += 1
+            elif getattr(args, "json", False):
+                print(json.dumps(event))
+            else:
+                print(f"{sid}: {_status_line(event)}")
+        return 1 if failed else 0
+
+    return _with_context(cfg, run)
+
+
+def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
+    sid = _target(args.session)
+    if args.status is None:
+        url, token = cfg.require_server()
+        with Api(url, token) as api:
+            api.require_capability(CAP_SESSION_STATUS)
+            state = api.state(ClaudeCode.harness, sid)
+        if args.json:
+            print(json.dumps(state, indent=2))
+            return 0
+        event = state.get("status")
+        print(_status_line(event) if event else "no status")
+        live = state.get("liveness")
+        if live is not None:
+            print(f"liveness  {live['state']} on {live['host']} since {live['since']}")
+            blocked = live.get("close_blocked")
+            if blocked:
+                print(f"not closed: {blocked}")
+        return 0
+    request = _request(
+        args.status,
+        sid,
+        reason=args.reason,
+        wake=args.wake,
+        note=args.note,
+        by_user=args.by_user,
+    )
+    return _write_all(cfg, [sid], request, args)
+
+
+def cmd_done(args: argparse.Namespace, cfg: Config) -> int:
+    sids = [_target(s) for s in args.sessions] or [_target(None)]
+    code = 0
+    for sid in sids:
+        request = _request(
+            "done", sid, reason=None, wake=None, note=args.note, by_user=args.by_user
+        )
+        code = max(code, _write_all(cfg, [sid], request, args))
+    return code
+
+
+def cmd_reopen(args: argparse.Namespace, cfg: Config) -> int:
+    sid = _target(args.session)
+    request = _request(
+        "ready", sid, reason="idle", wake=None, note=args.note, by_user=args.by_user
+    )
+    return _write_all(cfg, [sid], request, args)
+
+
+def tail(api: Api, sid: str, turns: int) -> str:
+    """The last `turns` turns of the active branch of a session's
+    transcript. Read only the end of the transcript, in growing windows."""
+    manifest = api.manifest(ClaudeCode.harness, sid)
+    entry = next(
+        (
+            f
+            for f in manifest["files"]
+            if f["path"] == "transcript.jsonl" and f["kind"] == "log"
+        ),
+        None,
+    )
+    if entry is None or entry["kind"] != "log":
+        raise Exit(1, f"{sid} has no transcript on the server")
+    active = entry["active"]
+    length = next(g["length"] for g in entry["generations"] if g["id"] == active)
+    window = TAIL_WINDOW
+    while True:
+        start = max(0, length - window)
+        data = api.read_log(ClaudeCode.harness, sid, active, start, length)
+        # The first record of a window is incomplete, so a window must hold
+        # one prompt more than the turns to show.
+        if start == 0 or ClaudeCode.prompts(data) > turns:
+            break
+        window *= 4
+    if start:
+        data = data[data.find(b"\n") + 1 :]
+    return ClaudeCode.format_tail(data, turns)
+
+
+def cmd_tail(args: argparse.Namespace, cfg: Config) -> int:
+    sid = _target(args.session)
+    url, token = cfg.require_server()
+    with Api(url, token) as api:
+        print(tail(api, sid, args.n))
     return 0
 
 
@@ -507,7 +831,56 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--title", help="text in the title")
     p.add_argument("--limit", type=int, default=50)
     p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--open", action="store_true", help="only sessions that are not done"
+    )
+    p.add_argument(
+        "--status",
+        action="append",
+        choices=["working", "waiting", "ready", "done", "none"],
+        help="only sessions with this status (repeatable)",
+    )
+    p.add_argument(
+        "--stalled-after",
+        type=float,
+        default=30,
+        metavar="MINUTES",
+        help="show a live working session with no append for this long as stalled",
+    )
     p.set_defaults(func=cmd_ls)
+
+    p = sub.add_parser(
+        "status", help="show or set the status of a session (default: this session)"
+    )
+    p.add_argument("status", nargs="?", choices=["working", "waiting", "ready", "done"])
+    p.add_argument("--session", help=f"the session (default: ${SESSION_ENV})")
+    p.add_argument("--reason", choices=["asked", "idle"], help="with ready")
+    p.add_argument("--wake", choices=["local", "message"], help="with waiting")
+    p.add_argument(
+        "--note", help="one line: what the session waits for, or the outcome"
+    )
+    p.add_argument(
+        "--by-user", action="store_true", help="the user sets the status, not the agent"
+    )
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("done", help="mark sessions done (default: this session)")
+    p.add_argument("sessions", nargs="*", metavar="SESSION")
+    p.add_argument("--note", help="one line: the outcome")
+    p.add_argument("--by-user", action="store_true")
+    p.set_defaults(func=cmd_done)
+
+    p = sub.add_parser("reopen", help="set a done session back to ready")
+    p.add_argument("session")
+    p.add_argument("--note", help="one line: why")
+    p.add_argument("--by-user", action="store_true")
+    p.set_defaults(func=cmd_reopen)
+
+    p = sub.add_parser("tail", help="print the last turns of a session")
+    p.add_argument("session", nargs="?")
+    p.add_argument("-n", type=int, default=3, help="the number of turns (default 3)")
+    p.set_defaults(func=cmd_tail)
 
     p = sub.add_parser("show", help="show a session: lease, placements, branches")
     p.add_argument("session")
@@ -558,6 +931,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "hook", help="harness hooks: read the hook's JSON on stdin and act on it"
+    )
+    p.add_argument(
+        "--notices",
+        action="store_true",
+        help="only print the session's pending notices for the agent",
     )
     p.set_defaults(func=cmd_hook)
     return parser

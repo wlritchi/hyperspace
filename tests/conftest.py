@@ -1,6 +1,7 @@
 # vim: filetype=python
 """Pytest configuration: put lib/ and tests/ on the path, register markers,
-and keep the tests away from the user's keyring and token cache."""
+and keep the tests away from the user's keyring, token cache, and Claude Code
+session."""
 
 import os
 import sys
@@ -31,6 +32,14 @@ def fake_keyring(monkeypatch: pytest.MonkeyPatch) -> MemoryKeyring:
     fake = MemoryKeyring()
     monkeypatch.setattr(keyring.core, "_keyring_backend", fake)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def no_claude_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tests can run inside a Claude Code session, whose variables
+    change the client's behavior."""
+    for name in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_JOB_DIR"):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture(autouse=True)
