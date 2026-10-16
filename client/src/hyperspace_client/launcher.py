@@ -3,7 +3,8 @@
 See "Launcher" in the session status spec. In workstation mode, the
 SessionStart hook starts the launcher, and the launcher stops when no session
 has run for a time. At each tick it sends the host's heartbeat and closes the
-background jobs of `done` sessions.
+background jobs of `done` sessions. In runner mode, it also restores the
+sessions whose lease the host holds, and resumes those that need a process.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import logging
 import os
 import subprocess
 import time
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -25,13 +27,15 @@ import httpx
 
 from hyperspace_client.adapters.claude_code import ClaudeCode, Job
 from hyperspace_client.api import ApiError, NotFound
+from hyperspace_client.backfill import Runner, run_claude
 from hyperspace_client.state import State
 from hyperspace_client.status import clean_note, printable
 from hyperspace_client.sync import Context
-from hyperspace_client.teleport import TeleportError, back_up
+from hyperspace_client.teleport import TeleportError, back_up, restore_held
 from hyperspace_protocol import (
     MAX_HEARTBEAT_SESSIONS,
     HeartbeatRequest,
+    SessionSummary,
     UnclosedSession,
 )
 
@@ -47,6 +51,22 @@ RECHECK = 900.0
 # `--close-job` waits at most this long for the session's process to stop.
 CLOSE_WAIT = 300.0
 _POLL = 1.0
+# The first message of a session that a runner resumes, by its status.
+RESUME_WORKING = (
+    "[hyperspace] The runner restarted while you worked. Check the state of "
+    "your work, then continue."
+)
+RESUME_WAITING = (
+    "[hyperspace] The runner restarted. Your crons, Monitors and background "
+    "tasks stopped. Set them up again if you still need them, then continue "
+    "to wait."
+)
+# `claude --bg` returns when the daemon has the job.
+RESUME_TIMEOUT = 120.0
+# At most this many resumes of one session in RESUME_WINDOW seconds, so that a
+# session that stops at once is not resumed in a loop.
+MAX_RESUMES = 5
+RESUME_WINDOW = 3600.0
 
 RunRm = Callable[[list[str]], tuple[int, str]]
 
@@ -216,6 +236,28 @@ def close_after_exit(
         record_refusal(ctx.state, job, reason)
 
 
+def needs_process(summary: SessionSummary, host: str, running: bool) -> str | None:
+    """The first message for a resume of a held session on a runner, or None
+    if the session needs no process here (R1 to R3 in the spec)."""
+    state = summary["state"]
+    lease = state["lease"]
+    if running or lease["state"] != "held" or lease.get("host") != host:
+        return None
+    live = state.get("liveness")
+    if live is not None and live["state"] == "live" and live["host"] != host:
+        # A copy runs on a different host. A resume here makes a conflict.
+        return None
+    event = state.get("status")
+    if event is None:
+        # From before the status feature; the backfill gives it a status.
+        return None
+    if event["status"] == "working":
+        return RESUME_WORKING
+    if event["status"] == "waiting" and event.get("wake") == "local":
+        return RESUME_WAITING
+    return None
+
+
 @dataclass
 class Launcher:
     ctx: Context
@@ -227,12 +269,21 @@ class Launcher:
     run_rm: RunRm = run_rm
     # Called before each tick, for example to keep the token cache alive.
     before_tick: Callable[[], None] | None = None
+    # Runner mode: restore and resume the sessions whose lease the host holds.
+    runner: bool = False
+    # More Claude Code options for each resume, from the configuration.
+    claude_args: list[str] = field(default_factory=list[str])
+    # The workspace for a held session that has no workspace of its own.
+    workspace: str = ""
+    run_claude: Runner = run_claude
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
     # Job name to (state.json mtime, time of the last check).
     _checked: dict[str, tuple[float, float]] = field(
         default_factory=dict[str, tuple[float, float]]
     )
+    # Session id to the times of its recent resumes.
+    _resumes: dict[str, deque[float]] = field(default_factory=dict[str, deque[float]])
 
     def sweep(self, live: list[str]) -> None:
         """Close the stopped jobs of `done` sessions."""
@@ -266,20 +317,83 @@ class Launcher:
             if reason is not None:
                 record_refusal(self.ctx.state, job, reason)
 
+    def resume_held(self, live: list[str]) -> None:
+        """Resume the sessions whose lease this host holds and that need a
+        process (runner mode)."""
+        held = self.ctx.api.sessions(
+            harness=self.adapter.harness,
+            lease_host=self.ctx.host,
+            open="1",
+            limit="1000",
+        )
+        for summary in held:
+            sid = summary["session_id"]
+            prompt = needs_process(summary, self.ctx.host, sid in live)
+            if prompt is not None:
+                self.resume(sid, prompt)
+
+    def resume(self, sid: str, prompt: str) -> bool:
+        """Resume a session as a background job, in the workspace that this
+        host recorded for it. Return True if `claude --bg` succeeded."""
+        now = self.clock()
+        recent = self._resumes.setdefault(sid, deque[float]())
+        while recent and now - recent[0] >= RESUME_WINDOW:
+            recent.popleft()
+        if len(recent) >= MAX_RESUMES:
+            log.info("%s: resumed %d times in an hour; not again", sid, len(recent))
+            return False
+        workspace = self.ctx.state.session(self.adapter.harness, sid).workspace
+        # Only a session with a local transcript under this id, so that the
+        # id is a valid file name and `claude --resume` finds the session.
+        if (
+            not workspace
+            or not os.path.isabs(workspace)
+            or not os.path.isdir(workspace)
+            or not self.adapter.find_transcripts(sid)
+        ):
+            log.warning("%s: not resumed: no local copy or no workspace", sid)
+            return False
+        # Claude Code starts a copy under a new id if the session runs.
+        if self.adapter.is_running(sid):
+            return False
+        recent.append(now)
+        argv = [self.claude, *self.claude_args, "--bg", "--resume", sid, prompt]
+        result = self.run_claude(argv, workspace, RESUME_TIMEOUT)
+        if result.returncode == 0:
+            log.info("%s: resumed in %s", sid, workspace)
+            return True
+        first = next(iter(printable(result.output).splitlines()), "")
+        log.warning("%s: resume failed (%s): %s", sid, result.returncode, first)
+        return False
+
     def tick(self) -> list[str]:
-        """One heartbeat and one sweep. Return the live sessions."""
+        """One heartbeat and one sweep, and in runner mode the resumes.
+        Return the live sessions."""
         live = self.adapter.live_sessions()
         try:
             if self.before_tick is not None:
                 self.before_tick()
             send_heartbeat(self.ctx, self.adapter.harness, live, self.interval)
             self.sweep(live)
+            if self.runner:
+                self.resume_held(live)
         except (ApiError, httpx.HTTPError, OSError) as exc:
             # The next tick tries again.
             log.warning("launcher: %s: %s", type(exc).__name__, exc)
         return live
 
+    def boot(self) -> None:
+        """Runner mode: restore the held sessions that have no local copy."""
+        try:
+            restored = restore_held(self.ctx, self.adapter, self.workspace)
+        except (ApiError, httpx.HTTPError, OSError) as exc:
+            log.warning("launcher: restore of held sessions: %s", exc)
+            return
+        log.info("launcher: restored %d held sessions", restored)
+
     def run(self, max_ticks: int | None = None) -> int:
+        if self.runner:
+            self.boot()
         last_live = self.clock()
         ticks = 0
         while max_ticks is None or ticks < max_ticks:

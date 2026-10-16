@@ -54,9 +54,64 @@ env:
     value: runner
 ```
 
-## At boot
+## At boot: the launcher
 
-Two rules keep leases correct across restarts:
+The entrypoint runs `hyperspace launcher --runner` as its main process, in the
+runner's workspace, in place of its own supervisor. See "Launcher" in the
+[session status spec](specs/2026-10-15-session-status.md). The launcher:
+
+1. Restores each session whose lease the runner holds and that has no local
+   copy (the same as `hyperspace restore --held`).
+2. Resumes each held session that needs a process: a session that was
+   `working` when the runner stopped, and a session that is `waiting` for an
+   event that only its process can receive (`wake: local`). It runs
+   `claude <args> --bg --resume <session id> <message>` in the session's
+   workspace, after it checks that the session does not run. The message tells
+   the agent that the runner restarted, and that its crons, Monitors and
+   background tasks stopped.
+3. Does not resume a session that is `ready`, `done`, `waiting` with
+   `wake: message`, or that has no status. The user, or a message, wakes these
+   sessions. Sessions from before the session status feature have no status
+   until the backfill gives them one (`hyperspace backfill-status`).
+4. Each minute: sends the heartbeat, closes the background jobs of `done`
+   sessions with `claude rm`, and resumes again a held session that needs a
+   process and does not run. It resumes one session at most 5 times in an
+   hour.
+
+The launcher never stops when no session runs. A runner with no session that
+needs a process runs only the launcher.
+
+The image must provide:
+
+- The client and the plugin (see "The image"), and `claude` on the `PATH` (or
+  `HYPERSPACE_CLAUDE`).
+- The environment of "Credential and environment", and the Claude Code options
+  for each resume as a JSON list in `HYPERSPACE_LAUNCHER_CLAUDE_ARGS`. Do not
+  put `--bg`, `--resume`, `--continue`, `--fork-session`, `--session-id` or
+  `--print` in it; the launcher refuses them. For example:
+
+  ```yaml
+  - name: HYPERSPACE_LAUNCHER_CLAUDE_ARGS
+    value: >-
+      ["--model", "opus", "--agent", "claude",
+       "--dangerously-load-development-channels",
+       "plugin:notifications@wlr-cc-plugins"]
+  ```
+
+- An entrypoint that starts in the workspace and then runs the launcher:
+
+  ```sh
+  cd "$WORKSPACE_DIR"
+  exec hyperspace launcher --runner
+  ```
+
+The launcher does not yet receive wake requests from subspace. Until it does,
+a message to a stopped session waits until a user or the runner resumes it.
+
+## At boot, with your own supervisor
+
+If the entrypoint keeps its own supervisor, two rules keep leases correct
+across restarts:
 
 1. If the harness config directory does not persist, restore the sessions
    whose lease the runner holds before the agent starts:

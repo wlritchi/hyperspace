@@ -871,6 +871,41 @@ image installs the client and the plugin, and the entrypoint runs
 - [ ] The two facts are confirmed in a throwaway runner pod.
 - [ ] Commit type `feat(client)`.
 
+### Step 5 as built
+
+The code follows this step, with these changes:
+
+- **Restore**: the `restore --held` logic moved from `cli.py` to
+  `teleport.restore_held`, so that the launcher can use it. The launcher's
+  fallback workspace is its working directory.
+- **Decision**: `needs_process(summary, host, running)` returns the first
+  message or None. It also returns None for a lease that is not `held` by this
+  host, and for a session that the server shows as `live` on a different host
+  (a resume there makes a conflict).
+- **Resume**: `Launcher.resume` uses the workspace from the local session
+  record only, never a path from the server, and only for a session with a
+  local transcript under that id (so the id is a valid UUID file name). It
+  checks `is_running` just before the resume. The command is
+  `[claude, *launcher_claude_args, "--bg", "--resume", sid, message]`, with no
+  shell, run by `backfill.run_claude` (no session variables, own process
+  group, a 120 s timeout).
+- **Backoff**: at most 5 resumes of one session in an hour, successful or not,
+  because a session that stops at once after a successful resume also makes a
+  loop. The launcher logs a failure; it sends no reason to the server. The
+  `unclosed` list of the heartbeat is for `done` sessions, and the client
+  shows `close_blocked` only for them.
+- **Config**: `check_claude_args` refuses a list with a non-string or empty
+  entry, and options that the launcher sets (`--bg`, `--background`,
+  `--resume`, `-r`, `--continue`, `-c`, `--fork-session`, `--session-id`,
+  `--print`, `-p`), also in the `--option=value` form.
+- **Docs**: the runner section is in `docs/runners.md` ("At boot: the
+  launcher"), not in a new `docs/launcher.md`.
+- **Tests**: in `tests/test_e2e_launcher.py`, with the step 4 fixtures:
+  `test_needs_process_table`, `test_boot_resumes_interrupted_only`,
+  `test_running_session_is_not_resumed`, `test_resume_limit`,
+  `test_resume_needs_a_local_copy_and_workspace`,
+  `test_boot_restores_held_sessions`, `test_launcher_claude_args_config`.
+
 ## Step 6: outside this repo
 
 - **subspace**: treat the webhook response by HTTP status (2xx accepted, 4xx

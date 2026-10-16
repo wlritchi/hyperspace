@@ -1,7 +1,8 @@
 # vim: filetype=python
-"""The launcher: heartbeats, idle exit, and the close of `done` background
-jobs, against an in-process server. A fake `claude rm` records its calls; the
-real `claude` and the real ~/.claude are never used."""
+"""The launcher: heartbeats, idle exit, the close of `done` background jobs,
+and the resumes in runner mode, against an in-process server. A fake
+`claude rm` and a fake `claude --bg` record their calls; the real `claude` and
+the real ~/.claude are never used."""
 
 from __future__ import annotations
 
@@ -15,19 +16,24 @@ import pytest
 
 from _hs import FakeClaude, Server, make_server, prompt, text_reply
 from hyperspace_client.adapters.claude_code import ClaudeCode
+from hyperspace_client.backfill import RunResult
 from hyperspace_client.cli import _hook_heartbeat, main, status_label
-from hyperspace_client.config import Config
+from hyperspace_client.config import Config, ConfigError, load
 from hyperspace_client.launcher import (
+    MAX_RESUMES,
+    RESUME_WAITING,
+    RESUME_WORKING,
     Launcher,
     close_after_exit,
     close_job,
     host_lock,
     load_unclosed,
+    needs_process,
     run_rm,
 )
 from hyperspace_client.state import State
 from hyperspace_client.sync import Context, Syncer
-from hyperspace_protocol import SessionStateBody
+from hyperspace_protocol import SessionStateBody, SessionSummary
 
 WS = "/home/wlritchi/hyperspace"
 HARNESS = "claude-code"
@@ -334,3 +340,253 @@ def test_run_rm_reports_the_output(monkeypatch: pytest.MonkeyPatch) -> None:
     code, output = run_rm([sys.executable, FAKE, "rm", "aa"])
     assert code == 1
     assert "worktree has unpushed commits" in output
+
+
+# --- Runner mode -------------------------------------------------------------
+
+
+class Bg:
+    """A fake `claude --bg --resume` that records each call and its cwd."""
+
+    def __init__(self, code: int = 0) -> None:
+        self.code = code
+        self.calls: list[tuple[list[str], str]] = []
+
+    def __call__(self, argv: list[str], cwd: str, timeout: float) -> RunResult:
+        self.calls.append((argv, cwd))
+        return RunResult(self.code, "" if self.code == 0 else "no such session")
+
+
+def set_status(ctx: Context, sid: str, status: str, **extra: str) -> None:
+    current = ctx.api.state(HARNESS, sid).get("status")
+    body: dict[str, Any] = {
+        "status": status,
+        "source_kind": "hook",
+        "explicit": False,
+        "base_seq": current["seq"] if current else 0,
+        **extra,
+    }
+    ctx.api.add_status(HARNESS, sid, body)  # pyright: ignore[reportArgumentType]
+
+
+def held_session(ctx: Context, fake: FakeClaude, workspace: Path) -> str:
+    """A session in `workspace`, synced, so that this host holds its lease."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    path = fake.transcript(str(workspace))
+    fake.write(path, prompt("hi"), text_reply())
+    found = ctx.adapter.session_for_transcript(path)
+    assert found is not None
+    Syncer(ctx, found, str(workspace)).run()
+    return found.session_id
+
+
+def runner(ctx: Context, host: Host, bg: Bg, clock: Clock, **kw: Any) -> Launcher:
+    return launcher(
+        ctx,
+        host,
+        Rm(ctx),
+        clock,
+        runner=True,
+        claude_args=kw.pop("claude_args", ["--model", "opus"]),
+        workspace=kw.pop("workspace", "/nonexistent"),
+        run_claude=bg,
+        **kw,
+    )
+
+
+def _summary(
+    status: dict[str, Any] | None,
+    lease: dict[str, Any] | None = None,
+    liveness: dict[str, Any] | None = None,
+) -> SessionSummary:
+    state: dict[str, Any] = {
+        "state": "normal",
+        "lease": lease or {"state": "held", "host": "agent-1", "since": "t"},
+    }
+    if status is not None:
+        state["status"] = {
+            "seq": 1,
+            "source": {"kind": "hook", "host": "agent-1"},
+            "explicit": False,
+            "received": "t",
+            **status,
+        }
+    if liveness is not None:
+        state["liveness"] = liveness
+    return {  # pyright: ignore[reportReturnType]
+        "harness": HARNESS,
+        "session_id": "s1",
+        "metadata": {},
+        "state": state,
+    }
+
+
+@pytest.mark.parametrize(
+    ("summary", "running", "expected"),
+    [
+        (_summary({"status": "working"}), False, RESUME_WORKING),
+        (_summary({"status": "working"}), True, None),
+        (_summary({"status": "waiting", "wake": "local"}), False, RESUME_WAITING),
+        (_summary({"status": "waiting", "wake": "message"}), False, None),
+        (_summary({"status": "ready", "reason": "asked"}), False, None),
+        (_summary({"status": "ready", "reason": "idle"}), False, None),
+        (_summary({"status": "done"}), False, None),
+        (_summary(None), False, None),
+        (
+            _summary(
+                {"status": "working"},
+                lease={"state": "reserved", "host": "agent-1", "since": "t"},
+            ),
+            False,
+            None,
+        ),
+        (
+            _summary(
+                {"status": "working"},
+                lease={"state": "held", "host": "laptop", "since": "t"},
+            ),
+            False,
+            None,
+        ),
+        (
+            _summary(
+                {"status": "working"},
+                liveness={"state": "live", "host": "laptop", "since": "t"},
+            ),
+            False,
+            None,
+        ),
+        (
+            _summary(
+                {"status": "working"},
+                liveness={"state": "stopped", "host": "laptop", "since": "t"},
+            ),
+            False,
+            RESUME_WORKING,
+        ),
+    ],
+)
+def test_needs_process_table(
+    summary: SessionSummary, running: bool, expected: str | None
+) -> None:
+    assert needs_process(summary, "agent-1", running) == expected
+
+
+def test_boot_resumes_interrupted_only(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    ws = tmp_path / "ws"
+    working, local, message, ready, done, unset = (
+        held_session(ctx, fake, ws) for _ in range(6)
+    )
+    set_status(ctx, working, "working")
+    set_status(ctx, local, "waiting", wake="local")
+    set_status(ctx, message, "waiting", wake="message")
+    set_status(ctx, ready, "ready", reason="asked")
+    set_status(ctx, done, "done")
+    bg = Bg()
+    assert runner(ctx, host, bg, Clock()).run(max_ticks=1) == 0
+    calls = {argv[5]: (argv, cwd) for argv, cwd in bg.calls}
+    assert set(calls) == {working, local}
+    argv, cwd = calls[working]
+    assert argv == [
+        "claude",
+        "--model",
+        "opus",
+        "--bg",
+        "--resume",
+        working,
+        RESUME_WORKING,
+    ]
+    assert calls[local][0][-1] == RESUME_WAITING
+    assert cwd == str(ws)
+    assert unset not in calls
+
+
+def test_running_session_is_not_resumed(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    host.live = [sid]
+    bg = Bg()
+    run = runner(ctx, host, bg, Clock())
+    run.tick()
+    assert bg.calls == []
+    # The process stops: the next tick resumes the session.
+    host.live = []
+    run.tick()
+    assert [argv[5] for argv, _ in bg.calls] == [sid]
+
+
+def test_resume_limit(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    bg = Bg(code=1)
+    clock = Clock()
+    run = runner(ctx, host, bg, clock)
+    for _ in range(MAX_RESUMES + 3):
+        run.tick()
+        clock.t += 60
+    assert len(bg.calls) == MAX_RESUMES
+    clock.t += 3600
+    run.tick()
+    assert len(bg.calls) == MAX_RESUMES + 1
+
+
+def test_resume_needs_a_local_copy_and_workspace(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    ws = tmp_path / "ws"
+    sid = held_session(ctx, fake, ws)
+    set_status(ctx, sid, "working")
+    bg = Bg()
+    run = runner(ctx, host, bg, Clock())
+    ws.rmdir()
+    run.tick()
+    assert bg.calls == []
+    ws.mkdir()
+    for path in host.find_transcripts(sid):
+        path.unlink()
+    run.tick()
+    assert bg.calls == []
+
+
+def test_boot_restores_held_sessions(
+    ctx: Context, host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    def restore_held(c: Context, adapter: ClaudeCode, workspace: str) -> int:
+        calls.append(workspace)
+        return 0
+
+    monkeypatch.setattr("hyperspace_client.launcher.restore_held", restore_held)
+    runner(ctx, host, Bg(), Clock(), workspace="/w").run(max_ticks=1)
+    launcher(ctx, host, Rm(ctx), Clock()).run(max_ticks=1)
+    assert calls == ["/w"]
+
+
+def test_launcher_claude_args_config(tmp_path: Path) -> None:
+    none = tmp_path / "none.toml"
+    env = {"HYPERSPACE_LAUNCHER_CLAUDE_ARGS": '["--model", "opus", "--agent", "a"]'}
+    assert load(env, none).launcher_claude_args == ["--model", "opus", "--agent", "a"]
+    assert load({}, none).launcher_claude_args == []
+    toml = tmp_path / "config.toml"
+    toml.write_text('launcher_claude_args = ["--model", "sonnet"]\n')
+    assert load({}, toml).launcher_claude_args == ["--model", "sonnet"]
+    for bad in (
+        "not json",
+        '"--model"',
+        "[1]",
+        '[""]',
+        '["--resume", "x"]',
+        '["--resume=x"]',
+        '["--fork-session"]',
+        '["-p"]',
+        '["--bg"]',
+    ):
+        with pytest.raises(ConfigError):
+            load({"HYPERSPACE_LAUNCHER_CLAUDE_ARGS": bad}, none)
