@@ -426,9 +426,16 @@ most 5 times in an hour, so that a session that stops at once does not start
 in a loop. A runner with no session to resume runs only the launcher.
 
 The resume runs in the workspace that the runner recorded for the session in
-its local state, and only for a session with a local transcript. The first
-message tells the agent that the runner restarted, and, for a `waiting`
-session, that its crons, Monitors and background tasks stopped.
+its local state, and only for a session with a local transcript and no
+pending-restore marker (main spec, "Restore"). A session with an unfinished
+restore resumes after a restore retry completes it. The launcher holds the
+session's sync lock from its checks until `claude --bg` returns, so that no
+restore or sync starts between the checks and the start. If another process
+holds the lock, the launcher tries again at the next tick. The session's
+process does not get the lock, and its hooks do not wait for it without a
+limit, so the hold cannot block the new session. The first message tells the
+agent that the runner restarted, and, for a `waiting` session, that its crons,
+Monitors and background tasks stopped.
 
 The launcher reads the Claude Code options for a resume (model, agent, and
 channels) from `launcher_claude_args`, or from

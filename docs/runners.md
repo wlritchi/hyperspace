@@ -68,12 +68,16 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
    copy (the same as `hyperspace restore --held`). If the server is not
    available, or a restore fails, the launcher tries again at later ticks,
    after 1, 2, 4 minutes and so on, to at most one hour between tries, until a
-   restore has no failure. A session resumes after its restore.
+   restore has no failure. A session resumes after its restore. A session with
+   an unfinished restore (its teleport request is not confirmed) does not
+   resume until a retry completes the restore.
 3. Resumes each held session that needs a process: a session that was
    `working` when the runner stopped, and a session that is `waiting` for an
    event that only its process can receive (`wake: local`). It runs
    `claude <args> --bg --resume <session id> <message>` in the session's
-   workspace, after it checks that the session does not run. It does not
+   workspace, after it checks that the session does not run. It holds the
+   session's sync lock from these checks until `claude --bg` returns, and it
+   does not resume a session while a sync or a restore of it runs. It does not
    resume a session that the server shows as `live` on any host, also on the
    runner itself (for example from a different harness config directory). The
    message tells the agent that the runner restarted, and that its crons,
