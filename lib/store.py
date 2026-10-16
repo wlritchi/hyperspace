@@ -50,6 +50,7 @@ from hyperspace_protocol import (
     StatusEvent,
     StatusRequest,
     TeleportEvent,
+    UnclosedSession,
     ValidationError,
     validate_metadata,
 )
@@ -1500,6 +1501,28 @@ class Store:
                     (session["id"], host, first, now),
                 )
                 recorded += 1
+            unclosed: list[UnclosedSession] = []
+            for item in request.get("unclosed", []):
+                session = self._session_row(
+                    SessionKey(account, item["harness"], item["session_id"])
+                )
+                if session is None or not self._can_read_row(session, host, scope):
+                    continue
+                unclosed.append(item)
+                # A job can stop before any heartbeat lists it. Then the host
+                # has no liveness row for it, and `close_blocked` would not
+                # show. Record it as stopped at its last activity.
+                since = session["last_activity"] or session["created"]
+                if since < now:
+                    self._db.execute(
+                        """
+                        INSERT INTO session_liveness
+                        (session, host, first_listed, last_listed)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT (session, host) DO NOTHING
+                        """,
+                        (session["id"], host, since, since),
+                    )
             self._db.execute(
                 """
                 INSERT INTO host_heartbeats
@@ -1517,7 +1540,7 @@ class Store:
                     now,
                     request["interval"],
                     int(request.get("final", False)),
-                    json.dumps(request.get("unclosed", [])),
+                    json.dumps(unclosed),
                 ),
             )
             return {"received": now, "recorded": recorded}
