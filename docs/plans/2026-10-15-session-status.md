@@ -1046,6 +1046,23 @@ without it.
   `test_launcher_start_fails_at_once_for_a_bad_credential`,
   `test_workstation_launcher_start_does_not_wait`,
   `test_launcher_start_needs_a_server_url`.
+- **Local start errors**: `launcher.temporary` treated each `httpx.HTTPError`
+  other than `UnsupportedProtocol`, and each `OSError`, as temporary. A
+  `HYPERSPACE_TOKEN` with a newline passed the configuration, but each request
+  raised `LocalProtocolError`, so `--runner` and `--stay` tried again for
+  ever. `TooManyRedirects` was also temporary. Now only transport errors are
+  temporary: `TimeoutException` (connect, read, write and pool timeouts),
+  `NetworkError` and `RemoteProtocolError`, and a 5xx, 408 or 429. Other
+  errors, for example `LocalProtocolError`, `UnsupportedProtocol`,
+  `TooManyRedirects`, `ProxyError`, `DecodingError` or a local `OSError`, stop
+  the launcher at once. Also, `config.check_token` refuses a token with a
+  character that is not visible ASCII (a space, a control character, or a
+  character that is not ASCII), from the environment, a token file, the token
+  cache or the keyring. Tests:
+  `test_launcher_start_fails_at_once_for_a_local_error`,
+  `test_temporary_errors`,
+  `test_a_token_with_whitespace_or_a_control_character_is_refused`,
+  `test_a_token_from_the_cache_is_checked`.
 
 ## Step 6: outside this repo
 

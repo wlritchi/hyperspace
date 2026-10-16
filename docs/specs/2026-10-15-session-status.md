@@ -393,12 +393,15 @@ or a launchd agent. `docs/deploy.md` has examples of both.
 
 On a runner, the image's entrypoint runs `hyperspace launcher --runner` as its
 main process, and it does not stop when no session runs. It registers the host
-first. If the server is not available (a network error, a server error, or a
-rate limit), it waits and tries again: after 5 seconds, then a wait that
-doubles to at most 5 minutes. Thus the pod does not restart in a loop while
-the server is not available. A permanent error, for example a bad credential
-or no server URL, stops the launcher at once with an error. `--stay` waits in
-the same way. At boot it:
+first. If the server is not available (a network error, a timeout, an
+incorrect response, a server error, or a rate limit), it waits and tries
+again: after 5 seconds, then a wait that doubles to at most 5 minutes. Thus
+the pod does not restart in a loop while the server is not available. A
+permanent error stops the launcher at once with an error, for example a bad
+credential, no server URL, a redirect loop, or a local error in the request.
+The client refuses a token with a space, a control character, or a character
+that is not ASCII when it reads its configuration, because such a token makes
+each request fail. `--stay` waits in the same way. At boot it:
 
 1. Runs `hyperspace restore --held` (main spec, "Leases"). If the server is
    not available, or the restore of a session fails, it does the restore again
