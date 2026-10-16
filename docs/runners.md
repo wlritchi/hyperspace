@@ -61,7 +61,10 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
 [session status spec](specs/2026-10-15-session-status.md). The launcher:
 
 1. Restores each session whose lease the runner holds and that has no local
-   copy (the same as `hyperspace restore --held`).
+   copy (the same as `hyperspace restore --held`). If the server is not
+   available, or a restore fails, the launcher tries again at later ticks,
+   after 1, 2, 4 minutes and so on, to at most one hour between tries, until a
+   restore has no failure. A session resumes after its restore.
 2. Resumes each held session that needs a process: a session that was
    `working` when the runner stopped, and a session that is `waiting` for an
    event that only its process can receive (`wake: local`). It runs

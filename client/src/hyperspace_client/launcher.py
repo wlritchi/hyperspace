@@ -69,6 +69,9 @@ RESUME_TIMEOUT = 120.0
 # session that stops at once is not resumed in a loop.
 MAX_RESUMES = 5
 RESUME_WINDOW = 3600.0
+# After a failed restore of held sessions, the next one is after one tick
+# interval. The wait doubles after each failure, to at most this time.
+RESTORE_RETRY_MAX = 3600.0
 
 # The most output of `claude --bg` that the launcher reads.
 _MAX_OUTPUT = 64 * 1024
@@ -347,6 +350,10 @@ class Launcher:
     )
     # Session id to the times of its recent resumes.
     _resumes: dict[str, deque[float]] = field(default_factory=dict[str, deque[float]])
+    # The earliest time of the next restore of held sessions; None after a
+    # restore with no failure.
+    _restore_at: float | None = float("-inf")
+    _restore_fails: int = 0
 
     def sweep(self, live: list[str]) -> None:
         """Close the stopped jobs of `done` sessions."""
@@ -430,8 +437,8 @@ class Launcher:
         return False
 
     def tick(self) -> list[str]:
-        """One heartbeat and one sweep, and in runner mode the resumes.
-        Return the live sessions."""
+        """One heartbeat and one sweep, and in runner mode the restores and
+        the resumes. Return the live sessions."""
         live = self.adapter.live_sessions()
         try:
             if self.before_tick is not None:
@@ -439,24 +446,34 @@ class Launcher:
             send_heartbeat(self.ctx, self.adapter, live, self.interval)
             self.sweep(live)
             if self.runner:
+                self.restore()
                 self.resume_held(live)
         except (ApiError, httpx.HTTPError, OSError) as exc:
             # The next tick tries again.
             log.warning("launcher: %s: %s", type(exc).__name__, exc)
         return live
 
-    def boot(self) -> None:
-        """Runner mode: restore the held sessions that have no local copy."""
+    def restore(self) -> None:
+        """Runner mode: restore the held sessions that have no local copy, at
+        the first tick. If a restore fails, do it again at a later tick, with
+        a backoff, until one has no failure."""
+        if self._restore_at is None or self.clock() < self._restore_at:
+            return
         try:
-            restored = restore_held(self.ctx, self.adapter, self.workspace)
+            result = restore_held(self.ctx, self.adapter, self.workspace)
         except (ApiError, httpx.HTTPError, OSError) as exc:
             log.warning("launcher: restore of held sessions: %s", exc)
-            return
-        log.info("launcher: restored %d held sessions", restored)
+        else:
+            log.info("launcher: restored %d held sessions", result.restored)
+            if not result.failed:
+                self._restore_at = None
+                return
+        delay = min(self.interval * 2**self._restore_fails, RESTORE_RETRY_MAX)
+        self._restore_fails += 1
+        self._restore_at = self.clock() + delay
+        log.info("launcher: restore of held sessions again in %d s", delay)
 
     def run(self, max_ticks: int | None = None) -> int:
-        if self.runner:
-            self.boot()
         last_live = self.clock()
         ticks = 0
         while max_ticks is None or ticks < max_ticks:

@@ -394,7 +394,13 @@ or a launchd agent. `docs/deploy.md` has examples of both.
 On a runner, the image's entrypoint runs `hyperspace launcher --runner` as its
 main process, and it does not stop when no session runs. At boot it:
 
-1. Runs `hyperspace restore --held` (main spec, "Leases").
+1. Runs `hyperspace restore --held` (main spec, "Leases"). If the server is
+   not available, or the restore of a session fails, it does the restore again
+   at a later tick, until a restore has no failure. The first retry is after
+   one tick interval, and the wait doubles after each failure, to at most one
+   hour. A retry has the same checks as the first restore: it does not write
+   over a local copy that differs, and it does not restore a session that
+   runs.
 2. Lists the sessions whose lease it holds, with their status and liveness.
 3. Resumes each session that is interrupted, or that is `waiting` with wake
    `local`, as a background job, with `claude --bg --resume <sid>` in the
