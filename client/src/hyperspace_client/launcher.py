@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -80,9 +81,17 @@ RESTORE_RETRY_MAX = 3600.0
 # to at most START_RETRY_MAX.
 START_RETRY = 5.0
 START_RETRY_MAX = 300.0
-# The message of httpcore's ProxyError when a SOCKS proxy refuses the
-# credential.
-_SOCKS_AUTH = "Invalid username/password"
+# httpcore's ProxyError for a refused HTTP CONNECT starts with the status, for
+# example "407 Proxy Authentication Required".
+_CONNECT_STATUS = re.compile(r"(\d{3})\b")
+# A SOCKS ProxyError that refers to authentication: a refused authentication
+# method ("Requested USERNAME/PASSWORD from proxy server, but got NO
+# ACCEPTABLE METHODS.") or a refused credential ("Invalid username/password").
+# A failed SOCKS connect ("Proxy Server could not connect: ...") does not
+# refer to authentication.
+_SOCKS_AUTH = re.compile(
+    r"\b(?:authentication|username|password|methods?)\b", re.IGNORECASE
+)
 
 # The most output of `claude --bg` that the launcher reads.
 _MAX_OUTPUT = 64 * 1024
@@ -323,19 +332,26 @@ def close_after_exit(
         record_refusal(ctx.state, adapter, job, reason)
 
 
+def _proxy_auth_refused(message: str) -> bool:
+    """True if a proxy refused the authentication: an HTTP CONNECT 407, or a
+    SOCKS refusal of the authentication method or of the credential. The
+    configuration must change before a retry can succeed."""
+    status = _CONNECT_STATUS.match(message)
+    if status is not None:
+        return status.group(1) == "407"
+    return _SOCKS_AUTH.search(message) is not None
+
+
 def temporary(exc: Exception) -> bool:
     """True if a request can succeed later with no change: a network error, a
     timeout, an incorrect response from the server, a server error, a rate
-    limit, or a proxy error other than a refused proxy credential. A local
-    error, for example a bad credential, an invalid token or URL, or a
+    limit, or a proxy error other than a refused proxy authentication. A
+    local error, for example a bad credential, an invalid token or URL, or a
     redirect loop, is not temporary."""
     if isinstance(exc, ApiError):
         return exc.status >= 500 or exc.status in (408, 429)
     if isinstance(exc, httpx.ProxyError):
-        # For a refused CONNECT, the message starts with the status, for
-        # example "407 Proxy Authentication Required".
-        message = str(exc)
-        return message.split(" ", 1)[0] != "407" and message != _SOCKS_AUTH
+        return not _proxy_auth_refused(str(exc))
     return isinstance(
         exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
     )

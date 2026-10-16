@@ -17,6 +17,7 @@ loopback.
 #     "zstandard",
 #     "starlette>=0.47",
 #     "httpx",
+#     "socksio",
 #     "httpx2",
 #     "hyperspace-protocol",
 #     "hyperspace-client",
