@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 
 from _hs import FakeClaude, Server, make_server, prompt, text_reply
+from hyperspace_client import launcher as launcher_mod
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.backfill import RunResult
 from hyperspace_client.cli import _hook_heartbeat, main, status_label
@@ -227,6 +228,47 @@ def test_close_syncs_before_rm(ctx: Context, fake: FakeClaude, host: Host) -> No
 
     close_job(ctx, host, job_for(host, fake, "aa", sid), "claude", rm)
     assert lengths == [size]
+
+
+def test_close_skips_a_queued_reopen(
+    ctx: Context, fake: FakeClaude, host: Host
+) -> None:
+    sid = session(ctx, fake)
+    mark(ctx, sid, "done")
+    done_seq = state(ctx, sid)["status"]["seq"]
+    # The user prompted while the server was down: the reopen waits in the
+    # queue, and the server still says `done`.
+    ctx.state.want_status(
+        HARNESS,
+        sid,
+        {
+            "status": "working",
+            "source_kind": "hook",
+            "explicit": True,
+            "base_seq": done_seq,
+        },
+    )
+    job(fake, "aa", sid)
+    rm = Rm(ctx)
+    launcher(ctx, host, rm, Clock()).tick()
+    assert rm.calls == []
+
+
+def test_close_asks_again_after_the_backup(
+    ctx: Context, fake: FakeClaude, host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = session(ctx, fake)
+    mark(ctx, sid, "done")
+    original = launcher_mod.back_up
+
+    def back_up(*args: Any) -> None:
+        original(*args)
+        mark(ctx, sid, "ready")
+
+    monkeypatch.setattr(launcher_mod, "back_up", back_up)
+    rm = Rm(ctx)
+    close_job(ctx, host, job_for(host, fake, "aa", sid), "claude", rm)
+    assert rm.calls == []
 
 
 def job_for(host: Host, fake: FakeClaude, short: str, sid: str) -> Any:

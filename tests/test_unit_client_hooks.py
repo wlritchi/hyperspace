@@ -133,6 +133,24 @@ def test_session_end_closes_a_done_job(
     assert (close in started) == closes
 
 
+def test_session_end_keeps_a_job_with_a_queued_reopen(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_JOB_DIR", "/home/u/.claude/jobs/1111aaaa")
+    _seen_status(cfg, "done")
+    state = State(cfg.state_dir)
+    try:
+        state.want_status(
+            "claude-code",
+            SID,
+            {"status": "working", "source_kind": "hook", "explicit": True},
+        )
+    finally:
+        state.close()
+    _, started = run(cfg, hook_event_name="SessionEnd")
+    assert ["--quiet", "launcher", "--close-job", "1111aaaa"] not in started
+
+
 def test_user_prompt_prints_notices(cfg: Config) -> None:
     state = State(cfg.state_dir)
     state.add_notice("claude-code", SID, "lease", "[hyperspace] a notice")

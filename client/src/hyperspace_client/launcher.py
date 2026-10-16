@@ -163,6 +163,19 @@ def _reason(code: int, output: str) -> str:
     return f"claude rm exited with status {code}"
 
 
+def queued_reopen(state: State, harness: str, session_id: str) -> bool:
+    """True if a status write that is not `done` waits in the queue."""
+    queued = state.wanted_status(harness, session_id)
+    return queued is not None and queued[0].get("status") != "done"
+
+
+def _done(ctx: Context, harness: str, sid: str) -> bool:
+    if queued_reopen(ctx.state, harness, sid):
+        return False
+    event = ctx.api.state(harness, sid).get("status")
+    return event is not None and event["status"] == "done"
+
+
 def close_job(
     ctx: Context, adapter: ClaudeCode, job: Job, claude: str, run: RunRm = run_rm
 ) -> str | None:
@@ -170,19 +183,18 @@ def close_job(
     then run `claude rm`. Return the reason if `claude rm` refuses, or None.
 
     The job is left as it is if its session runs, a sync of it runs, its
-    status on the server is not `done`, or the server does not have every
-    local byte. Raise `TeleportError` in the last case, and `NotFound` if
-    the server does not have the session."""
+    status on the server or its queued status is not `done`, or the server
+    does not have every local byte. Raise `TeleportError` in the last case,
+    and `NotFound` if the server does not have the session."""
     harness = adapter.harness
     sid = job.session_id
     with ctx.state.try_lock(harness, sid) as locked:
-        if not locked or adapter.is_running(sid):
-            return None
-        event = ctx.api.state(harness, sid).get("status")
-        if event is None or event["status"] != "done":
+        if not locked or adapter.is_running(sid) or not _done(ctx, harness, sid):
             return None
         back_up(ctx, adapter, sid, adapter.find_transcripts(sid), "close")
-        if adapter.is_running(sid):
+        # The backup sends a queued status write, which can reopen the
+        # session, so ask again just before `claude rm`.
+        if adapter.is_running(sid) or not _done(ctx, harness, sid):
             return None
         # Never with --discard-unpushed or --force-remove-worktree: a refusal
         # keeps the work, and the user decides.
