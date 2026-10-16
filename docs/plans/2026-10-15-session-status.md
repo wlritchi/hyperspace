@@ -564,6 +564,10 @@ The code follows this step, with these changes and additions:
   text, so that a sync that sees the same problem again does not repeat it. A
   `done` notice uses the event's `seq`, so that each new `done` mark gives one
   notice, also when its host, source and note are the same as an earlier mark.
+- `State` adds the new `sessions` and `notices` columns to the file of an
+  older client in one `BEGIN IMMEDIATE` transaction, and it reads the columns
+  in that transaction. At `SessionStart`, many hook processes open the file at
+  the same time; the second waits for the lock and then sees the columns.
 - `SessionStart` does not print a pending `done` notice ("Finish the current
   step and stop"), because no turn runs at a start. The notice stays pending,
   and `SessionStart` prints only that the session is marked done and that a
