@@ -18,6 +18,7 @@ from hyperspace_client.api import Api
 from hyperspace_client.backfill import (
     ALLOWED_TOOLS,
     MESSAGE,
+    RESTRICTIONS,
     Candidate,
     RunResult,
     attempt_key,
@@ -75,7 +76,9 @@ def test_parse_age() -> None:
 def test_command_allows_only_status_and_done() -> None:
     argv = command("claude", "s1")
     assert argv[:5] == ["claude", "--resume", "s1", "-p", MESSAGE]
-    assert argv[5:] == ["--allowedTools", *ALLOWED_TOOLS]
+    assert argv[5:] == [*RESTRICTIONS, "--allowedTools", *ALLOWED_TOOLS]
+    assert set(RESTRICTIONS) >= {"--restricted", "--strict-mcp-config", "dontAsk"}
+    assert argv[argv.index("--tools") + 1] == "Bash"
     assert set(ALLOWED_TOOLS) == {
         "Bash(hyperspace status:*)",
         "Bash(hyperspace done:*)",

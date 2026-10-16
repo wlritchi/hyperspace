@@ -39,6 +39,19 @@ MESSAGE = (
     "one line that says which status you set and why."
 )
 ALLOWED_TOOLS = ("Bash(hyperspace status:*)", "Bash(hyperspace done:*)")
+# The resumed session runs with no user, and its transcript can hold text from
+# other sources. These options remove the user's settings (allow rules, the
+# default permission mode, plugins), all MCP servers, and all built-in tools
+# except Bash. Then only ALLOWED_TOOLS can run. A `claude` that does not know
+# an option stops, so the backfill never runs with fewer limits.
+RESTRICTIONS = (
+    "--restricted",
+    "--tools",
+    "Bash",
+    "--strict-mcp-config",
+    "--permission-mode",
+    "dontAsk",
+)
 # The variables of a Claude Code session that runs this command. The resumed
 # session must not get them, or `hyperspace status` would act on the wrong
 # session.
@@ -203,6 +216,7 @@ def command(claude: str, session_id: str) -> list[str]:
         session_id,
         "-p",
         MESSAGE,
+        *RESTRICTIONS,
         "--allowedTools",
         *ALLOWED_TOOLS,
     ]

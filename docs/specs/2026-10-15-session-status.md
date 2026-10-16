@@ -450,8 +450,11 @@ asks the agent to set its status with a note, and to change nothing else.
 
 - The command resumes each session for one turn with
   `claude --resume <sid> -p`, with permission only for `hyperspace status` and
-  `hyperspace done`. It skips sessions that are live, that have a status, or
-  whose lease a different host holds.
+  `hyperspace done`. No user watches the session, and its transcript can hold
+  text from other sources. The resume therefore uses Claude Code's restricted
+  mode: it does not load the user's settings or MCP servers, and Bash is the
+  only tool. It skips sessions that are live, that have a status, or whose
+  lease a different host holds.
 - It records each session that it messages before the resume starts. A second
   run, for example after an interruption, skips these sessions unless
   `--retry` is given. `--dry-run` lists the sessions and messages none.
