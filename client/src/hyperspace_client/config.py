@@ -11,6 +11,9 @@ environment.
 | Host kind          | `HYPERSPACE_HOST_KIND`    | `host_kind`          |
 | Excluded cwds      |                           | `exclude_cwd`        |
 | Checkpoint seconds |                           | `checkpoint_interval`|
+| Heartbeat seconds  |                           | `heartbeat_interval` |
+| Launcher idle exit |                           | `launcher_idle_exit` |
+| Claude Code binary | `HYPERSPACE_CLAUDE`       | `claude_bin`         |
 
 With no token in the environment or a file, the token comes from the token
 cache or the system keyring (see `credentials`).
@@ -30,7 +33,12 @@ from urllib.parse import urlsplit
 
 from hyperspace_client import credentials
 from hyperspace_client.credentials import CredentialError, KeyringUse, TokenSource
-from hyperspace_protocol import HostKind, validate_host_name
+from hyperspace_protocol import (
+    MAX_HEARTBEAT_INTERVAL,
+    MIN_HEARTBEAT_INTERVAL,
+    HostKind,
+    validate_host_name,
+)
 
 
 class ConfigError(Exception):
@@ -90,6 +98,10 @@ class Config:
     host_kind: HostKind = "workstation"
     exclude_cwd: list[str] = field(default_factory=list[str])
     checkpoint_interval: float = 10.0
+    heartbeat_interval: int = 60
+    # Seconds with no live session before the launcher stops.
+    launcher_idle_exit: float = 600.0
+    claude_bin: str = "claude"
     state_dir: Path = field(default_factory=state_dir)
 
     def require_server(self) -> tuple[str, str]:
@@ -169,6 +181,24 @@ def load(env: dict[str, str] | None = None, path: Path | None = None) -> Config:
     if not isinstance(interval, int | float) or interval < 1:
         raise ConfigError("checkpoint_interval must be a number of seconds >= 1")
     cfg.checkpoint_interval = float(interval)
+    beat = data.get("heartbeat_interval", 60)
+    if (
+        not isinstance(beat, int)
+        or isinstance(beat, bool)
+        or not MIN_HEARTBEAT_INTERVAL <= beat <= MAX_HEARTBEAT_INTERVAL
+    ):
+        raise ConfigError(
+            f"heartbeat_interval must be a whole number of seconds from "
+            f"{MIN_HEARTBEAT_INTERVAL} to {MAX_HEARTBEAT_INTERVAL}"
+        )
+    cfg.heartbeat_interval = beat
+    idle = data.get("launcher_idle_exit", 600.0)
+    if not isinstance(idle, int | float) or isinstance(idle, bool) or idle < 60:
+        raise ConfigError("launcher_idle_exit must be a number of seconds >= 60")
+    cfg.launcher_idle_exit = float(idle)
+    cfg.claude_bin = str(
+        env.get("HYPERSPACE_CLAUDE") or data.get("claude_bin") or "claude"
+    )
     ttl = data.get("token_cache_ttl", 86400)
     if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 60:
         raise ConfigError("token_cache_ttl must be a whole number of seconds >= 60")

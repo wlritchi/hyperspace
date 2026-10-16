@@ -163,6 +163,74 @@ seconds. The plugin also runs this sweep at most once an hour.
 hyperspace sync --all
 ```
 
+### The launcher
+
+`hyperspace launcher` sends the host's heartbeat each minute, so that
+`hyperspace ls` shows which sessions run. It also closes the background jobs
+of `done` sessions: after the job's process stops, it backs up the session and
+runs `claude rm <job>`, which removes the job from `claude agents` and deletes
+the job's worktree. If `claude rm` refuses, for example because the worktree
+has commits that are not pushed, the job stays, and `hyperspace ls` shows
+`done, not closed: <reason>`. The launcher never forces the removal.
+
+The SessionStart hook starts the launcher if it does not run. It stops after
+10 minutes with no live session. To run it all the time instead, use a service
+manager with `--stay`. Under systemd:
+
+```ini
+# ~/.config/systemd/user/hyperspace-launcher.service
+[Unit]
+Description=Hyperspace launcher
+
+[Service]
+ExecStart=%h/.local/bin/hyperspace --quiet launcher --stay
+# With no token in the cache yet, the launcher stops; try again later.
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user enable --now hyperspace-launcher.service
+```
+
+Under launchd, on macOS:
+
+```xml
+<!-- ~/Library/LaunchAgents/hyperspace-launcher.plist -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>hyperspace-launcher</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/.local/bin/hyperspace</string>
+    <string>--quiet</string>
+    <string>launcher</string>
+    <string>--stay</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+</dict>
+</plist>
+```
+
+```sh
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/hyperspace-launcher.plist
+```
+
+Only one launcher runs for each host and harness config directory, so a
+launcher from a hook and one from a service manager do not conflict.
+`HYPERSPACE_LAUNCHER=off` turns off the launcher and the heartbeats; set it
+for tests on a real `~/.claude`. The settings `heartbeat_interval` (default
+60), `launcher_idle_exit` (default 600), and `claude_bin` (or
+`HYPERSPACE_CLAUDE`, default `claude`) go in `config.toml`. The client works
+on Linux and macOS.
+
 ### Upgrade order
 
 Upgrade the server before the client. The new server accepts old clients while

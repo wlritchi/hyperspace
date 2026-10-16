@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import httpx
 
-from hyperspace_client import backfill, credentials
+from hyperspace_client import backfill, credentials, launcher
 from hyperspace_client import config as config_mod
 from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
@@ -33,6 +33,7 @@ from hyperspace_client.status import clean_note, printable, seq, write
 from hyperspace_client.sync import Context, Syncer, register_host
 from hyperspace_client.teleport import TeleportError, fork, restore, send
 from hyperspace_protocol import (
+    CAP_LIVENESS,
     CAP_SESSION_STATUS,
     SessionStateBody,
     SessionSummary,
@@ -49,6 +50,8 @@ log.addHandler(logging.NullHandler())
 
 # Events where the hook's cwd is the session's workspace.
 _START_EVENTS = ("SessionStart",)
+# Events whose checkpoint also sends a heartbeat.
+_HEARTBEAT_EVENTS = ("SessionStart", "SessionEnd")
 # Errors that apply to the credential, not to one session, so that the next
 # session of a sweep gets the same error.
 CREDENTIAL_ERRORS = frozenset({"unauthorized", "forbidden", "rate_limited"})
@@ -182,10 +185,29 @@ def cmd_sync(args: argparse.Namespace, cfg: Config) -> int:
                     log.info("%s: another sync is running", session.session_id)
                     return 0
                 run()
+        if args.event in _HEARTBEAT_EVENTS:
+            _hook_heartbeat(cfg, ctx, session.session_id, args.event)
         return 0
     finally:
         ctx.api.close()
         state.close()
+
+
+def _hook_heartbeat(cfg: Config, ctx: Context, session_id: str, event: str) -> None:
+    """Send a heartbeat at once, so that a start or an end shows with no
+    wait for the launcher's next tick."""
+    if launcher.off() or not isinstance(ctx.adapter, ClaudeCode):
+        return
+    try:
+        if not ctx.api.has_capability(CAP_LIVENESS):
+            return
+        live = ctx.adapter.live_sessions()
+        if event == "SessionEnd":
+            # The process can still be alive while its SessionEnd hook runs.
+            live = [sid for sid in live if sid != session_id]
+        launcher.send_heartbeat(ctx, ctx.adapter.harness, live, cfg.heartbeat_interval)
+    except (ApiError, httpx.HTTPError) as exc:
+        log.info("%s: no heartbeat: %s", session_id, exc)
 
 
 def _sweep(cfg: Config, ctx: Context, if_stale: float | None) -> int:
@@ -714,12 +736,11 @@ def cmd_backfill_status(args: argparse.Namespace, cfg: Config) -> int:
             return 0
         if skipped:
             print(f"skipped: {skipped}")
-        claude = os.environ.get("HYPERSPACE_CLAUDE", "claude")
         results = backfill.run(
             ctx,
             adapter,
             selection.candidates,
-            claude=claude,
+            claude=cfg.claude_bin,
             rate=args.rate,
             timeout=args.timeout,
             report=lambda line: print(line, flush=True),
@@ -738,6 +759,62 @@ def cmd_grant(args: argparse.Namespace, cfg: Config) -> int:
         api.grant(ClaudeCode.harness, args.session, args.to)
     print(f"granted {args.session} to {args.to}")
     return 0
+
+
+def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
+    if launcher.off():
+        return 0
+    state = State(cfg.state_dir)
+    adapter = ClaudeCode()
+    try:
+        if args.close_job:
+            ctx = _context(cfg, state)
+            try:
+                launcher.close_after_exit(ctx, adapter, args.close_job, cfg.claude_bin)
+            finally:
+                ctx.api.close()
+            return 0
+        with launcher.host_lock(cfg.state_dir, cfg.host, adapter.config_dir) as held:
+            if not held:
+                if not args.if_absent:
+                    raise Exit(1, "a launcher already runs for this host")
+                return 0
+            ctx = _context(cfg, state)
+            try:
+                register_host(ctx, cfg.host_kind)
+                if not ctx.api.has_capability(CAP_LIVENESS):
+                    log.warning("launcher: the server does not support liveness")
+                    return 0
+                return launcher.Launcher(
+                    ctx,
+                    adapter,
+                    cfg.claude_bin,
+                    cfg.heartbeat_interval,
+                    None if args.stay else cfg.launcher_idle_exit,
+                    before_tick=lambda: _refresh_token(cfg, ctx),
+                ).run()
+            finally:
+                ctx.api.close()
+    finally:
+        state.close()
+
+
+def _refresh_token(cfg: Config, ctx: Context) -> None:
+    """Read the token cache again. Each read keeps the cache alive (see
+    "Credentials" in the spec), and a new login takes effect."""
+    if cfg.token_source not in ("cache", "keyring") or cfg.url is None:
+        return
+    try:
+        found = credentials.find(
+            cfg.url, cfg.state_dir, cfg.token_cache_ttl, "cache-only"
+        )
+    except CredentialError as exc:
+        log.info("launcher: token cache: %s", exc)
+        return
+    if found is not None and found[0] != cfg.token:
+        cfg.token = found[0]
+        ctx.api.close()
+        ctx.api = Api(cfg.url, found[0])
 
 
 def _with_context(cfg: Config, fn: Callable[[Context, ClaudeCode], int]) -> int:
@@ -1022,6 +1099,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cwd", help="the workspace (default: the current directory)")
     p.add_argument("--resume", action="store_true", help="then run claude --resume")
     p.set_defaults(func=cmd_fork)
+
+    p = sub.add_parser(
+        "launcher",
+        help="send this host's heartbeat and close done background jobs",
+    )
+    p.add_argument(
+        "--stay",
+        action="store_true",
+        help="do not stop when no session runs (for a service manager)",
+    )
+    p.add_argument(
+        "--if-absent",
+        action="store_true",
+        help="exit 0 with no message if a launcher already runs (for hooks)",
+    )
+    p.add_argument(
+        "--close-job",
+        metavar="JOB",
+        help="wait for the job's session to stop, then close the job if its "
+        "session is done (for the SessionEnd hook)",
+    )
+    p.add_argument(
+        "--unlock",
+        action="store_true",
+        help="with --quiet: the token can come from the keyring, which can ask "
+        "for a passphrase (session start)",
+    )
+    p.set_defaults(func=cmd_launcher)
 
     p = sub.add_parser(
         "hook", help="harness hooks: read the hook's JSON on stdin and act on it"

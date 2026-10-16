@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # vim: filetype=python
-"""A stand-in for the `claude` binary in backfill tests.
+"""A stand-in for the `claude` binary in backfill and launcher tests.
 
 `FAKE_CLAUDE_MODE=echo` prints its arguments, working directory, and the
-session variables of its environment as one JSON line. `FAKE_CLAUDE_MODE=hang`
+session variables of its environment as one JSON line. `FAKE_CLAUDE_MODE=fail`
+prints an error with color codes and exits 1. `FAKE_CLAUDE_MODE=hang`
 starts a child process that writes its pid to `FAKE_CLAUDE_PIDFILE`, then
 both wait for ever."""
 
@@ -23,6 +24,9 @@ def main() -> None:
         print("thinking")
         print(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "env": env}))
         return
+    if mode == "fail":
+        print("\x1b[31merror:\x1b[0m worktree has unpushed commits", file=sys.stderr)
+        sys.exit(1)
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
     with open(os.environ["FAKE_CLAUDE_PIDFILE"], "w") as f:
         f.write(str(child.pid))
