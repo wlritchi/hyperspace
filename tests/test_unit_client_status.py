@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ import pytest
 
 from _hs import FakeClaude, prompt, text_reply, tool_call
 from hyperspace_client.adapters.claude_code import ClaudeCode
-from hyperspace_client.state import State
+from hyperspace_client.state import _ADDED_COLUMNS, _SCHEMA, State
 from hyperspace_client.status import (
     WITH_EXCERPT,
     Known,
@@ -262,6 +263,56 @@ def test_notices_table_from_an_older_client(tmp_path: Path) -> None:
     state.add_notice("claude-code", SID, "lease", "lease lost")
     state.add_notice("claude-code", SID, "status", "marked done", key="seq:3")
     assert state.take_notices("claude-code", SID) == ["lease lost", "marked done"]
+
+
+def test_two_openers_add_the_columns_of_an_older_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = sqlite3.connect(tmp_path / "state.sqlite3")
+    db.execute("PRAGMA journal_mode = WAL")
+    db.executescript(_SCHEMA)
+    db.close()
+    # A third connection holds the write lock until both openers are about
+    # to change the schema, so that both can see the missing columns.
+    holder = sqlite3.connect(tmp_path / "state.sqlite3", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    connect = sqlite3.connect
+    waiting = threading.Semaphore(0)
+
+    def traced(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        conn = connect(*args, **kwargs)
+
+        def trace(sql: str) -> None:
+            if sql.startswith(("ALTER", "BEGIN IMMEDIATE")):
+                waiting.release()
+
+        conn.set_trace_callback(trace)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", traced)
+    errors: list[BaseException] = []
+
+    def open_state() -> None:
+        try:
+            State(tmp_path).close()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=open_state) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for _ in threads:
+        assert waiting.acquire(timeout=10)
+    holder.rollback()
+    holder.close()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert errors == []
+    db = sqlite3.connect(tmp_path / "state.sqlite3")
+    for table, added in _ADDED_COLUMNS.items():
+        columns = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+        assert set(added) <= columns, table
+    db.close()
 
 
 def test_session_columns_survive_a_round_trip(tmp_path: Path) -> None:
