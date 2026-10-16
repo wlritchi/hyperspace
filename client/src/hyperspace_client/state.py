@@ -179,21 +179,28 @@ class State:
         # table untouched, but never reuse them: sync adopts remote bytes.
         self._add_columns()
 
+    def _missing_columns(self) -> list[tuple[str, str, str]]:
+        """The table, name and definition of each added column that the
+        file does not have."""
+        missing: list[tuple[str, str, str]] = []
+        for table, added in _ADDED_COLUMNS.items():
+            columns = {r[1] for r in self._db.execute(f"PRAGMA table_info({table})")}
+            missing += [(table, n, d) for n, d in added.items() if n not in columns]
+        return missing
+
     def _add_columns(self) -> None:
-        """Add the columns that an older client did not make. Other
-        processes can open the same file at the same time, so the check and
-        the changes occur in one write transaction. A second process waits
-        for the lock and then sees the new columns."""
+        """Add the columns that an older client did not make. The first
+        check does not lock, so that a writer does not stop the open of an
+        up-to-date file. Other processes can open the same file at the same
+        time, so the second check and the changes occur in one write
+        transaction. A second process waits for the lock and then sees the
+        new columns."""
+        if not self._missing_columns():
+            return
         self._db.execute("BEGIN IMMEDIATE")
         with self._db:
-            for table, added in _ADDED_COLUMNS.items():
-                rows = self._db.execute(f"PRAGMA table_info({table})")
-                columns = {r[1] for r in rows}
-                for name, definition in added.items():
-                    if name not in columns:
-                        self._db.execute(
-                            f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
-                        )
+            for table, name, definition in self._missing_columns():
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def close(self) -> None:
         self._db.close()

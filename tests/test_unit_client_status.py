@@ -299,20 +299,50 @@ def test_two_openers_add_the_columns_of_an_older_client(
             errors.append(exc)
 
     threads = [threading.Thread(target=open_state) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for _ in threads:
-        assert waiting.acquire(timeout=10)
-    holder.rollback()
-    holder.close()
+    try:
+        for thread in threads:
+            thread.start()
+        for _ in threads:
+            assert waiting.acquire(timeout=10)
+    finally:
+        holder.rollback()
+        holder.close()
     for thread in threads:
         thread.join(timeout=30)
+        assert not thread.is_alive()
     assert errors == []
     db = sqlite3.connect(tmp_path / "state.sqlite3")
     for table, added in _ADDED_COLUMNS.items():
         columns = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
         assert set(added) <= columns, table
     db.close()
+
+
+def test_a_writer_does_not_stop_the_open_of_an_up_to_date_file(
+    tmp_path: Path,
+) -> None:
+    State(tmp_path).close()
+    holder = sqlite3.connect(tmp_path / "state.sqlite3", isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("INSERT INTO kv (key, value) VALUES ('k', 'v')")
+    errors: list[BaseException] = []
+
+    def open_state() -> None:
+        try:
+            State(tmp_path).close()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=open_state)
+    try:
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    finally:
+        holder.rollback()
+        holder.close()
+        thread.join(timeout=30)
+    assert errors == []
 
 
 def test_session_columns_survive_a_round_trip(tmp_path: Path) -> None:
