@@ -403,7 +403,7 @@ class StatusEvent(TypedDict):
 
 class Liveness(TypedDict):
     state: LivenessState
-    # The host that last listed the session.
+    # The host of a live copy, or else the host that last listed the session.
     host: str
     since: str
     # Why the host's launcher did not close the session, if it did not.
