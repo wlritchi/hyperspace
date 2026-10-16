@@ -16,10 +16,13 @@ from starlette.testclient import TestClient
 
 from _hs import MemoryCache, MemoryKeyring, Server, make_server
 from hyperspace_client import cli, credentials
+from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import Api
 from hyperspace_client.config import Config, ConfigError, load
 from hyperspace_client.credentials import NotNow
 from hyperspace_client.keycache import KernelCache
+from hyperspace_client.state import State
+from hyperspace_client.sync import Context
 
 URL = "https://hs.test"
 NAME = "token:hs.test"
@@ -77,6 +80,29 @@ def test_a_token_from_the_cache_is_checked(
     token_cache.items[NAME] = "from\ncache"
     with pytest.raises(ConfigError, match="token cache"):
         cfg_with(tmp_path, keyring_use="interactive").require_server()
+
+
+def test_the_launcher_refuses_a_bad_token_from_the_cache(
+    tmp_path: Path, token_cache: MemoryCache
+) -> None:
+    cfg = cfg_with(tmp_path, keyring_use="interactive")
+    token_cache.items[NAME] = "first"
+    cfg.require_server()
+    api = Api(URL, "first")
+    state = State(tmp_path / "state")
+    ctx = Context(
+        api=api, state=state, adapter=ClaudeCode(tmp_path / "claude"), host="laptop"
+    )
+    # A new login with a bad token: the launcher keeps the token that works.
+    token_cache.items[NAME] = "new\ntoken"
+    cli._refresh_token(cfg, ctx)  # pyright: ignore[reportPrivateUsage]
+    assert (cfg.token, ctx.api) == ("first", api)
+    token_cache.items[NAME] = "second"
+    cli._refresh_token(cfg, ctx)  # pyright: ignore[reportPrivateUsage]
+    assert cfg.token == "second"
+    assert ctx.api is not api
+    ctx.api.close()
+    state.close()
 
 
 def test_the_cache_comes_before_the_keyring(

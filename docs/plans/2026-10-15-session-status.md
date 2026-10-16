@@ -1064,11 +1064,14 @@ without it.
   the launcher at once. Also, `config.check_token` refuses a token with a
   character that is not visible ASCII (a space, a control character, or a
   character that is not ASCII), from the environment, a token file, the token
-  cache or the keyring. Tests:
+  cache or the keyring. The launcher's read of the token cache before each
+  tick also checks a new token. If the check fails, the launcher keeps its
+  current token and logs a warning. Tests:
   `test_launcher_start_fails_at_once_for_a_local_error`,
   `test_temporary_errors`,
   `test_a_token_with_whitespace_or_a_control_character_is_refused`,
-  `test_a_token_from_the_cache_is_checked`.
+  `test_a_token_from_the_cache_is_checked`,
+  `test_the_launcher_refuses_a_bad_token_from_the_cache`.
 
 ## Step 6: outside this repo
 

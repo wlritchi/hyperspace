@@ -848,10 +848,18 @@ def _refresh_token(cfg: Config, ctx: Context) -> None:
     except CredentialError as exc:
         log.info("launcher: token cache: %s", exc)
         return
-    if found is not None and found[0] != cfg.token:
-        cfg.token = found[0]
-        ctx.api.close()
-        ctx.api = Api(cfg.url, found[0])
+    if found is None or found[0] == cfg.token:
+        return
+    where = "the token cache" if found[1] == "cache" else "the keyring"
+    try:
+        config_mod.check_token(found[0], where)
+    except ConfigError as exc:
+        # Keep the current token. A bad token makes each request fail.
+        log.warning("launcher: %s", exc)
+        return
+    cfg.token = found[0]
+    ctx.api.close()
+    ctx.api = Api(cfg.url, found[0])
 
 
 def _with_context(cfg: Config, fn: Callable[[Context, ClaudeCode], int]) -> int:
