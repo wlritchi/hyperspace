@@ -1,0 +1,14 @@
+{
+  "name": "hyperspace",
+  "owner": {
+    "name": "wlritchi"
+  },
+  "description": "The Hyperspace plugin for Claude Code: transcript backup and session teleport",
+  "plugins": [
+    {
+      "name": "hyperspace",
+      "source": "./plugin/hyperspace",
+      "description": "Back up Claude Code transcripts to a Hyperspace server as you work, and teleport sessions between hosts"
+    }
+  ]
+}

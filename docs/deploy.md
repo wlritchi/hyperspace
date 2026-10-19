@@ -137,12 +137,12 @@ resumes, at most once for many sessions (see "Credentials" in the spec).
 A token file also works, with no keyring:
 `token_file = "~/.config/hyperspace/token"` (mode 0600).
 
-Install the plugin from the marketplace, so that the hooks back up sessions as
-they run:
+Install the plugin, so that the hooks back up sessions as they run. This
+repository is its marketplace:
 
 ```sh
-claude plugin marketplace add wlritchi/wlr-cc-plugins
-claude plugin install hyperspace@wlr-cc-plugins
+claude plugin marketplace add wlritchi/hyperspace
+claude plugin install hyperspace@hyperspace
 ```
 
 The plugin only forwards each hook to `hyperspace hook`, so it needs the
@@ -150,21 +150,10 @@ client on PATH (or `HYPERSPACE_CLI` set to a command line that runs it).
 Without the client, the hooks do nothing. Upgrade the client with
 `uv tool upgrade hyperspace-client`; the plugin does not change with it.
 
-A marketplace lists the plugin with a `git-subdir` source; the `ref` selects
-the version:
-
-```json
-{
-  "name": "hyperspace",
-  "source": {
-    "source": "git-subdir",
-    "url": "https://github.com/wlritchi/hyperspace.git",
-    "path": "plugin/hyperspace",
-    "ref": "main"
-  },
-  "description": "Back up Claude Code transcripts to Hyperspace and teleport sessions between hosts"
-}
-```
+No file in the repository has a plugin version: Claude Code uses the commit,
+so each new commit on the branch that the marketplace follows is an update. To
+stay on a release, add the marketplace at its tag
+(`claude plugin marketplace add wlritchi/hyperspace#X.Y.Z`).
 
 Then back up the sessions that are already on the workstation. The first run
 uploads everything (about 20 minutes for 2,000 sessions); later runs take

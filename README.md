@@ -17,19 +17,30 @@ Status: v1 is built and not yet released. See the
 [deploying Hyperspace](docs/deploy.md), and
 [Hyperspace on container runners](docs/runners.md).
 
+## Install the Claude Code plugin
+
+This repository is also a plugin marketplace. The plugin needs the
+`hyperspace` client and a server; see [deploying Hyperspace](docs/deploy.md).
+
+```sh
+claude plugin marketplace add wlritchi/hyperspace
+claude plugin install hyperspace@hyperspace
+```
+
 ## Layout
 
-| Path        | Contents                                         |
-| ----------- | ------------------------------------------------ |
-| `server/`   | The server, a PEP 723 script with a lock file    |
-| `lib/`      | Server modules                                   |
-| `protocol/` | `hyperspace-protocol`: wire types and validation |
-| `client/`   | `hyperspace-client`: sync engine, adapters, CLI  |
-| `scripts/`  | Admin scripts that run inside the server image   |
-| `tests/`    | Unit and end-to-end tests                        |
-| `docs/`     | Design specs and implementation plans            |
-| `charts/`   | The Helm chart                                   |
-| `plugin/`   | The Claude Code plugin (hooks that call the CLI) |
+| Path              | Contents                                         |
+| ----------------- | ------------------------------------------------ |
+| `server/`         | The server, a PEP 723 script with a lock file    |
+| `lib/`            | Server modules                                   |
+| `protocol/`       | `hyperspace-protocol`: wire types and validation |
+| `client/`         | `hyperspace-client`: sync engine, adapters, CLI  |
+| `scripts/`        | Admin scripts that run inside the server image   |
+| `tests/`          | Unit and end-to-end tests                        |
+| `docs/`           | Design specs and implementation plans            |
+| `charts/`         | The Helm chart                                   |
+| `plugin/`         | The Claude Code plugin (hooks that call the CLI) |
+| `.claude-plugin/` | The plugin marketplace that lists `plugin/`      |
 
 ## Development
 

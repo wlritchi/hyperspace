@@ -46,7 +46,7 @@ through any number of teleports.
 - A security model for a server on the open internet, from the first release.
 - A small stack: Python 3.12, PEP 723 `uv` scripts with lock files, a
   container image and a Helm chart built by repository workflows, and a thin
-  client plugin in wlr-cc-plugins.
+  client plugin in this repository, which is also its marketplace.
 
 ## Non-goals (v1)
 
@@ -1022,10 +1022,11 @@ top-level `agent-*.jsonl` files.
 
 ## Plugin
 
-The plugin is in this repo (`plugin/hyperspace/`). A marketplace (for example
-wlr-cc-plugins) lists it with a `git-subdir` source; the entry's `ref` selects
-the version. `plugin.json` has no version, so Claude Code uses the commit, and
-a release never edits the plugin.
+The plugin is in this repo (`plugin/hyperspace/`), and the repo is its
+marketplace (`.claude-plugin/marketplace.json`, which lists the plugin by its
+relative path). No file has a plugin version, so Claude Code uses the commit,
+and a release never edits the plugin. A host that adds the marketplace at a
+release tag stays on that release.
 
 The plugin holds no logic. For every event it runs `hooks/forward.sh`, which
 runs `hyperspace hook` (or `$HYPERSPACE_CLI hook`) with the hook's JSON on

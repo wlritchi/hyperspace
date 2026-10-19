@@ -15,14 +15,20 @@ server runs (see [deploy.md](deploy.md)).
 
 ## The image
 
-Add the client and the plugin to the runner image:
+Add the client and the plugin to the runner image, from one checkout of a
+release, so that the plugin's hooks match the client that they call:
 
 ```dockerfile
-RUN uv tool install 'hyperspace-client @ git+https://github.com/wlritchi/hyperspace@client-vX.Y.Z#subdirectory=client'
+RUN git clone --filter=blob:none https://github.com/wlritchi/hyperspace /opt/hyperspace \
+    && git -C /opt/hyperspace checkout --detach X.Y.Z \
+    && uv tool install /opt/hyperspace/client \
+    && claude plugin marketplace add /opt/hyperspace \
+    && claude plugin install hyperspace@hyperspace
 ```
 
-Enable the `hyperspace` plugin in the image's Claude Code settings, the same
-way as the other plugins that the runner uses.
+Keep the checkout in the image: the marketplace registration and the client's
+`hyperspace-protocol` dependency refer to it. The clone needs its history and
+tags, because the client takes its version from the latest `client-v` tag.
 
 ## Credential and environment
 
