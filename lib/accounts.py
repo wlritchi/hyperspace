@@ -20,18 +20,26 @@ The accounts file is TOML:
 
 A token is `hsp_<credential id>_<secret>`. The server stores only the sha256
 of the secret.
+
+The server reads the main accounts file and the `*.toml` files in an accounts
+directory, and merges them (see `AccountSources`). The admin scripts write
+only the main file. Another system, for example a provisioner, can supply the
+files in the directory.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import re
 import secrets
 import tomllib
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+
+log = logging.getLogger("hyperspace.accounts")
 
 SCOPES = ("append", "read", "grant")
 READ_SCOPES = ("own", "granted", "all")
@@ -221,62 +229,187 @@ def dump_accounts(accounts: Accounts) -> str:
     return "\n".join(lines)
 
 
+# Credential id -> (account id, credential).
+Index = dict[str, tuple[str, Credential]]
+
+
+def _check(index: Index, token: str, now: datetime) -> Principal | None:
+    parsed = parse_token(token)
+    if parsed is None:
+        return None
+    credential_id, secret = parsed
+    found = index.get(credential_id)
+    # Hash even when the id is unknown, so that the time does not show
+    # whether the id exists.
+    digest = hash_secret(secret)
+    if found is None:
+        hmac.compare_digest(digest, "0" * 64)
+        return None
+    account_id, cred = found
+    if not hmac.compare_digest(digest, cred.secret_sha256):
+        return None
+    if cred.expired(now):
+        return None
+    return Principal(
+        account=account_id,
+        host=cred.host,
+        scopes=cred.scopes,
+        read=cred.read,
+        credential=cred.id,
+    )
+
+
 class AccountsFile:
-    """The accounts file, reloaded when it changes on disk."""
+    """One accounts file, reloaded when it changes on disk."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._stamp: tuple[int, int] | None = None
-        self._accounts = Accounts()
-        self._index: dict[str, tuple[Account, Credential]] = {}
+        self._stamp: tuple[int, int, int] | None = None
+        self.index: Index = {}
         self.error: str | None = None
         self.reload()
 
-    def reload(self) -> None:
-        """Read the file if it changed. On an error, keep no credentials:
-        a broken file must not leave revoked credentials in use."""
+    def reload(self) -> bool:
+        """Read the file if it changed, and return True if it did. On an
+        error, keep no credentials: a broken file must not leave revoked
+        credentials in use. A file that does not exist has no credentials
+        and is not an error."""
         try:
             stat = self.path.stat()
         except FileNotFoundError:
+            changed = self._stamp is not None or self.error is not None
             self._stamp = None
-            self._accounts = Accounts()
-            self._index = {}
+            self.index = {}
             self.error = None
-            return
-        stamp = (stat.st_mtime_ns, stat.st_size)
+            return changed
+        except OSError as exc:
+            error = f"{self.path}: {exc}"
+            changed = self._stamp is not None or self.error != error
+            self._stamp = None
+            self.index = {}
+            self.error = error
+            return changed
+        # An atomic replace (by the admin scripts, or in a Kubernetes Secret
+        # volume) can keep the time and the size, but not the inode.
+        stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
         if stamp == self._stamp:
-            return
+            return False
         self._stamp = stamp
         try:
-            self._accounts = parse_accounts(self.path.read_text())
+            accounts = parse_accounts(self.path.read_text())
             self.error = None
         except (AccountsError, OSError, UnicodeDecodeError) as exc:
-            self._accounts = Accounts()
-            self.error = str(exc)
-        self._index = self._accounts.by_credential()
+            accounts = Accounts()
+            self.error = f"{self.path}: {exc}"
+        self.index = {
+            cid: (account.id, cred)
+            for cid, (account, cred) in accounts.by_credential().items()
+        }
+        return True
 
     def authenticate(self, token: str, now: datetime) -> Principal | None:
         self.reload()
-        parsed = parse_token(token)
-        if parsed is None:
-            return None
-        credential_id, secret = parsed
-        found = self._index.get(credential_id)
-        # Hash even when the id is unknown, so that the time does not show
-        # whether the id exists.
-        digest = hash_secret(secret)
-        if found is None:
-            hmac.compare_digest(digest, "0" * 64)
-            return None
-        account, cred = found
-        if not hmac.compare_digest(digest, cred.secret_sha256):
-            return None
-        if cred.expired(now):
-            return None
-        return Principal(
-            account=account.id,
-            host=cred.host,
-            scopes=cred.scopes,
-            read=cred.read,
-            credential=cred.id,
-        )
+        return _check(self.index, token, now)
+
+
+def account_files(directory: Path) -> list[Path]:
+    """The accounts files in an accounts directory, sorted by name: the
+    regular files whose names end in `.toml`. Names that start with a dot are
+    not included; a Kubernetes Secret volume keeps its internal data there.
+
+    Raise `OSError` if the directory cannot be listed."""
+    return sorted(
+        p
+        for p in directory.iterdir()
+        if p.name.endswith(".toml") and not p.name.startswith(".") and p.is_file()
+    )
+
+
+class AccountSources:
+    """The main accounts file and the files in the accounts directory, as one
+    set of credentials. Each check reloads the files that changed and lists
+    the directory again, so a change takes effect at once.
+
+    - An account that is in more than one file has the credentials of all of
+      them. One account can thus have credentials from the admin scripts and
+      from a provisioner.
+    - A file that is not valid gives no credentials, but the other files still
+      work. A directory that cannot be listed gives no credentials.
+    - A credential id that is in more than one file works in none of them.
+    """
+
+    def __init__(self, main: Path, directory: Path | None = None) -> None:
+        self.main = AccountsFile(main)
+        self.directory = directory
+        self._files: dict[Path, AccountsFile] = {}
+        self._directory_error: str | None = None
+        self._index: Index = {}
+        self.errors: tuple[str, ...] = ()
+        self._reload_directory()
+        self._rebuild()
+
+    @property
+    def error(self) -> str | None:
+        return "; ".join(self.errors) or None
+
+    def reload(self) -> None:
+        changed = self.main.reload()
+        if self._reload_directory():
+            changed = True
+        if changed:
+            self._rebuild()
+
+    def _reload_directory(self) -> bool:
+        if self.directory is None:
+            return False
+        error: str | None = None
+        try:
+            paths = account_files(self.directory)
+        except FileNotFoundError:
+            paths = []
+        except OSError as exc:
+            paths = []
+            error = f"{self.directory}: {exc}"
+        changed = error != self._directory_error or paths != list(self._files)
+        self._directory_error = error
+        files: dict[Path, AccountsFile] = {}
+        for path in paths:
+            old = self._files.get(path)
+            if old is None:
+                files[path] = AccountsFile(path)
+            else:
+                files[path] = old
+                if old.reload():
+                    changed = True
+        self._files = files
+        return changed
+
+    def _rebuild(self) -> None:
+        sources = [self.main, *self._files.values()]
+        errors = [f.error for f in sources if f.error]
+        if self._directory_error:
+            errors.append(self._directory_error)
+        index: Index = {}
+        places: dict[str, list[Path]] = {}
+        for source in sources:
+            for cid, entry in source.index.items():
+                index[cid] = entry
+                places.setdefault(cid, []).append(source.path)
+        for cid, paths in places.items():
+            if len(paths) > 1:
+                del index[cid]
+                errors.append(
+                    f"credential {cid} is in more than one file "
+                    f"({', '.join(str(p) for p in paths)}); it works in none of them"
+                )
+        self._index = index
+        for message in errors:
+            if message not in self.errors:
+                log.error("accounts: %s", message)
+        if self.errors and not errors:
+            log.info("accounts: all accounts files are valid again")
+        self.errors = tuple(errors)
+
+    def authenticate(self, token: str, now: datetime) -> Principal | None:
+        self.reload()
+        return _check(self._index, token, now)

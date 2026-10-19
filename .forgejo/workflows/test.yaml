@@ -51,7 +51,8 @@ jobs:
           "$HELM" template t charts/hyperspace $SET \
             --set ingress.enabled=true --set ingress.host=hyperspace.example.com \
             --set ingress.tls.secretName=tls --set persistence.existingClaim=data \
-            --set 'server.trustedProxies={10.0.0.0/8}' > /tmp/full.yaml
+            --set 'server.trustedProxies={10.0.0.0/8}' \
+            --set 'accountsSecrets={runners,services}' > /tmp/full.yaml
           /tmp/kubeconform -strict -summary /tmp/default.yaml /tmp/full.yaml
           # Flux sets the chart version of an OCI source to <version>+<digest>.
           # A label value must not contain "+", and kubeconform does not check

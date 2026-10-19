@@ -5,7 +5,8 @@
     scripts/revoke-credential.py abcdefghijkl
 
 The server reloads the accounts file when it changes, so the credential stops
-working at once.
+working at once. A credential in the accounts directory cannot be revoked
+here: remove it where that file comes from.
 """
 
 # /// script
@@ -37,7 +38,8 @@ def main() -> int:
     parser.add_argument("credential_id")
     parser.add_argument("--data-dir", type=Path, default=None)
     args = parser.parse_args()
-    path = (args.data_dir or _new.data_dir()) / "accounts.toml"
+    data = args.data_dir or _new.data_dir()
+    path = data / "accounts.toml"
     try:
         with _new.locked_accounts(path):
             accounts = _new.load_accounts(path)
@@ -50,7 +52,18 @@ def main() -> int:
                     found = True
                     accounts.accounts[account_id] = replace(account, credentials=kept)
             if not found:
-                print(f"error: no credential {args.credential_id}", file=sys.stderr)
+                source = _new.directory_credentials(_new.accounts_dir(data)).get(
+                    args.credential_id
+                )
+                if source is not None:
+                    print(
+                        f"error: credential {args.credential_id} is in {source}, "
+                        "which the server only reads. Remove it where that file "
+                        "comes from.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"error: no credential {args.credential_id}", file=sys.stderr)
                 return 1
             _new.write_accounts(path, accounts)
     except AccountsError as exc:

@@ -18,7 +18,7 @@ from starlette.testclient import TestClient
 from accounts import (
     Account,
     Accounts,
-    AccountsFile,
+    AccountSources,
     Credential,
     dump_accounts,
     new_token,
@@ -88,7 +88,7 @@ def make_server(
     store = Store(data)
     app = create_app(
         store,
-        AccountsFile(path),
+        AccountSources(path),
         Settings(**{"data_dir": data, "requests_per_minute": 100_000, **settings}),
     )
     return Server(store, app, tokens)

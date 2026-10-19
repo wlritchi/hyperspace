@@ -73,6 +73,10 @@ spec:
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
+            {{- if .Values.accountsSecrets }}
+            - name: HYPERSPACE_ACCOUNTS_DIR
+              value: /etc/hyperspace/accounts.d
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -94,6 +98,11 @@ spec:
             # writable /tmp.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.accountsSecrets }}
+            - name: accounts
+              mountPath: /etc/hyperspace/accounts.d
+              readOnly: true
+            {{- end }}
           {{- with .Values.resources }}
           resources:
             {{- toYaml . | nindent 12 }}
@@ -104,6 +113,17 @@ spec:
             claimName: {{ include "hyperspace.claimName" . }}
         - name: tmp
           emptyDir: {}
+        {{- with .Values.accountsSecrets }}
+        - name: accounts
+          projected:
+            defaultMode: 0440
+            sources:
+              {{- range . }}
+              - secret:
+                  name: {{ . | quote }}
+                  optional: true
+              {{- end }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

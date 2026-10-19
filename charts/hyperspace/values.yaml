@@ -42,6 +42,13 @@ server:
   failedAuthPerMinute: ""
   globalFailedAuthPerMinute: ""
 
+# Secrets with read-only accounts files, for credentials that another system
+# makes (for example, a provisioner). Each key that ends in .toml is an
+# accounts file. The server merges them with the accounts file on the volume;
+# see "Accounts files" in the spec. Keys must be unique across these Secrets.
+# A Secret that does not exist gives no credentials and does not stop the pod.
+accountsSecrets: []
+
 extraEnv: []
 
 resources: {}

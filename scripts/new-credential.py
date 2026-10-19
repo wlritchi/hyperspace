@@ -35,6 +35,7 @@ from accounts import (
     Accounts,
     AccountsError,
     Credential,
+    account_files,
     dump_accounts,
     new_token,
     parse_accounts,
@@ -46,6 +47,31 @@ def data_dir() -> Path:
         return Path(os.environ["HYPERSPACE_DATA_DIR"])
     base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
     return Path(base) / "hyperspace"
+
+
+def accounts_dir(data: Path) -> Path:
+    """The directory of read-only accounts files, with the server's default."""
+    if os.environ.get("HYPERSPACE_ACCOUNTS_DIR"):
+        return Path(os.environ["HYPERSPACE_ACCOUNTS_DIR"])
+    return data / "accounts.d"
+
+
+def directory_credentials(directory: Path) -> dict[str, Path]:
+    """Credential id -> file, for the valid files in the accounts directory.
+    These scripts never write those files."""
+    out: dict[str, Path] = {}
+    try:
+        paths = account_files(directory)
+    except OSError:
+        return out
+    for path in paths:
+        try:
+            accounts = parse_accounts(path.read_text())
+        except (AccountsError, OSError, UnicodeDecodeError):
+            continue
+        for cid in accounts.by_credential():
+            out[cid] = path
+    return out
 
 
 @contextmanager
@@ -94,26 +120,34 @@ def main() -> int:
     parser.add_argument("--data-dir", type=Path, default=None)
     args = parser.parse_args()
 
-    path = (args.data_dir or data_dir()) / "accounts.toml"
+    data = args.data_dir or data_dir()
+    path = data / "accounts.toml"
     scopes = frozenset(s.strip() for s in args.scopes.split(",") if s.strip())
     expires = None
     if args.expires:
         expires = datetime.fromisoformat(args.expires)
         if expires.tzinfo is None:
             expires = expires.replace(tzinfo=UTC)
-    token, credential_id, digest = new_token()
-    credential = Credential(
-        id=credential_id,
-        secret_sha256=digest,
-        host=args.host,
-        scopes=scopes,
-        read=args.read,
-        expires_at=expires,
-        label=args.label,
-    )
     try:
         with locked_accounts(path):
             accounts = load_accounts(path)
+            # A credential id in two files works in neither.
+            taken = (
+                accounts.by_credential().keys()
+                | directory_credentials(accounts_dir(data)).keys()
+            )
+            token, credential_id, digest = new_token()
+            while credential_id in taken:
+                token, credential_id, digest = new_token()
+            credential = Credential(
+                id=credential_id,
+                secret_sha256=digest,
+                host=args.host,
+                scopes=scopes,
+                read=args.read,
+                expires_at=expires,
+                label=args.label,
+            )
             account = accounts.accounts.get(args.account, Account(id=args.account))
             accounts.accounts[args.account] = replace(
                 account, credentials=(*account.credentials, credential)

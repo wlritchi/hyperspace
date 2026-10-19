@@ -14,7 +14,7 @@ from starlette.testclient import TestClient
 from accounts import (
     Account,
     Accounts,
-    AccountsFile,
+    AccountSources,
     Credential,
     dump_accounts,
     new_token,
@@ -72,7 +72,7 @@ def env(tmp_path: Path) -> Iterator[Env]:
     )
     store = Store(data)
     settings = Settings(data_dir=data, failed_auth_per_minute=5)
-    app = create_app(store, AccountsFile(path), settings)
+    app = create_app(store, AccountSources(path), settings)
     with TestClient(app) as client:
         yield Env(client, tokens, path, creds)
     store.close()

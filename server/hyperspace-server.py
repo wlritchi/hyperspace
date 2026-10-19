@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
 import uvicorn
 
-from accounts import AccountsFile
+from accounts import AccountSources
 from app import Settings, create_app
 from store import Store
 
@@ -47,7 +47,9 @@ def main() -> None:
         logging.getLogger("hyperspace").warning(
             "cut uncommitted frames from %d generation files", len(cut)
         )
-    accounts = AccountsFile(settings.data_dir / "accounts.toml")
+    accounts = AccountSources(
+        settings.data_dir / "accounts.toml", settings.accounts_dir
+    )
     app = create_app(store, accounts, settings)
     uvicorn.run(
         app,

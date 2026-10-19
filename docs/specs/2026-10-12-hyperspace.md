@@ -662,6 +662,7 @@ $HYPERSPACE_DATA_DIR/
                            one frame per segment
   objects/ab/<sha256>.zst  blob versions, content-addressed
   accounts.toml            credentials (sha256 of the secret only)
+  accounts.d/*.toml        read-only accounts files (see "Accounts files")
 ```
 
 - The zstd format permits concatenated frames. A generation file is therefore
@@ -746,19 +747,53 @@ run inside the server container, so they need shell access to the pod
   the index.
 - `scripts/stats.py`: sizes per host, per workspace, and per harness.
 
+### Accounts files
+
+The server reads credentials from two places:
+
+- `accounts.toml` in the data directory. The admin scripts write only this
+  file.
+- The `*.toml` files in the accounts directory (`HYPERSPACE_ACCOUNTS_DIR`).
+  The server only reads them. Another system supplies them, for example a
+  provisioner that makes a credential for each runner and writes a Kubernetes
+  Secret. A token is `hsp_<id>_<secret>` and the file has only the sha256 of
+  the secret, so the provisioner can make the token itself. Names that start
+  with a dot are not read.
+
+All the files have the same format, and the server merges them:
+
+- An account that is in more than one file has the credentials of all of them.
+  Runner credentials from a provisioner can thus be in the same account as the
+  workstation credentials from the admin scripts, so that sessions can
+  teleport between them.
+- A file that is not valid gives no credentials, but the other files still
+  work. A directory that cannot be listed gives no credentials. A directory
+  that does not exist is not an error.
+- A credential id that is in more than one file works in none of them.
+- At each authentication, the server checks each file for a change (inode,
+  time, and size) and lists the directory again. A change, also an atomic
+  update of a Kubernetes Secret volume, takes effect at once.
+- The server logs an error when it appears, not at each authentication.
+
+`scripts/new-credential.py` does not use an id that is in the directory.
+`scripts/revoke-credential.py` refuses a credential from the directory,
+because the next update from its source would bring it back; remove it at the
+source.
+
 ### Configuration
 
-| Variable                                   | Default                      |
-| ------------------------------------------ | ---------------------------- |
-| `HYPERSPACE_DATA_DIR`                      | `$XDG_DATA_HOME/hyperspace`  |
-| `HYPERSPACE_LISTEN_HOST`                   | `127.0.0.1`                  |
-| `HYPERSPACE_PORT`                          | `8139`                       |
-| `HYPERSPACE_MAX_BODY`                      | 8 MiB (also the maximum)     |
-| `HYPERSPACE_TRUSTED_PROXIES`               | none (comma-separated CIDRs) |
-| `HYPERSPACE_RATE_PER_MINUTE`               | 1200 requests per credential |
-| `HYPERSPACE_BYTES_PER_DAY`                 | 4 GiB per credential         |
-| `HYPERSPACE_FAILED_AUTH_PER_MINUTE`        | 30 per address (IPv6: /64)   |
-| `HYPERSPACE_GLOBAL_FAILED_AUTH_PER_MINUTE` | 1000 from all addresses      |
+| Variable                                   | Default                           |
+| ------------------------------------------ | --------------------------------- |
+| `HYPERSPACE_DATA_DIR`                      | `$XDG_DATA_HOME/hyperspace`       |
+| `HYPERSPACE_ACCOUNTS_DIR`                  | `$HYPERSPACE_DATA_DIR/accounts.d` |
+| `HYPERSPACE_LISTEN_HOST`                   | `127.0.0.1`                       |
+| `HYPERSPACE_PORT`                          | `8139`                            |
+| `HYPERSPACE_MAX_BODY`                      | 8 MiB (also the maximum)          |
+| `HYPERSPACE_TRUSTED_PROXIES`               | none (comma-separated CIDRs)      |
+| `HYPERSPACE_RATE_PER_MINUTE`               | 1200 requests per credential      |
+| `HYPERSPACE_BYTES_PER_DAY`                 | 4 GiB per credential              |
+| `HYPERSPACE_FAILED_AUTH_PER_MINUTE`        | 30 per address (IPv6: /64)        |
+| `HYPERSPACE_GLOBAL_FAILED_AUTH_PER_MINUTE` | 1000 from all addresses           |
 
 `HYPERSPACE_TRUSTED_PROXIES` lists the proxies whose `X-Forwarded-For` the
 server trusts. Behind a proxy that is not in the list, all clients have the
@@ -789,8 +824,8 @@ server is on the open internet from the first release.
 - **Credentials.** One credential per host, `hsp_<id>_<secret>`, with 256 bits
   of secret. The server stores only the sha256 of the secret, and compares
   with a constant-time function. Credentials can expire, and the server
-  reloads `accounts.toml` when it changes, so a revoked credential stops at
-  once. There is no master token on the network.
+  reloads the accounts files when they change, so a revoked credential stops
+  at once. There is no master token on the network.
 - **Scopes.** Each credential has scopes:
   - `append`: back up sessions as its own host. A credential cannot write as a
     different host, and the protocol cannot change or remove data. A stolen

@@ -70,6 +70,40 @@ A runner with `--read granted` can read only its own sessions and the sessions
 granted to it. Revoke a credential with
 `scripts/revoke-credential.py <credential id>`; it stops working at once.
 
+### Credentials from a provisioner
+
+A provisioner (for example, OpenTofu) can make credentials with no step in the
+pod. It makes each token itself, gives the token to the host (for example, in
+a Secret for a runner), and gives the server an accounts file with the sha256
+of each secret:
+
+- Token: `hsp_<id>_<secret>`. The id is 12 characters from `a`-`z` and
+  `2`-`7`. The secret is at least 40 characters from `A`-`Z`, `a`-`z`,
+  `0`-`9`, `-` and `_`; use at least 256 random bits.
+- Accounts file: the format in `lib/accounts.py`, with `secret_sha256` = the
+  hex sha256 of the secret (the part after the id).
+
+```toml
+[[accounts.default.credentials]]
+id = "abcdefghijkl"
+secret_sha256 = "<hex sha256 of the secret>"
+host = "agent-1"
+scopes = ["append", "read", "grant"]
+read = "granted"
+```
+
+Put the file in a Secret, under a key that ends in `.toml`, and name the
+Secret in the chart:
+
+```yaml
+accountsSecrets:
+  - hyperspace-runner-accounts
+```
+
+Use the account id of your other credentials, so that sessions can teleport
+between the hosts. To revoke a credential, remove it at the provisioner. See
+"Accounts files" in the spec for how the server merges the files.
+
 ## 3. Set up a workstation
 
 Install the client:

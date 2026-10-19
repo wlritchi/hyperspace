@@ -29,7 +29,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
-from accounts import AccountsFile, Principal, parse_token
+from accounts import AccountSources, Principal, parse_token
 from hyperspace_protocol import (
     API_PREFIX,
     CAPABILITIES,
@@ -80,6 +80,8 @@ _STATUS = {
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
+    # Read-only accounts files; see `AccountSources`. None: no directory.
+    accounts_dir: Path | None = None
     listen_host: str = "127.0.0.1"
     port: int = 8139
     max_body: int = MAX_BODY
@@ -101,8 +103,12 @@ class Settings:
             for p in env.get("HYPERSPACE_TRUSTED_PROXIES", "").split(",")
             if p.strip()
         )
+        data_dir = Path(env.get("HYPERSPACE_DATA_DIR") or default_data)
         return cls(
-            data_dir=Path(env.get("HYPERSPACE_DATA_DIR") or default_data),
+            data_dir=data_dir,
+            accounts_dir=Path(
+                env.get("HYPERSPACE_ACCOUNTS_DIR") or data_dir / "accounts.d"
+            ),
             listen_host=env.get("HYPERSPACE_LISTEN_HOST", "127.0.0.1"),
             port=int(env.get("HYPERSPACE_PORT", "8139")),
             max_body=min(int(env.get("HYPERSPACE_MAX_BODY", str(MAX_BODY))), MAX_BODY),
@@ -327,7 +333,7 @@ def blob_path(request: Request) -> str:
 Handler = Callable[[Request, Principal], Awaitable[Response]]
 
 
-def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Starlette:
+def create_app(store: Store, accounts: AccountSources, settings: Settings) -> Starlette:
     limiter = _Limiter(settings)
 
     def now() -> datetime:
@@ -779,7 +785,5 @@ def create_app(store: Store, accounts: AccountsFile, settings: Settings) -> Star
         Route(f"{s}/blobs/{{path:path}}", put_blob, methods=["PUT"]),
         Route(f"{s}/blobs/{{path:path}}", get_blob, methods=["GET"]),
     ]
-    app = Starlette(routes=routes)
-    if accounts.error:
-        log.error("accounts file is invalid; no credentials work: %s", accounts.error)
-    return app
+    # AccountSources logs its errors when it loads the files.
+    return Starlette(routes=routes)
