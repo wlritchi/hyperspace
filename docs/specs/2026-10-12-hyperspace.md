@@ -770,15 +770,30 @@ All the files have the same format, and the server merges them:
   work. A directory that cannot be listed gives no credentials. A directory
   that does not exist is not an error.
 - A credential id that is in more than one file works in none of them.
-- At each authentication, the server checks each file for a change (inode,
-  time, and size) and lists the directory again. A change, also an atomic
-  update of a Kubernetes Secret volume, takes effect at once.
+- At each authentication, the server checks each file for a change (device,
+  inode, change and modification times, and size) and lists the directory
+  again. A change takes effect at once. This includes an atomic update of a
+  Kubernetes Secret volume.
+- The server checks the file stamps and the directory listing again before it
+  uses the merged credentials. If a source changes during these checks, the
+  server tries again, up to three attempts. If the sources keep changing, no
+  credentials work for that authentication, including those in the main file.
+  The server logs an error and checks again at the next authentication.
 - The server logs an error when it appears, not at each authentication.
 
 `scripts/new-credential.py` does not use an id that is in the directory.
-`scripts/revoke-credential.py` refuses a credential from the directory,
-because the next update from its source would bring it back; remove it at the
-source.
+`scripts/revoke-credential.py` never changes the directory:
+
+- When a file in the directory has the id, the script refuses, because the
+  next update from the source of that file would bring the credential back.
+  Remove the credential at that source.
+- When `accounts.toml` also has that id, the script does not change
+  `accounts.toml`. If it removed that copy, the copy in the directory would
+  work. Remove the credential at the source first, then run the script again.
+- When the script cannot read a file in the directory, or cannot list the
+  directory, it revokes the credential in `accounts.toml` and gives a warning
+  for each file that it did not check. Such a file can have the credential and
+  become valid again, so check its source.
 
 ### Configuration
 

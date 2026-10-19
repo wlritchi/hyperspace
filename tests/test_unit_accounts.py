@@ -246,6 +246,144 @@ def test_sources_follow_a_secret_volume_update(tmp_path: Path) -> None:
     assert sources.authenticate(new_token_, NOW) is not None
 
 
+def test_sources_reject_duplicate_during_volume_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token, cred = make()
+    directory = tmp_path / "accounts.d"
+    for name in ("a.toml", "b.toml"):
+        write_account(directory / "..v1" / name, "default", cred)
+        write_account(directory / "..v2" / name, "default")
+        (directory / name).symlink_to(f"..data/{name}")
+    (directory / "..data").symlink_to("..v1")
+    sources = AccountSources(tmp_path / "accounts.toml", directory)
+    assert sources.authenticate(token, NOW) is None
+    original = AccountsFile.reload
+    swapped = False
+
+    def reload(file: AccountsFile) -> bool:
+        nonlocal swapped
+        changed = original(file)
+        if file.path == directory / "a.toml" and not swapped:
+            (directory / "..next").symlink_to("..v2")
+            os.replace(directory / "..next", directory / "..data")
+            swapped = True
+        return changed
+
+    monkeypatch.setattr(AccountsFile, "reload", reload)
+    assert sources.authenticate(token, NOW) is None
+    assert swapped
+    assert sources.authenticate(token, NOW) is None
+    assert sources.errors == ()
+
+
+def test_sources_exhaustion_does_not_log_unverified_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    token, cred = make()
+    directory = tmp_path / "accounts.d"
+    for generation in range(4):
+        for position, name in enumerate(("a.toml", "b.toml")):
+            creds = (cred,) if generation % 2 == position else ()
+            write_account(directory / f"..v{generation}" / name, "default", *creds)
+    for name in ("a.toml", "b.toml"):
+        (directory / name).symlink_to(f"..data/{name}")
+    (directory / "..data").symlink_to("..v0")
+    sources = AccountSources(tmp_path / "accounts.toml", directory)
+    assert sources.authenticate(token, NOW) is not None
+    original = AccountsFile.reload
+    swaps = 0
+
+    def reload(file: AccountsFile) -> bool:
+        nonlocal swaps
+        changed = original(file)
+        if file.path == directory / "a.toml" and swaps < 3:
+            swaps += 1
+            (directory / "..next").symlink_to(f"..v{swaps}")
+            os.replace(directory / "..next", directory / "..data")
+        return changed
+
+    monkeypatch.setattr(AccountsFile, "reload", reload)
+    assert sources.authenticate(token, NOW) is None
+    assert swaps == 3
+    assert len(sources.errors) == 1
+    assert "changed during reload" in sources.errors[0]
+    assert sources.authenticate(token, NOW) is not None
+    assert sources.errors == ()
+    assert not any("more than one file" in r.message for r in caplog.records)
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1
+
+
+@pytest.mark.parametrize("broken_file", [False, True])
+def test_sources_churn_fails_closed_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    broken_file: bool,
+) -> None:
+    token, cred = make()
+    path = tmp_path / "accounts.toml"
+    write(path, cred)
+    directory = tmp_path / "accounts.d"
+    directory.mkdir()
+    if broken_file:
+        (directory / "broken.toml").write_text("broken [")
+    caplog.set_level("INFO", logger="hyperspace.accounts")
+    sources = AccountSources(path, directory)
+    original = AccountsFile.reload
+    calls = 0
+
+    def reload(file: AccountsFile) -> bool:
+        nonlocal calls
+        changed = original(file)
+        if file.path == path:
+            calls += 1
+            os.utime(path, ns=(calls, calls))
+        return changed
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AccountsFile, "reload", reload)
+        for _ in range(2):
+            assert sources.authenticate(token, NOW) is None
+        assert calls == 6
+        assert "changed during reload" in (sources.error or "")
+        assert len([r for r in caplog.records if r.levelname == "ERROR"]) == (
+            1 + broken_file
+        )
+    assert sources.authenticate(token, NOW) is not None
+    assert len(sources.errors) == int(broken_file)
+    assert len([r for r in caplog.records if r.levelname == "ERROR"]) == 1 + broken_file
+    assert sum("stable again" in r.message for r in caplog.records) == 1
+    assert sources.authenticate(token, NOW) is not None
+    assert sum("stable again" in r.message for r in caplog.records) == 1
+
+
+def test_sources_verify_main_and_directory_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token, cred = make()
+    path = tmp_path / "accounts.toml"
+    directory = tmp_path / "accounts.d"
+    write(path, cred)
+    directory.mkdir()
+    sources = AccountSources(path, directory)
+    original = sources._reload_directory
+    changed = False
+
+    def reload() -> bool:
+        nonlocal changed
+        result = original()
+        if not changed:
+            write(path)
+            write_account(directory / "a.toml", "default", cred)
+            write_account(directory / "b.toml", "default", cred)
+            changed = True
+        return result
+
+    monkeypatch.setattr(sources, "_reload_directory", reload)
+    assert sources.authenticate(token, NOW) is None
+
+
 def test_sources_unreadable_directory_is_an_error(tmp_path: Path) -> None:
     token, c = make()
     directory = tmp_path / "accounts.d"

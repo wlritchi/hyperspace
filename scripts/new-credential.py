@@ -56,22 +56,38 @@ def accounts_dir(data: Path) -> Path:
     return data / "accounts.d"
 
 
-def directory_credentials(directory: Path) -> dict[str, Path]:
-    """Credential id -> file, for the valid files in the accounts directory.
-    These scripts never write those files."""
+def scan_directory(
+    directory: Path,
+) -> tuple[dict[str, Path], list[tuple[Path, str]]]:
+    """Credential id -> file, for the valid files in the accounts directory,
+    and (path, reason) for each file or directory that could not be checked.
+    A directory that does not exist is not an error. These scripts never
+    write those files."""
     out: dict[str, Path] = {}
+    unchecked: list[tuple[Path, str]] = []
     try:
         paths = account_files(directory)
-    except OSError:
-        return out
+    except FileNotFoundError:
+        return out, unchecked
+    except OSError as exc:
+        unchecked.append((directory, str(exc)))
+        return out, unchecked
     for path in paths:
         try:
             accounts = parse_accounts(path.read_text())
-        except (AccountsError, OSError, UnicodeDecodeError):
+        except (AccountsError, OSError, UnicodeDecodeError) as exc:
+            unchecked.append((path, str(exc)))
             continue
         for cid in accounts.by_credential():
             out[cid] = path
-    return out
+    return out, unchecked
+
+
+def directory_credentials(directory: Path) -> dict[str, Path]:
+    """Credential id -> file, for the valid files in the accounts directory.
+    Files that could not be checked are not included: a random new id is
+    unlikely to match an id in them."""
+    return scan_directory(directory)[0]
 
 
 @contextmanager

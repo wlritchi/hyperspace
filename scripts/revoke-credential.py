@@ -40,6 +40,7 @@ def main() -> int:
     args = parser.parse_args()
     data = args.data_dir or _new.data_dir()
     path = data / "accounts.toml"
+    unchecked: list[tuple[Path, str]] = []
     try:
         with _new.locked_accounts(path):
             accounts = _new.load_accounts(path)
@@ -51,24 +52,53 @@ def main() -> int:
                 if len(kept) != len(account.credentials):
                     found = True
                     accounts.accounts[account_id] = replace(account, credentials=kept)
-            if not found:
-                source = _new.directory_credentials(_new.accounts_dir(data)).get(
-                    args.credential_id
+            # Check the directory also when accounts.toml has the id. An id in
+            # two files works in neither, so to remove only the copy in
+            # accounts.toml would make the copy in the directory work.
+            in_directory, unchecked = _new.scan_directory(_new.accounts_dir(data))
+            # A file that is not valid gives no credentials now, but it can
+            # have this credential and become valid again. Do not refuse: an
+            # emergency revocation must not wait for an unrelated broken file.
+            for unchecked_path, reason in unchecked:
+                print(
+                    f"warning: could not check {unchecked_path} for credential "
+                    f"{args.credential_id}: {reason}",
+                    file=sys.stderr,
                 )
-                if source is not None:
+            source = in_directory.get(args.credential_id)
+            if source is not None:
+                print(
+                    f"error: credential {args.credential_id} is in {source}, "
+                    "which the server only reads. Remove it where that file "
+                    "comes from.",
+                    file=sys.stderr,
+                )
+                if found:
                     print(
-                        f"error: credential {args.credential_id} is in {source}, "
-                        "which the server only reads. Remove it where that file "
-                        "comes from.",
+                        f"note: {path} also has it, and this script did not "
+                        "change that file. Run this script again after the "
+                        "credential is gone from the directory.",
                         file=sys.stderr,
                     )
-                else:
-                    print(f"error: no credential {args.credential_id}", file=sys.stderr)
+                return 1
+            if not found:
+                where = " in the files that could be checked" if unchecked else ""
+                print(
+                    f"error: no credential {args.credential_id}{where}",
+                    file=sys.stderr,
+                )
                 return 1
             _new.write_accounts(path, accounts)
     except AccountsError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if unchecked:
+        print(
+            f"warning: this script changed only {path}. Make sure that the "
+            "source of the accounts directory does not have credential "
+            f"{args.credential_id}.",
+            file=sys.stderr,
+        )
     print(f"revoked {args.credential_id}", file=sys.stderr)
     return 0
 

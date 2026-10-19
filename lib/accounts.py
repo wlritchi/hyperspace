@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import os
 import re
 import secrets
 import tomllib
@@ -259,12 +260,16 @@ def _check(index: Index, token: str, now: datetime) -> Principal | None:
     )
 
 
+def _file_stamp(stat: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+
+
 class AccountsFile:
     """One accounts file, reloaded when it changes on disk."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
-        self._stamp: tuple[int, int, int] | None = None
+        self._stamp: tuple[int, int, int, int, int] | None = None
         self.index: Index = {}
         self.error: str | None = None
         self.reload()
@@ -290,8 +295,9 @@ class AccountsFile:
             self.error = error
             return changed
         # An atomic replace (by the admin scripts, or in a Kubernetes Secret
-        # volume) can keep the time and the size, but not the inode.
-        stamp = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        # volume) can keep the size and the modification time. The stamp
+        # therefore also has the device, the inode and the change time.
+        stamp = _file_stamp(stat)
         if stamp == self._stamp:
             return False
         self._stamp = stamp
@@ -306,6 +312,15 @@ class AccountsFile:
             for cid, (account, cred) in accounts.by_credential().items()
         }
         return True
+
+    def unchanged(self) -> bool:
+        """True for the same stamp, or still missing or unreadable with the same error."""
+        try:
+            return _file_stamp(self.path.stat()) == self._stamp
+        except FileNotFoundError:
+            return self._stamp is None and self.error is None
+        except OSError as exc:
+            return self._stamp is None and self.error == f"{self.path}: {exc}"
 
     def authenticate(self, token: str, now: datetime) -> Principal | None:
         self.reload()
@@ -345,7 +360,8 @@ class AccountSources:
         self._directory_error: str | None = None
         self._index: Index = {}
         self.errors: tuple[str, ...] = ()
-        self._reload_directory()
+        self._snapshot_error: str | None = None
+        self.reload()
         self._rebuild()
 
     @property
@@ -353,15 +369,35 @@ class AccountSources:
         return "; ".join(self.errors) or None
 
     def reload(self) -> None:
-        changed = self.main.reload()
-        if self._reload_directory():
-            changed = True
-        if changed:
-            self._rebuild()
+        changed = self._snapshot_error is not None
+        for _ in range(3):
+            changed = self.main.reload() or changed
+            changed = self._reload_directory() or changed
+            # A volume update can remove a duplicate between file reads.
+            # Do not use the merged credentials until a second check finds
+            # the same directory listing and the same file stamps.
+            paths, error = self._directory_listing()
+            if (
+                paths == list(self._files)
+                and error == self._directory_error
+                and all(f.unchanged() for f in [self.main, *self._files.values()])
+            ):
+                if self._snapshot_error:
+                    log.info(
+                        "accounts: the accounts files are stable again; credentials work"
+                    )
+                self._snapshot_error = None
+                if changed:
+                    self._rebuild()
+                return
+        self._snapshot_error = (
+            "accounts files changed during reload; no credentials work"
+        )
+        self._rebuild()
 
-    def _reload_directory(self) -> bool:
+    def _directory_listing(self) -> tuple[list[Path], str | None]:
         if self.directory is None:
-            return False
+            return [], None
         error: str | None = None
         try:
             paths = account_files(self.directory)
@@ -370,6 +406,10 @@ class AccountSources:
         except OSError as exc:
             paths = []
             error = f"{self.directory}: {exc}"
+        return paths, error
+
+    def _reload_directory(self) -> bool:
+        paths, error = self._directory_listing()
         changed = error != self._directory_error or paths != list(self._files)
         self._directory_error = error
         files: dict[Path, AccountsFile] = {}
@@ -402,6 +442,14 @@ class AccountSources:
                     f"credential {cid} is in more than one file "
                     f"({', '.join(str(p) for p in paths)}); it works in none of them"
                 )
+        if self._snapshot_error:
+            index = {}
+            # An unverified attempt can contain duplicates that never existed.
+            # Keep only the errors from the last verified sources.
+            errors = [
+                *(e for e in self.errors if e != self._snapshot_error),
+                self._snapshot_error,
+            ]
         self._index = index
         for message in errors:
             if message not in self.errors:

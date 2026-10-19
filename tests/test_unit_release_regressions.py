@@ -8,9 +8,18 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
-from accounts import parse_accounts
+from accounts import (
+    Account,
+    Accounts,
+    AccountSources,
+    Credential,
+    dump_accounts,
+    new_token,
+    parse_accounts,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -77,6 +86,107 @@ except BlockingIOError:
         [sys.executable, "-c", code, str(path.with_suffix(".lock"))], check=False
     )
     assert result.returncode == 0
+
+
+def test_revoke_refuses_id_also_in_accounts_directory(tmp_path):
+    token, cid, digest = new_token()
+    credential = Credential(
+        id=cid, secret_sha256=digest, host="runner", scopes=frozenset({"read"})
+    )
+    text = dump_accounts(
+        Accounts({"default": Account(id="default", credentials=(credential,))})
+    )
+    main = tmp_path / "accounts.toml"
+    directory = tmp_path / "accounts.d"
+    directory.mkdir()
+    main.write_text(text)
+    (directory / "runner.toml").write_text(text)
+    sources = AccountSources(main, directory)
+    assert sources.authenticate(token, datetime.now(UTC)) is None
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/revoke-credential.py"),
+            cid,
+            "--data-dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "HYPERSPACE_ACCOUNTS_DIR": str(directory)},
+    )
+
+    assert result.returncode != 0
+    assert "runner.toml" in result.stderr
+    assert main.read_text() == text
+    assert sources.authenticate(token, datetime.now(UTC)) is None
+
+
+def test_revoke_warns_about_unreadable_directory_file(tmp_path):
+    _, cid, digest = new_token()
+    credential = Credential(
+        id=cid, secret_sha256=digest, host="runner", scopes=frozenset({"read"})
+    )
+    text = dump_accounts(
+        Accounts({"default": Account(id="default", credentials=(credential,))})
+    )
+    main = tmp_path / "accounts.toml"
+    directory = tmp_path / "accounts.d"
+    directory.mkdir()
+    main.write_text(text)
+    broken = directory / "runner.toml"
+    broken.write_text(text + "[not valid toml\n")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/revoke-credential.py"),
+            cid,
+            "--data-dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "HYPERSPACE_ACCOUNTS_DIR": str(directory)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert cid not in parse_accounts(main.read_text()).by_credential()
+    assert f"could not check {broken}" in result.stderr
+    assert f"changed only {main}" in result.stderr
+
+
+def test_revoke_does_not_warn_without_accounts_directory(tmp_path):
+    _, cid, digest = new_token()
+    credential = Credential(
+        id=cid, secret_sha256=digest, host="runner", scopes=frozenset({"read"})
+    )
+    main = tmp_path / "accounts.toml"
+    main.write_text(
+        dump_accounts(
+            Accounts({"default": Account(id="default", credentials=(credential,))})
+        )
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/revoke-credential.py"),
+            cid,
+            "--data-dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "HYPERSPACE_ACCOUNTS_DIR": str(tmp_path / "missing")},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "warning" not in result.stderr
 
 
 def test_registry_auth_preserves_arbitrary_password():
