@@ -171,7 +171,11 @@ of `done` sessions: after the job's process stops, it backs up the session and
 runs `claude rm <job>`, which removes the job from `claude agents` and deletes
 the job's worktree. If `claude rm` refuses, for example because the worktree
 has commits that are not pushed, the job stays, and `hyperspace ls` shows
-`done, not closed: <reason>`. The launcher never forces the removal.
+`done, not closed: <reason>`. The launcher never forces the removal. A job
+that has its own id and writes another session, for example a session that you
+sent to the background, also stays, with the reason
+`job <short> writes another session; close it yourself`. Close such a job with
+`claude rm <short>`.
 
 The SessionStart hook starts the launcher if it does not run. It stops after
 10 minutes with no live session. To run it all the time instead, use a service
