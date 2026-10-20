@@ -86,8 +86,8 @@ def handle(
         return ""
     resolved = _resolve(cfg, adapter, session)
     if resolved is None:
-        # The job can write more than one session: write no status, and back
-        # up only the transcript of the payload.
+        # The session of the job is not known: write no status, and back up
+        # only the transcript of the payload.
         log.info("%s: no status: the job's session is not known", session.session_id)
     else:
         session = resolved
@@ -172,8 +172,8 @@ def _resolve(
     """The session whose transcript the hook's process writes, with the rule
     of the CLI (`ClaudeCode.resolve`). The hook of a background job can name
     the job's own id. Only a job continues another session, so the hook of a
-    process that is not a job keeps its session. None if the job can write
-    more than one session."""
+    process that is not a job keeps its session. None if the session of the
+    job is not known."""
     if not os.environ.get("CLAUDE_JOB_DIR"):
         return session
     state = State(cfg.state_dir)

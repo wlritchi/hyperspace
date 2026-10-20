@@ -704,8 +704,8 @@ class ClaudeCode:
         environment writes, from its session id (`CLAUDE_CODE_SESSION_ID`, or
         the session of a hook). In a background job, that id can be the job's
         own id. Only in the job that runs this process (`current_job`) does
-        the id change, to the one session from `writes`. None if that job can
-        write more than one session. Else the id does not change."""
+        the id change, to the one session from `writes`. None if that job has
+        no candidate or more than one. Else the id does not change."""
         state = self.current_job()
         if state is None or session_id not in (
             state.get("sessionId"),
@@ -715,9 +715,7 @@ class ClaudeCode:
         candidates = self.writes(
             session_id, state.get("resumeSessionId"), continued_from
         )
-        if len(candidates) == 1:
-            return candidates[0]
-        return None if candidates else session_id
+        return candidates[0] if len(candidates) == 1 else None
 
     def current_job(self) -> dict[str, Any] | None:
         """The state of the background job that runs this process, or None.
