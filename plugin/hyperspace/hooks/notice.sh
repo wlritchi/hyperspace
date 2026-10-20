@@ -37,7 +37,9 @@ job_session() {
 
 if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
     if [ ! -e "$dir/$CLAUDE_CODE_SESSION_ID" ]; then
-        # The state of a job is read only if some session has a flag.
+        # Only a job can write the transcript of a different session. The
+        # flags are listed, and the job's state is read, only in a job.
+        [ -n "${CLAUDE_JOB_DIR:-}" ] || exit 0
         set -- "$dir"/*
         [ -e "$1" ] || exit 0
         job_session || exit 0
