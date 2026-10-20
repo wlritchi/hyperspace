@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 
 from _hs import FakeClaude, Server, context, make_server, prompt, tool_call
 from hyperspace_client.adapters.claude_code import (
+    STUB_MAX,
     TRANSCRIPT,
     ClaudeCode,
     is_stub,
@@ -28,7 +30,7 @@ from hyperspace_client.adapters.claude_code import (
 from hyperspace_client.cli import _sweep
 from hyperspace_client.config import Config
 from hyperspace_client.state import LEASE_FIELDS, SessionRecord, State
-from hyperspace_client.sync import Context, Syncer
+from hyperspace_client.sync import REWRITE_SETTLE, Context, Syncer
 from hyperspace_client.teleport import TeleportError, fork, restore, send
 from store import SessionKey
 
@@ -118,6 +120,9 @@ def test_stub_detection() -> None:
     assert not is_stub(stub + b'{"type": "some-new-type"}\n')
     assert not is_stub(stub + b"not json\n")
     assert not is_stub(stub + b"[1, 2]\n")
+    assert not is_stub(stub + b'{"type": []}\n')
+    assert not is_stub(stub + b'{"type": {}}\n')
+    assert not is_stub(stub * (STUB_MAX // len(stub) + 1))
 
 
 def test_sweep_does_not_back_up_a_stub_until_it_has_a_conversation(
@@ -148,13 +153,21 @@ def test_a_stub_that_is_already_backed_up_keeps_syncing(
     assert active_bytes(server, j.stem) == j.read_bytes()
 
 
-def test_a_large_file_is_not_a_stub(fake: FakeClaude) -> None:
+def test_a_large_file_is_not_a_stub(
+    server: Server, fake: FakeClaude, ctx: Context
+) -> None:
     t = fake.transcript(WS)
     title = {"type": "ai-title", "aiTitle": "x" * 1000, "sessionId": t.stem}
     fake.write(t, *([title] * 100))
     session = fake.adapter.session_for_transcript(t)
     assert session is not None
     assert not fake.adapter.is_stub(session)
+    # Sync, restore and fork agree.
+    sync(ctx, t)
+    t.unlink()
+    restore(ctx, fake.adapter, t.stem, WS)
+    forked = fork(ctx, fake.adapter, t.stem, WS)
+    assert forked.transcript.exists()
 
 
 def test_restore_and_fork_refuse_a_stub(
@@ -281,6 +294,37 @@ def test_a_recreated_empty_file_does_not_replace_the_backup(
     rewrite = next(g for g in entry["generations"] if g["cause"] == "rewrite")
     assert rewrite["fork_offset"] == 0
     assert active_bytes(server, t.stem) == t.read_bytes()
+
+
+def test_a_settled_shorter_file_gets_its_fork(
+    server: Server, fake: FakeClaude, ctx: Context
+) -> None:
+    t = fake.transcript(WS)
+    fake.write(t, prompt("one", cwd=WS))
+    sync(ctx, t)
+    t.write_bytes(b"")
+    sync(ctx, t)
+    assert active_bytes(server, t.stem) != b""
+    old = time.time() - REWRITE_SETTLE - 1
+    os.utime(t, (old, old))
+    sync(ctx, t)
+    assert active_bytes(server, t.stem) == b""
+
+
+def test_a_same_size_replacement_with_the_same_mtime_is_uploaded(
+    server: Server, fake: FakeClaude, ctx: Context
+) -> None:
+    t = fake.transcript(WS)
+    fake.write(t, prompt("aaaa", cwd=WS))
+    sync(ctx, t)
+    st = t.stat()
+    tmp = t.with_suffix(".tmp")
+    tmp.write_bytes(t.read_bytes().replace(b"aaaa", b"bbbb"))
+    os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+    os.replace(tmp, t)
+    sync(ctx, t)
+    assert active_bytes(server, t.stem) == t.read_bytes()
+    assert sync(ctx, t).uploaded == 0
 
 
 def test_send_forks_a_shorter_file_with_no_new_record(

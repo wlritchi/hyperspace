@@ -128,15 +128,19 @@ def _records(data: bytes) -> list[dict[str, Any]]:
 
 
 def is_stub(data: bytes) -> bool:
-    """True if `data` has records and every line is a record that only names
-    the session (see `_NAME_RECORDS`). A line that is not a record, or a
-    record of another type, makes this False."""
+    """True if `data` is at most `STUB_MAX` bytes, has records, and every
+    line is a record that only names the session (see `_NAME_RECORDS`). A
+    line that is not a record, or a record of another type, makes this
+    False."""
+    if len(data) > STUB_MAX:
+        return False
     found = False
     for line in data.splitlines():
         if not line.strip():
             continue
         record = _parse(line)
-        if record is None or record.get("type") not in _NAME_RECORDS:
+        kind = record.get("type") if record is not None else None
+        if not isinstance(kind, str) or kind not in _NAME_RECORDS:
             return False
         found = True
     return found
@@ -391,7 +395,7 @@ class ClaudeCode:
                 data = f.read(STUB_MAX + 1)
         except OSError:
             return False
-        return len(data) <= STUB_MAX and is_stub(data)
+        return is_stub(data)
 
     # --- Teleport support -------------------------------------------------------
 

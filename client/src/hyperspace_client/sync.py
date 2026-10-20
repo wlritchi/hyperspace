@@ -39,6 +39,9 @@ CHUNK = MAX_BODY // 2
 # this size. The margin keeps the compressed body below the server limit,
 # also for data that does not compress.
 RECORD_MAX = MAX_BODY - MAX_BODY // 128
+# A rewritten file with no new complete record gets its fork only after it
+# has not changed for this many seconds (see `Syncer.sync_log`).
+REWRITE_SETTLE = 60.0
 
 
 @dataclass
@@ -161,9 +164,10 @@ class Syncer:
         workspace: str,
         empty_rewrites: bool = False,
     ) -> None:
-        """`empty_rewrites`: fork a `rewrite` generation also when the
-        rewritten file has no new complete record. Without it, the fork
-        waits for such a record (see `sync_log`)."""
+        """`empty_rewrites`: fork a `rewrite` generation at once also when
+        the rewritten file has no new complete record. Without it, the fork
+        waits for such a record or for the file to settle (see
+        `sync_log`)."""
         self.ctx = ctx
         self.session = session
         self.workspace = workspace
@@ -302,13 +306,17 @@ class Syncer:
         except FileNotFoundError:
             return metadata
         cursor, rewritten = self._prepare_cursor(f, st)
-        if cursor is not None and _unchanged(cursor, st):
+        if cursor is not None and not rewritten and _unchanged(cursor, st):
             return metadata
         start = cursor.length if cursor is not None else 0
         pending = _read(f.path, start)
         end = start + self.ctx.adapter.commit_boundary(f.rel_path, pending)
         if end <= start:
-            if rewritten and not self.empty_rewrites:
+            if (
+                rewritten
+                and not self.empty_rewrites
+                and time.time() - st.st_mtime < REWRITE_SETTLE
+            ):
                 # A file that Claude Code is writing again (for example, set
                 # aside and started again) can be empty or shorter for a
                 # moment. Its fork would become the active branch, which a

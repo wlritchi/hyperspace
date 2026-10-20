@@ -212,12 +212,12 @@ than one session, and a session can leave its first workspace.
   `continued-in`) as metadata. A `continued-in` link does not always mean that
   the old transcript stopped: a background job continues to write it (see
   "Background jobs").
-- **Stub.** A transcript whose records only name the session (`ai-title`,
-  `agent-name`, `custom-title`). The client does not start the backup of a
-  stub: its backup starts when it gets any other record. A restore or fork of
-  a stub that an older client backed up stops, and names the sessions that can
-  hold its conversation (one with a `continued-in` link to it, or one with its
-  title). `restore --force` restores the stub.
+- **Stub.** A transcript of at most 64 KiB whose records only name the session
+  (`ai-title`, `agent-name`, `custom-title`). The client does not start the
+  backup of a stub: its backup starts when it gets any other record. A restore
+  or fork of a stub that an older client backed up stops, and names the
+  sessions that can hold its conversation (one with a `continued-in` link to
+  it, or one with its title). `restore --force` restores the stub.
 - **File.** A path relative to the session root, for example
   `transcript.jsonl`, `subagents/agent-a1b2.jsonl`, or `tool-results/x.txt`.
   The adapter selects these names. They do not depend on the local layout. A
@@ -291,11 +291,11 @@ than the cursor length, if the inode changed, or if the last segment's bytes
 have a different hash, the client finds the last segment that still matches
 the local file and forks a new generation at the end of that segment. Then it
 uploads the rest of the file to the new generation. The fork waits until the
-rest of the file holds a complete record. Claude Code can set a transcript
-aside and start it again, and the new file can be empty for a moment; a fork
-at that time would make the empty file the active branch. The surrender of a
-teleport does not wait, because it needs the server copy to match the local
-file.
+rest of the file holds a complete record, or until the file has not changed
+for 60 seconds. Claude Code can set a transcript aside and start it again, and
+the new file can be empty for a moment; a fork at that time would make the
+empty file the active branch. The surrender of a teleport does not wait,
+because it needs the server copy to match the local file.
 
 ### Metadata
 
