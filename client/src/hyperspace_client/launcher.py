@@ -324,6 +324,22 @@ def close_job(
     return NotClosed(reason)
 
 
+def try_close(
+    ctx: Context, adapter: ClaudeCode, job: Job, claude: str, run: RunRm = run_rm
+) -> NotClosed | None:
+    """`close_job`. A failed backup, or a session that the server does not
+    have, gives a reason that the sweep checks again. It replaces the
+    earlier entry of the job, whose session ids can be out of date."""
+    try:
+        return close_job(ctx, adapter, job, claude, run)
+    except NotFound:
+        reason = f"the server does not have the session of job {job.short}"
+    except TeleportError as exc:
+        reason = clean_note(str(exc)) or f"the backup for job {job.short} failed"
+    log.info("%s: not closed: %s", job.own_id, reason)
+    return NotClosed(reason, refused=False)
+
+
 def record_refusal(
     state: State, adapter: ClaudeCode, job: Job, reason: str, recheck: bool = False
 ) -> None:
@@ -384,11 +400,7 @@ def close_after_exit(
             log.info("%s: still runs; the sweep closes it later", sid)
             return
         sleep(_POLL)
-    try:
-        kept = close_job(ctx, adapter, job, claude, run)
-    except (NotFound, TeleportError) as exc:
-        log.warning("%s: not closed: %s", sid, exc)
-        return
+    kept = try_close(ctx, adapter, job, claude, run)
     if kept is not None:
         record(ctx.state, adapter, job, kept)
 
@@ -536,11 +548,7 @@ class Launcher:
             if seen is not None and seen[0] == job.mtime and now - seen[1] < RECHECK:
                 continue
             self._checked[job.short] = (job.mtime, now)
-            try:
-                result = close_job(self.ctx, adapter, job, self.claude, self.run_rm)
-            except (NotFound, TeleportError) as exc:
-                log.info("%s: not closed: %s", job.session_id, exc)
-                continue
+            result = try_close(self.ctx, adapter, job, self.claude, self.run_rm)
             if result is None:
                 forget_recheck(state, adapter, job.short)
             else:
