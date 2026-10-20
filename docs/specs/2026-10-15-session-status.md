@@ -242,11 +242,21 @@ id J, and continue to write the transcript of S (main spec, "Background
 jobs"). Then the job's state has `sessionId` J and can have `resumeSessionId`
 S, and S's transcript has a `continued-in` record with J. Some jobs have the
 same id as their session. The rules for background jobs then apply to S, the
-session whose transcript the job writes: the adapter keys a job on S (on
-`resumeSessionId` if the state has it, else on the one session that continued
-in J), and the hooks, the status and the `inFlight` hint of the job are for S.
-A job that has a transcript with a conversation under its own id writes that
-transcript, and is its own session.
+session whose transcript the job writes: the adapter keys a job on S, and the
+hooks, the status and the `inFlight` hint of the job are for S. A job that has
+a transcript with a conversation under its own id writes that transcript, and
+is its own session. Else the candidates for S are `resumeSessionId` and the
+sessions whose synced metadata says that they continued in J. One candidate is
+S. With more than one candidate, or with none, the session of the job is not
+known, and the client acts on no session that it would have to guess. The
+synced metadata keeps only the last `continued-in` link of a session, so a
+missing link does not show that the job writes J.
+
+Only the job that runs a process changes the id of that process to S: its
+`CLAUDE_JOB_DIR` names the job, the job's state names the id, and a live
+`sessions/<pid>.json` of the process or of a parent process has that `jobId`.
+A foreground `claude --resume J` writes J's transcript, so it stays J. A stale
+`CLAUDE_JOB_DIR` changes nothing. The CLI and the hooks use this one rule.
 
 ### Liveness
 
@@ -358,6 +368,18 @@ Both triggers ask the server for the status just before they run `claude rm`,
 and act only on `done`. When `claude rm` refuses, the launcher records the
 reason and sends it in each heartbeat, until the job goes away or its state
 file changes.
+
+A job whose session is not known (see "Transitions") is never closed
+automatically. The sweep records it while it does not run, on the job's own id
+and on each candidate session, with the reason
+`job <short> can write more than one session` or
+`the session of job <short> is not known`. When a job has its own id J and
+writes S, it also stays while J runs or has a status that is not `done`. An
+older client, or a user, can have written the status of the job's work under
+J, so that status can be the true one. The reason is
+`job <short> has its own id <J>, which is not done`. The sweep checks these
+jobs again at each check, also if the state file does not change. The user
+closes such a job with `claude rm`, or marks J `done`.
 
 ## Launcher
 
@@ -510,9 +532,10 @@ The CLI gives the overview stories their commands:
   With no session id, the command applies to the current session, from
   `CLAUDE_CODE_SESSION_ID` (A1, A2). In a background job, this variable can
   hold the job's own id J. The client then uses the session whose transcript
-  the job writes: `resumeSessionId` in `$CLAUDE_JOB_DIR/state.json`, else the
-  one session that continued in J. The source is `agent` when the command runs
-  in a Claude Code session, and `user` otherwise or with `--by-user`.
+  the job writes (see "Transitions"). If the job can write more than one
+  session, a command with no session id stops with an error. The source is
+  `agent` when the command runs in a Claude Code session, and `user` otherwise
+  or with `--by-user`.
 
 The plugin adds:
 
