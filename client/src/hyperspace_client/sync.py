@@ -315,13 +315,15 @@ class Syncer:
             if (
                 rewritten
                 and not self.empty_rewrites
-                and time.time() - st.st_mtime < REWRITE_SETTLE
+                and 0 <= time.time() - st.st_mtime < REWRITE_SETTLE
             ):
                 # A file that Claude Code is writing again (for example, set
                 # aside and started again) can be empty or shorter for a
                 # moment. Its fork would become the active branch, which a
                 # restore then gives. The saved cursor does not change, so
-                # the next sync finds the rewrite again.
+                # the next sync finds the rewrite again. A file with an mtime
+                # in the future did not come from such a write, and does not
+                # wait.
                 return metadata
             if cursor is not None:
                 if rewritten:

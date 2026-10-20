@@ -311,6 +311,19 @@ def test_a_settled_shorter_file_gets_its_fork(
     assert active_bytes(server, t.stem) == b""
 
 
+def test_a_shorter_file_with_a_future_mtime_does_not_wait(
+    server: Server, fake: FakeClaude, ctx: Context
+) -> None:
+    t = fake.transcript(WS)
+    fake.write(t, prompt("one", cwd=WS))
+    sync(ctx, t)
+    t.write_bytes(b"")
+    future = time.time() + 86_400
+    os.utime(t, (future, future))
+    sync(ctx, t)
+    assert active_bytes(server, t.stem) == b""
+
+
 def test_a_same_size_replacement_with_the_same_mtime_is_uploaded(
     server: Server, fake: FakeClaude, ctx: Context
 ) -> None:
