@@ -110,23 +110,35 @@ def _seen_status(cfg: Config, status: str) -> None:
         state.close()
 
 
+def _job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run in the background job 1111aaaa, whose own id SID has a
+    conversation."""
+    root = tmp_path / "claude"
+    project = root / "projects" / "-w"
+    project.mkdir(parents=True)
+    record = {"type": "user", "message": {"role": "user", "content": "hi"}}
+    (project / f"{SID}.jsonl").write_text(json.dumps(record) + "\n")
+    job = root / "jobs" / "1111aaaa"
+    job.mkdir(parents=True)
+    (job / "state.json").write_text(json.dumps({"sessionId": SID}))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(root))
+    monkeypatch.setenv("CLAUDE_JOB_DIR", str(job))
+
+
 @pytest.mark.parametrize(
-    ("job_dir", "status", "closes"),
-    [
-        ("/home/u/.claude/jobs/1111aaaa", "done", True),
-        ("/home/u/.claude/jobs/1111aaaa", "ready", False),
-        (None, "done", False),
-    ],
+    ("in_job", "status", "closes"),
+    [(True, "done", True), (True, "ready", False), (False, "done", False)],
 )
 def test_session_end_closes_a_done_job(
     cfg: Config,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    job_dir: str | None,
+    in_job: bool,
     status: str,
     closes: bool,
 ) -> None:
-    if job_dir is not None:
-        monkeypatch.setenv("CLAUDE_JOB_DIR", job_dir)
+    if in_job:
+        _job(tmp_path, monkeypatch)
     _seen_status(cfg, status)
     _, started = run(cfg, hook_event_name="SessionEnd")
     close = ["--quiet", "launcher", "--close-job", "1111aaaa"]
@@ -134,9 +146,9 @@ def test_session_end_closes_a_done_job(
 
 
 def test_session_end_keeps_a_job_with_a_queued_reopen(
-    cfg: Config, monkeypatch: pytest.MonkeyPatch
+    cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("CLAUDE_JOB_DIR", "/home/u/.claude/jobs/1111aaaa")
+    _job(tmp_path, monkeypatch)
     _seen_status(cfg, "done")
     state = State(cfg.state_dir)
     try:

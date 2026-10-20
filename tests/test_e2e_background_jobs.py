@@ -23,6 +23,7 @@ import pytest
 
 from _hs import FakeClaude, Server, context, make_server, prompt, tool_call
 from hyperspace_client import backfill
+from hyperspace_client import launcher as launcher_module
 from hyperspace_client.adapters.claude_code import (
     STUB_MAX,
     TRANSCRIPT,
@@ -512,32 +513,104 @@ def test_the_runner_does_not_resume_a_session_that_a_job_writes(
     assert [argv[-2] for argv in calls] == [s.stem]
 
 
-def test_a_job_closes_on_the_status_of_the_session_that_it_writes(
+def test_only_a_job_that_writes_its_own_id_closes(
     server: Server, fake: FakeClaude, ctx: Context
 ) -> None:
     # A job whose state names the session that it resumes.
     s, j = background_job(fake)
     # A job whose state names only its own id.
     s2, j2 = background_job(fake)
-    # A job that has a conversation under its own id writes its own
-    # transcript.
-    j3 = fake.transcript(WS)
-    fake.write(j3, prompt("own work", cwd=WS))
-    for t in (s, s2, j3):
+    # Jobs whose own id has a conversation: with no other session (dd and
+    # ee), and with a state that resumes another session (cc).
+    j3, j4, j5 = (fake.transcript(WS) for _ in range(3))
+    for t in (j3, j4, j5):
+        fake.write(t, prompt("own work", cwd=WS))
+    for t in (s, s2, j3, j4, j5):
         sync(ctx, t)
         add_status(ctx, t.stem, "done")
+    # An older client backed up the stub of J, and a user marked J done.
+    sync(ctx, j)
+    add_status(ctx, j.stem, "done")
     job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
     job_dir(fake, "bb", sessionId=j2.stem, resumeSessionId=j2.stem)
     job_dir(fake, "cc", sessionId=j3.stem, resumeSessionId=s.stem)
+    job_dir(fake, "dd", sessionId=j4.stem)
+    job_dir(fake, "ee", sessionId=j5.stem, resumeSessionId=j5.stem)
     jobs = fake.adapter.jobs(ctx.state.continued_from(H))
-    assert [(x.short, x.session_id, x.own_id) for x in jobs] == [
-        ("aa", s.stem, j.stem),
-        ("bb", s2.stem, j2.stem),
-        ("cc", j3.stem, j3.stem),
+    assert [(x.short, x.session_id, x.own_id, x.candidates) for x in jobs] == [
+        ("aa", None, j.stem, (s.stem,)),
+        ("bb", None, j2.stem, (s2.stem,)),
+        ("cc", None, j3.stem, (j3.stem, s.stem)),
+        ("dd", j4.stem, j4.stem, (j4.stem,)),
+        ("ee", j5.stem, j5.stem, (j5.stem,)),
     ]
     rm = Rm()
-    launcher(ctx, fake, run_rm=rm).tick()
-    assert rm.calls == [["claude", "rm", short] for short in ("aa", "bb", "cc")]
+    run = launcher(ctx, fake, run_rm=rm)
+    run.tick()
+    run.tick()
+    assert rm.calls == [["claude", "rm", "dd"], ["claude", "rm", "ee"]]
+    # A job that writes another session stays, also when each of its
+    # sessions is done.
+    another = "writes another session; close it yourself"
+    assert close_blocked(ctx, j.stem) == f"job aa {another}"
+    assert close_blocked(ctx, s2.stem) == f"job bb {another}"
+    reason = "job cc can write more than one session; close it yourself"
+    assert close_blocked(ctx, j3.stem) == reason
+
+
+def test_a_job_whose_own_id_has_a_competing_conversation_is_not_closed(
+    server: Server, fake: FakeClaude, ctx: Context
+) -> None:
+    # `claude --resume J` in a terminal gave J a conversation, while the job
+    # wrote S. The job's state names S (aa), or only the continued-in record
+    # of S links the two (bb).
+    pairs = [background_job(fake), background_job(fake)]
+    for s, j in pairs:
+        fake.write(j, prompt("in a terminal", cwd=WS))
+        sync(ctx, s)
+        sync(ctx, j)
+        add_status(ctx, j.stem, "done")
+        add_status(ctx, s.stem, "working", kind="hook")
+    (s, j), (s2, j2) = pairs
+    job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
+    job_dir(fake, "bb", sessionId=j2.stem, resumeSessionId=j2.stem)
+    rm = Rm()
+    run = launcher(ctx, fake, run_rm=rm)
+    run.tick()
+    run.tick()
+    assert rm.calls == []
+    for short, sids in (("aa", (s, j)), ("bb", (s2, j2))):
+        for sid in sids:
+            assert close_blocked(ctx, sid.stem) == (
+                f"job {short} can write more than one session; close it yourself"
+            )
+
+
+def test_a_link_to_the_job_during_the_close_keeps_the_job(
+    server: Server, fake: FakeClaude, ctx: Context, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    j = fake.transcript(WS)
+    fake.write(j, prompt("own work", cwd=WS))
+    sync(ctx, j)
+    add_status(ctx, j.stem, "done")
+    job_dir(fake, "aa", sessionId=j.stem)
+    other = str(uuid.uuid4())
+    real = launcher_module.back_up
+
+    def back_up(*args: Any) -> None:
+        real(*args)
+        # A sync of another session records that it continued in J.
+        links = {"links": {"continued_in": j.stem}}
+        ctx.state.save_session(SessionRecord(H, other, metadata=links), ("metadata",))
+
+    monkeypatch.setattr(launcher_module, "back_up", back_up)
+    rm = Rm()
+    run = launcher(ctx, fake, run_rm=rm)
+    run.tick()
+    run.tick()
+    assert rm.calls == []
+    reason = "job aa can write more than one session; close it yourself"
+    assert close_blocked(ctx, j.stem) == reason
 
 
 def hook_env(
@@ -579,13 +652,13 @@ def test_the_hooks_of_a_job_under_its_own_id_act_on_its_session(
     assert queued is not None
     assert (queued[0]["status"], queued[0]["wake"]) == ("waiting", "local")
     assert ctx.state.wanted_status(H, j.stem) is None
-    # At the end of the job, the close depends on the status of S.
+    # The job writes another session, so its end does not close it.
     ctx.state.drop_wanted_status(H, s.stem)
     event = add_status(ctx, s.stem, "done")
     ctx.state.save_status(H, s.stem, event, None)
     started.clear()
     handle({**payload, "hook_event_name": "SessionEnd"}, cfg, start=started.append)
-    assert ["--quiet", "launcher", "--close-job", "aa"] in started
+    assert not any("--close-job" in args for args in started)
 
 
 @needs_proc
@@ -721,16 +794,23 @@ def test_a_job_that_more_than_one_session_continued_in_is_not_closed(
     run.tick()
     assert rm.calls == []
     # The heartbeat says why, for each session that the job can write.
+    reason = "job aa can write more than one session; close it yourself"
     for sid in (j.stem, s.stem, t.stem):
-        assert close_blocked(ctx, sid) == "job aa can write more than one session"
-    # With one session that the job can write, the sweep closes the job.
+        assert close_blocked(ctx, sid) == reason
+    # With one other session that the job can write, the job stays, and the
+    # reason changes.
     (fake.root / "jobs" / "aa" / "state.json").write_text(
         json.dumps({"sessionId": j.stem, "resumeSessionId": t.stem})
     )
     ctx.state.save_session(SessionRecord(H, s.stem, workspace=WS), ("metadata",))
     rm = Rm()
-    launcher(ctx, fake, run_rm=rm).tick()
-    assert rm.calls == [["claude", "rm", "aa"]]
+    run = launcher(ctx, fake, run_rm=rm)
+    run.tick()
+    run.tick()
+    assert rm.calls == []
+    reason = "job aa writes another session; close it yourself"
+    assert close_blocked(ctx, j.stem) == close_blocked(ctx, t.stem) == reason
+    assert close_blocked(ctx, s.stem) is None
 
 
 def test_a_job_with_no_mapping_to_its_session_is_not_closed(
@@ -752,7 +832,8 @@ def test_a_job_with_no_mapping_to_its_session_is_not_closed(
     run.tick()
     run.tick()
     assert rm.calls == []
-    assert close_blocked(ctx, j.stem) == "the session of job aa is not known"
+    reason = "the session of job aa is not known; close it yourself"
+    assert close_blocked(ctx, j.stem) == reason
 
 
 def test_a_job_with_a_stale_mapping_to_its_session_is_not_closed(
@@ -774,30 +855,6 @@ def test_a_job_with_a_stale_mapping_to_its_session_is_not_closed(
     rm = Rm()
     launcher(ctx, fake, run_rm=rm).tick()
     assert rm.calls == []
-
-
-def test_a_job_is_not_closed_while_its_own_id_is_not_done(
-    server: Server, fake: FakeClaude, ctx: Context
-) -> None:
-    s, j = background_job(fake)
-    sync(ctx, s)
-    add_status(ctx, s.stem, "done")
-    # An older client backed up the stub, and the hooks of the job wrote
-    # their status for J.
-    sync(ctx, j)
-    add_status(ctx, j.stem, "working", kind="hook")
-    job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
-    rm = Rm()
-    run = launcher(ctx, fake, run_rm=rm)
-    run.tick()
-    run.tick()
-    assert rm.calls == []
-    reason = close_blocked(ctx, s.stem)
-    assert reason == f"job aa has its own id {j.stem}, which is not done"
-    # The sweep checks again when J is done.
-    add_status(ctx, j.stem, "done")
-    launcher(ctx, fake, run_rm=rm).tick()
-    assert rm.calls == [["claude", "rm", "aa"]]
 
 
 # --- The current session -----------------------------------------------------------
