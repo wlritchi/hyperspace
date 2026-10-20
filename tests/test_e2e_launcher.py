@@ -63,6 +63,9 @@ class Host(ClaudeCode):
     def live_sessions(self) -> list[str]:
         return list(self.live)
 
+    def is_running(self, session_id: str) -> bool:
+        return session_id in self.live
+
 
 class Clock:
     def __init__(self) -> None:
