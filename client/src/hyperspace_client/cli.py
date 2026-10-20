@@ -14,6 +14,7 @@ from collections.abc import Callable
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from types import EllipsisType
 from typing import Any, cast
 
 import httpx
@@ -506,7 +507,8 @@ def _current(state: State | None = None) -> str | None:
     """The session whose transcript the Claude Code process of this command
     writes. `CLAUDE_CODE_SESSION_ID` can hold the own id of a background job
     (see `ClaudeCode.resolve`). `state` gives the sessions that continued in
-    an id."""
+    an id. None if the variable is not set, or if the job can write more than
+    one session."""
     sid = os.environ.get(SESSION_ENV)
     if not sid:
         return None
@@ -530,27 +532,33 @@ def _current_for(cfg: Config) -> str | None:
         state.close()
 
 
-def _target(session: str | None, current: str | None = None) -> str:
+def _target(session: str | None, current: str | None | EllipsisType = ...) -> str:
     """The session to act on: the argument, else the current session
-    (`current`, or else from the environment)."""
-    sid = session or current or _current()
-    if not sid:
+    (`current`; `...` gets it from the environment)."""
+    if not session:
+        session = _current() if current is ... else current
+    if not session and os.environ.get(SESSION_ENV):
+        raise Exit(
+            2,
+            "give a session id; this background job can write more than one session",
+        )
+    if not session:
         raise Exit(2, f"give a session id; {SESSION_ENV} is not set")
     try:
-        return validate_session_id(sid)
+        return validate_session_id(session)
     except ValidationError as exc:
         raise Exit(2, str(exc)) from None
 
 
 def _targets(
-    sessions: list[str], by_user: bool, current: str | None = None
+    sessions: list[str], by_user: bool, current: str | None | EllipsisType = ...
 ) -> list[str]:
     """The sessions for a status command: the arguments, else the current
     session. In a backfill turn, only the current session, not as the user."""
+    if current is ...:
+        current = _current()
     sids = [_target(s) for s in sessions] or [_target(None, current)]
-    if os.environ.get(backfill.SELF_ONLY_ENV) == "1" and (
-        by_user or sids != [current or _current()]
-    ):
+    if os.environ.get(backfill.SELF_ONLY_ENV) == "1" and (by_user or sids != [current]):
         raise Exit(
             2,
             "in a backfill turn, set only the status of this session, "
@@ -567,17 +575,19 @@ def _request(
     wake: str | None,
     note: str | None,
     by_user: bool,
-    current: str | None = None,
+    current: str | None | EllipsisType = ...,
 ) -> dict[str, Any]:
     """An explicit status write from the CLI. The source is the agent when
     the command runs in a Claude Code session, unless `by_user` is set.
-    `current` is the current session, else it comes from the environment."""
-    current = current or _current()
+    `current` is the current session; `...` gets it from the environment."""
+    if current is ...:
+        current = _current()
     if status == "ready" and reason is None:
         reason = "idle"
+    agent = bool(os.environ.get(SESSION_ENV)) and not by_user
     body: dict[str, Any] = {
         "status": status,
-        "source_kind": "agent" if current and not by_user else "user",
+        "source_kind": "agent" if agent else "user",
         "explicit": True,
         "base_seq": 0,
     }

@@ -84,9 +84,15 @@ def handle(
     session = adapter.session_for_transcript(Path(transcript))
     if session is None:
         return ""
-    session = _resolve(cfg, adapter, session)
+    resolved = _resolve(cfg, adapter, session)
+    if resolved is None:
+        # The job can write more than one session: write no status, and back
+        # up only the transcript of the payload.
+        log.info("%s: no status: the job's session is not known", session.session_id)
+    else:
+        session = resolved
     transcript = str(session.transcript)
-    if event in STATUS_EVENTS:
+    if event in STATUS_EVENTS and resolved is not None:
         try:
             state = State(cfg.state_dir)
             try:
@@ -160,11 +166,14 @@ def handle(
     return ""
 
 
-def _resolve(cfg: Config, adapter: ClaudeCode, session: LocalSession) -> LocalSession:
-    """The session whose transcript the hook's process writes. The hook of a
-    background job can name the job's own id (see `ClaudeCode.resolve`).
-    Only a job continues another session, so the hook of a process that is
-    not a job keeps its session."""
+def _resolve(
+    cfg: Config, adapter: ClaudeCode, session: LocalSession
+) -> LocalSession | None:
+    """The session whose transcript the hook's process writes, with the rule
+    of the CLI (`ClaudeCode.resolve`). The hook of a background job can name
+    the job's own id. Only a job continues another session, so the hook of a
+    process that is not a job keeps its session. None if the job can write
+    more than one session."""
     if not os.environ.get("CLAUDE_JOB_DIR"):
         return session
     state = State(cfg.state_dir)
@@ -172,6 +181,8 @@ def _resolve(cfg: Config, adapter: ClaudeCode, session: LocalSession) -> LocalSe
         sid = adapter.resolve(session.session_id, state.continued_from(session.harness))
     finally:
         state.close()
+    if sid is None:
+        return None
     if sid == session.session_id:
         return session
 
@@ -193,7 +204,7 @@ def _close_if_done(
     """At the end of a background job whose session is `done`, close the
     job when its process stops. Claude Code sets `CLAUDE_JOB_DIR` only in
     a background job. The job's session is the one whose transcript it
-    writes."""
+    writes. A job whose session is not known stays."""
     job_dir = os.environ.get("CLAUDE_JOB_DIR")
     if not job_dir or launcher.off():
         return
@@ -204,6 +215,8 @@ def _close_if_done(
         jobs = adapter.jobs(state.continued_from(harness))
         job = next((j for j in jobs if j.short == short), None)
         sid = job.session_id if job is not None else session_id
+        if sid is None:
+            return
         status = state.session(harness, sid).status
         reopened = launcher.queued_reopen(state, harness, sid)
     finally:
@@ -224,7 +237,7 @@ def notices(payload: dict[str, Any], cfg: Config) -> str:
     session = adapter.session_for_transcript(Path(transcript)) if transcript else None
     if session is None:
         return ""
-    session = _resolve(cfg, adapter, session)
+    session = _resolve(cfg, adapter, session) or session
     state = State(cfg.state_dir)
     try:
         texts = state.take_notices(session.harness, session.session_id)

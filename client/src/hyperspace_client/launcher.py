@@ -186,9 +186,11 @@ def host_lock(state_dir: Path, host: str, config_dir: Path) -> Iterator[bool]:
 
 
 def load_unclosed(state: State, adapter: ClaudeCode) -> dict[str, dict[str, Any]]:
-    """The jobs of `adapter`'s config directory that `claude rm` refused:
-    job name to session id, reason, and the mtime of the job's state.json at
-    the refusal."""
+    """The jobs of `adapter`'s config directory that the launcher did not
+    close: job name to session id, reason, and the mtime of the job's
+    state.json at that time. `also` has more session ids for the reason.
+    With `recheck`, a check refused the close, and the sweep checks the job
+    again; else `claude rm` refused."""
     raw = state.get(_unclosed_key(adapter))
     if raw is None:
         return {}
@@ -229,8 +231,9 @@ def send_heartbeat(
         ],
     }
     unclosed: list[UnclosedSession] = [
-        {"harness": harness, "session_id": e["session_id"], "reason": e["reason"]}
+        {"harness": harness, "session_id": sid, "reason": e["reason"]}
         for e in load_unclosed(ctx.state, adapter).values()
+        for sid in [e["session_id"], *e.get("also", [])]
     ]
     if unclosed:
         request["unclosed"] = unclosed[:MAX_HEARTBEAT_SESSIONS]
@@ -260,26 +263,74 @@ def _done(ctx: Context, harness: str, sid: str) -> bool:
     return event is not None and event["status"] == "done"
 
 
+def _own_id_open(ctx: Context, adapter: ClaudeCode, job: Job) -> bool:
+    """True if the job's own id differs from its session and runs, or has a
+    status that is not `done`. The hooks of an older client, or a user, can
+    write a status for the own id while the job writes its session. Then
+    that status can be the true status of the job's work."""
+    own, harness = job.own_id, adapter.harness
+    if own == job.session_id:
+        return False
+    if adapter.is_running(own) or queued_reopen(ctx.state, harness, own):
+        return True
+    try:
+        event = ctx.api.state(harness, own).get("status")
+    except NotFound:
+        return False
+    return event is not None and event["status"] != "done"
+
+
+@dataclass(frozen=True)
+class NotClosed:
+    """Why `close_job` kept a job, for the heartbeat's `unclosed` list."""
+
+    reason: str
+    # True if `claude rm` refused: the refusal holds until the job's state
+    # changes. Else the sweep checks the job again.
+    refused: bool = True
+
+
+def unknown_reason(job: Job) -> str:
+    """Why a job whose session is not known stays."""
+    if len(job.candidates) > 1:
+        return f"job {job.short} can write more than one session"
+    return f"the session of job {job.short} is not known"
+
+
 def close_job(
     ctx: Context, adapter: ClaudeCode, job: Job, claude: str, run: RunRm = run_rm
-) -> str | None:
+) -> NotClosed | None:
     """Close the background job of a `done` session: back up the session,
-    then run `claude rm`. Return the reason if `claude rm` refuses, or None.
+    then run `claude rm`. Return why the job stays, or None if it closed or
+    if it is not ready to close.
 
-    The job is left as it is if its session runs, a sync of it runs, its
-    status on the server or its queued status is not `done`, or the server
-    does not have every local byte. Raise `TeleportError` in the last case,
-    and `NotFound` if the server does not have the session."""
+    The job is left as it is if its session is not known, if its session or
+    its own id runs, if a sync of its session runs, or if the server does not
+    have every local byte. It is also left if the status of the session on
+    the server or in the queue is not `done`, or if its own id has a status
+    that is not `done`. Raise `TeleportError` if the server does not have
+    every local byte, and `NotFound` if the server does not have the
+    session."""
     harness = adapter.harness
     sid = job.session_id
+    if sid is None:
+        return NotClosed(unknown_reason(job), refused=False)
+    own_open = NotClosed(
+        f"job {job.short} has its own id {job.own_id}, which is not done",
+        refused=False,
+    )
     with ctx.state.try_lock(harness, sid) as locked:
         if not locked or adapter.is_running(sid) or not _done(ctx, harness, sid):
             return None
+        if _own_id_open(ctx, adapter, job):
+            return own_open
         back_up(ctx, adapter, sid, adapter.find_transcripts(sid), "close")
         # The backup sends a queued status write, which can reopen the
         # session, so ask again just before `claude rm`.
         if adapter.is_running(sid) or not _done(ctx, harness, sid):
             return None
+        if _own_id_open(ctx, adapter, job):
+            return own_open
         # Never with --discard-unpushed or --force-remove-worktree: a refusal
         # keeps the work, and the user decides.
         code, output = run([claude, "rm", job.short])
@@ -288,17 +339,40 @@ def close_job(
         return None
     reason = _reason(code, output)
     log.warning("%s: claude rm %s: %s", sid, job.short, reason)
-    return reason
+    return NotClosed(reason)
 
 
-def record_refusal(state: State, adapter: ClaudeCode, job: Job, reason: str) -> None:
-    entries = load_unclosed(state, adapter)
-    entries[job.short] = {
-        "session_id": job.session_id,
+def record_refusal(
+    state: State, adapter: ClaudeCode, job: Job, reason: str, recheck: bool = False
+) -> None:
+    """Record why the launcher did not close the job, for the heartbeat. A
+    job whose session is not known has the reason on its own id and on each
+    session that it can write."""
+    entry: dict[str, Any] = {
+        "session_id": job.session_id or job.own_id,
         "reason": reason,
         "mtime": job.mtime,
     }
-    save_unclosed(state, adapter, entries)
+    if job.session_id is None and job.candidates:
+        entry["also"] = list(job.candidates)
+    if recheck:
+        entry["recheck"] = True
+    entries = load_unclosed(state, adapter)
+    if entries.get(job.short) != entry:
+        entries[job.short] = entry
+        save_unclosed(state, adapter, entries)
+
+
+def record(state: State, adapter: ClaudeCode, job: Job, kept: NotClosed) -> None:
+    record_refusal(state, adapter, job, kept.reason, recheck=not kept.refused)
+
+
+def forget_recheck(state: State, adapter: ClaudeCode, short: str) -> None:
+    """Remove the entry of a job that a check, not `claude rm`, kept."""
+    entries = load_unclosed(state, adapter)
+    if entries.get(short, {}).get("recheck"):
+        del entries[short]
+        save_unclosed(state, adapter, entries)
 
 
 def close_after_exit(
@@ -318,19 +392,23 @@ def close_after_exit(
     job = next((j for j in jobs if j.short == short), None)
     if job is None:
         return
+    sid = job.session_id
+    if sid is None:
+        log.info("%s: not closed: %s", job.own_id, unknown_reason(job))
+        return
     deadline = clock() + wait
-    while adapter.is_running(job.session_id):
+    while adapter.is_running(sid):
         if clock() >= deadline:
-            log.info("%s: still runs; the sweep closes it later", job.session_id)
+            log.info("%s: still runs; the sweep closes it later", sid)
             return
         sleep(_POLL)
     try:
-        reason = close_job(ctx, adapter, job, claude, run)
+        kept = close_job(ctx, adapter, job, claude, run)
     except (NotFound, TeleportError) as exc:
-        log.warning("%s: not closed: %s", job.session_id, exc)
+        log.warning("%s: not closed: %s", sid, exc)
         return
-    if reason is not None:
-        record_refusal(ctx.state, adapter, job, reason)
+    if kept is not None:
+        record(ctx.state, adapter, job, kept)
 
 
 def _proxy_auth_refused(message: str) -> bool:
@@ -440,36 +518,51 @@ class Launcher:
     _restore_wait: float = 0.0
 
     def sweep(self, live: list[str]) -> None:
-        """Close the stopped jobs of `done` sessions."""
+        """Close the stopped jobs of `done` sessions. A job whose session is
+        not known is never closed; the heartbeat says why."""
+        state, adapter = self.ctx.state, self.adapter
         now = self.clock()
-        jobs = self.adapter.jobs(self.ctx.state.continued_from(self.adapter.harness))
+        jobs = adapter.jobs(state.continued_from(adapter.harness))
         by_name = {j.short: j for j in jobs}
-        entries = load_unclosed(self.ctx.state, self.adapter)
-        # A refusal holds until the job goes away or its state changes.
+        entries = load_unclosed(state, adapter)
+        # A refusal of `claude rm` holds until the job goes away or its state
+        # changes. The next check of the job replaces any other entry.
         kept = {
             short: e
             for short, e in entries.items()
-            if short in by_name and by_name[short].mtime == e.get("mtime")
+            if short in by_name
+            and (e.get("recheck") or by_name[short].mtime == e.get("mtime"))
         }
         if kept != entries:
-            save_unclosed(self.ctx.state, self.adapter, kept)
+            save_unclosed(state, adapter, kept)
         self._checked = {k: v for k, v in self._checked.items() if k in by_name}
         for job in jobs:
-            if job.session_id in live or job.short in kept:
+            if job.session_id is None:
+                if job.own_id in live:
+                    forget_recheck(state, adapter, job.short)
+                else:
+                    record_refusal(
+                        state, adapter, job, unknown_reason(job), recheck=True
+                    )
+                continue
+            if job.session_id in live:
+                forget_recheck(state, adapter, job.short)
+                continue
+            if job.short in kept and not kept[job.short].get("recheck"):
                 continue
             seen = self._checked.get(job.short)
             if seen is not None and seen[0] == job.mtime and now - seen[1] < RECHECK:
                 continue
             self._checked[job.short] = (job.mtime, now)
             try:
-                reason = close_job(
-                    self.ctx, self.adapter, job, self.claude, self.run_rm
-                )
+                result = close_job(self.ctx, adapter, job, self.claude, self.run_rm)
             except (NotFound, TeleportError) as exc:
                 log.info("%s: not closed: %s", job.session_id, exc)
                 continue
-            if reason is not None:
-                record_refusal(self.ctx.state, self.adapter, job, reason)
+            if result is None:
+                forget_recheck(state, adapter, job.short)
+            else:
+                record(state, adapter, job, result)
 
     def resume_held(self, live: list[str]) -> None:
         """Resume the sessions whose lease this host holds and that need a

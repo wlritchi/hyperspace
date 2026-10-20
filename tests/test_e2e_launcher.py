@@ -404,7 +404,10 @@ def test_jobs_skips_unsafe_names(fake: FakeClaude, host: Host) -> None:
     job(fake, "bb", "../x")
     (fake.root / "jobs" / "cc").mkdir()
     (fake.root / "jobs" / "cc" / "state.json").write_text("{}")
-    assert [(j.short, j.session_id) for j in host.jobs()] == [("1111aaaa", sid)]
+    # With no local transcript, the session of the job is not known.
+    assert [(j.short, j.own_id, j.session_id) for j in host.jobs()] == [
+        ("1111aaaa", sid, None)
+    ]
 
 
 def test_single_instance_lock(tmp_path: Path) -> None:

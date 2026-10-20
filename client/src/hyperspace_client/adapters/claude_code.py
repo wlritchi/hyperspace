@@ -33,17 +33,36 @@ TRANSCRIPT = "transcript.jsonl"
 
 
 @dataclass(frozen=True)
+class Writer:
+    """The session whose transcript a process or a job writes (see
+    `ClaudeCode.writes`)."""
+
+    # None if it is not known.
+    session_id: str | None
+    # The sessions other than its own id that it can write.
+    candidates: tuple[str, ...] = ()
+
+    @property
+    def ambiguous(self) -> bool:
+        """True if it can write more than one session."""
+        return self.session_id is None and len(self.candidates) > 1
+
+
+@dataclass(frozen=True)
 class Job:
     """A Claude Code background job: `claude rm <short>` removes it."""
 
     short: str
-    # The session whose transcript the job writes (see `ClaudeCode.writes`).
-    session_id: str
+    # The session whose transcript the job writes (see `ClaudeCode.writes`),
+    # or None if it is not known. Such a job is never closed automatically.
+    session_id: str | None
     # The modification time of the job's state.json.
     mtime: float
     # The job's own id (`sessionId` in its state). It can differ from
     # `session_id`.
     own_id: str
+    # The sessions other than `own_id` that the job can write.
+    candidates: tuple[str, ...] = ()
 
 
 # A job directory name that cannot be read as an option.
@@ -220,6 +239,22 @@ def _alive(record: dict[str, Any]) -> bool:
     fields = stat[stat.rfind(")") + 2 :].split()
     start = fields[19] if len(fields) > 19 else None
     return record.get("procStart") in (None, start)
+
+
+def _ancestors() -> set[int]:
+    """The pids of this process and of its parent processes."""
+    if sys.platform != "linux":
+        return {os.getpid(), os.getppid()}
+    out: set[int] = set()
+    pid = os.getpid()
+    while pid > 0 and pid not in out:
+        out.add(pid)
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            pid = int(stat[stat.rfind(")") + 2 :].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return out
 
 
 def is_prompt(record: dict[str, Any]) -> bool:
@@ -639,8 +674,8 @@ class ClaudeCode:
             own = _session_id(record.get("sessionId")) if record else None
             if record is None or own is None:
                 continue
-            sid = self.writes(own, record.get("resumeSessionId"), continued_from)
-            out.append(Job(short, sid, mtime, own))
+            writer = self.writes(own, record.get("resumeSessionId"), continued_from)
+            out.append(Job(short, writer.session_id, mtime, own, writer.candidates))
         return out
 
     def writes(
@@ -648,40 +683,73 @@ class ClaudeCode:
         own: str,
         resumes: object = None,
         continued_from: ContinuedFrom | None = None,
-    ) -> str:
+    ) -> Writer:
         """The session whose transcript a process or a job with the id `own`
-        writes. A background job can have its own id and write the transcript
-        of the session that it continues. That session is `resumes` (the
-        `resumeSessionId` of the job's state). If `resumes` is not usable, it
-        is the one session that continued in `own`. If `own` has a local
-        transcript with a conversation, the job writes `own`."""
-        target = _session_id(resumes)
-        if target is None or target == own:
-            sources = {
-                sid
-                for s in (continued_from or {}).get(own, ())
-                if (sid := _session_id(s)) is not None and sid != own
-            }
-            target = next(iter(sources)) if len(sources) == 1 else None
-        if target is None or target == own or self._has_conversation(own):
-            return own
-        return target
+        writes. If `own` has a local transcript with a conversation, it is
+        `own`. Else a background job can write the transcript of the session
+        that it continues: `resumes` (the `resumeSessionId` of the job's
+        state) and the sessions that continued in `own` are the candidates.
+        One candidate is the session. With no candidate or more than one, the
+        session is not known: a stale or missing `continued_from` cannot show
+        that the job writes `own`."""
+        if self._has_conversation(own):
+            return Writer(own)
+        candidates: list[str] = []
+        for value in (resumes, *sorted((continued_from or {}).get(own, ()))):
+            sid = _session_id(value)
+            if sid is not None and sid != own and sid not in candidates:
+                candidates.append(sid)
+        if len(candidates) == 1:
+            return Writer(candidates[0], tuple(candidates))
+        return Writer(None, tuple(candidates))
 
     def resolve(
         self, session_id: str, continued_from: ContinuedFrom | None = None
-    ) -> str:
+    ) -> str | None:
         """The session whose transcript the Claude Code process of this
         environment writes, from its session id (`CLAUDE_CODE_SESSION_ID`, or
         the session of a hook). In a background job, that id can be the job's
-        own id. Then the job's state (`CLAUDE_JOB_DIR`) or `continued_from`
-        gives the session (see `writes`)."""
-        resumes = None
+        own id. Only in the job that runs this process (`current_job`) does
+        the id change, to the session from `writes`. None if that job can
+        write more than one session. Else the id does not change."""
+        state = self.current_job()
+        if state is None or session_id not in (
+            state.get("sessionId"),
+            state.get("resumeSessionId"),
+        ):
+            return session_id
+        writer = self.writes(session_id, state.get("resumeSessionId"), continued_from)
+        if writer.session_id is not None:
+            return writer.session_id
+        return None if writer.ambiguous else session_id
+
+    def current_job(self) -> dict[str, Any] | None:
+        """The state of the background job that runs this process, or None.
+        `CLAUDE_JOB_DIR` names the job. Its value can be stale, for example in
+        a process that a job started and that outlives the job. Thus a live
+        registry record of this process or of a parent process must also
+        name the job."""
         job_dir = os.environ.get("CLAUDE_JOB_DIR")
-        if job_dir:
-            state = _read_state(Path(job_dir) / "state.json") or {}
-            if session_id in (state.get("sessionId"), state.get("resumeSessionId")):
-                resumes = state.get("resumeSessionId")
-        return self.writes(session_id, resumes, continued_from)
+        sessions = self.config_dir / "sessions"
+        if not job_dir or not sessions.is_dir():
+            return None
+        short = Path(job_dir).name
+        if not _JOB_ID.fullmatch(short):
+            return None
+        ancestors = _ancestors()
+        for path in sessions.glob("*.json"):
+            try:
+                record: dict[str, Any] = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if (
+                isinstance(record, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
+                and record.get("jobId") == short
+                and record.get("pid") in ancestors
+                and _alive(record)
+            ):
+                return _read_state(self.config_dir / "jobs" / short / "state.json")
+        return None
 
     def _has_conversation(self, session_id: str) -> bool:
         """True if a local transcript of the session is not empty and not a
