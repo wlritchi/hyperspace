@@ -43,7 +43,7 @@ from hyperspace_client.cli import (
     set_status,
 )
 from hyperspace_client.config import Config
-from hyperspace_client.hooks import handle
+from hyperspace_client.hooks import handle, notices
 from hyperspace_client.launcher import Launcher
 from hyperspace_client.state import LEASE_FIELDS, SessionRecord, State
 from hyperspace_client.sync import REWRITE_SETTLE, Context, Syncer
@@ -993,3 +993,58 @@ def test_a_job_whose_session_is_not_known_acts_on_none(
     )
     assert started[0][4] == str(j)
     assert ctx.state.wanted_status(H, j.stem) is None
+
+
+@needs_proc
+@pytest.mark.parametrize("shape", ["not known", "ambiguous"])
+def test_a_job_whose_session_is_not_known_takes_no_status_notices(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: str,
+) -> None:
+    j = fake.transcript(WS)
+    fake.write(j, *stub_records(j.stem))
+    resumes = j.stem
+    if shape == "ambiguous":
+        s, t = fake.transcript(WS), fake.transcript(WS)
+        fake.write(s, prompt("one", cwd=WS))
+        fake.write(t, prompt("two", cwd=WS))
+        continued(fake, j, t)
+        sync(ctx, t)
+        resumes = s.stem
+    directory = job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=resumes)
+    hook_env(monkeypatch, fake, directory)
+    register(fake, sessionId=j.stem, jobId="aa")
+    cfg = Config(host="laptop", state_dir=tmp_path / "state")
+    payload = {"transcript_path": str(j), "cwd": WS}
+
+    def hook(event: str, **more: Any) -> str:
+        started: list[list[str]] = []
+        return handle(
+            {**payload, "hook_event_name": event, **more}, cfg, start=started.append
+        )
+
+    # An older client backed up the stub, and a user marked J done.
+    sync(ctx, j)
+    event = add_status(ctx, j.stem, "done")
+    ctx.state.save_status(H, j.stem, event, None)
+    marked = "[hyperspace] marked done"
+    ctx.state.add_notice(H, j.stem, "status", marked)
+    ctx.state.add_notice(H, j.stem, "lease", "[hyperspace] lease 1")
+    monkeypatch.setenv("HYPERSPACE_LAUNCHER", "off")
+    # No status notice at the start, but the lease notice of the payload.
+    assert hook("SessionStart", source="startup") == "[hyperspace] lease 1"
+    ctx.state.add_notice(H, j.stem, "lease", "[hyperspace] lease 2")
+    assert hook("UserPromptSubmit") == "[hyperspace] lease 2"
+    ctx.state.add_notice(H, j.stem, "lease", "[hyperspace] lease 3")
+    tool = {**payload, "hook_event_name": "PostToolUse"}
+    out = json.loads(notices(tool, cfg))
+    assert out["hookSpecificOutput"]["additionalContext"] == "[hyperspace] lease 3"
+    assert notices(tool, cfg) == ""
+    assert ctx.state.has_notice(H, j.stem, "status")
+    # The prevention checks still apply to the session of the payload.
+    ctx.state.put(f"restore_pending:{H}:{j.stem}", "1")
+    assert "unfinished restore" in hook("UserPromptSubmit")
