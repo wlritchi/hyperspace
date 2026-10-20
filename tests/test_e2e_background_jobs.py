@@ -1092,3 +1092,44 @@ def test_a_registry_record_with_no_matching_start_time_does_not_change_the_sessi
     # With the start time of this process, the id changes.
     register(fake, sessionId=j.stem, jobId="aa")
     assert _current(ctx.state) == s.stem
+
+
+@pytest.mark.parametrize("failure", ["backup", "not found"])
+def test_a_failed_close_replaces_the_old_reason(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    j, s, t = (fake.transcript(WS) for _ in range(3))
+    for x in (j, s, t):
+        fake.write(x, prompt("work", cwd=WS))
+    continued(fake, j, t)
+    for x in (s, t) if failure == "not found" else (j, s, t):
+        sync(ctx, x)
+    job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
+    rm = Rm()
+    run = launcher(ctx, fake, run_rm=rm)
+    run.tick()
+    run.tick()
+    old = "job aa can write more than one session; close it yourself"
+    for x in (s, t) if failure == "not found" else (j, s, t):
+        assert close_blocked(ctx, x.stem) == old
+    # Now the job writes only J, but its close fails.
+    job_dir(fake, "aa", sessionId=j.stem)
+    ctx.state.save_session(SessionRecord(H, t.stem, workspace=WS), ("metadata",))
+    if failure == "backup":
+        add_status(ctx, j.stem, "done")
+
+        def back_up(*args: Any) -> None:
+            raise TeleportError("cannot close: test")
+
+        monkeypatch.setattr(launcher_module, "back_up", back_up)
+    run.tick()
+    run.tick()
+    assert rm.calls == []
+    assert close_blocked(ctx, s.stem) is None
+    assert close_blocked(ctx, t.stem) is None
+    if failure == "backup":
+        assert close_blocked(ctx, j.stem) == "cannot close: test"
