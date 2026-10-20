@@ -16,6 +16,11 @@ Events in `STATUS_EVENTS` also queue a status write (see `status.py`), which
 the checkpoint sends. With `--notices`, the hook only prints the pending
 notices for the agent, for the plugin's synchronous PostToolUse hook.
 
+In a background job whose session is not known (`ClaudeCode.resolve`), the
+hooks queue no status write, start no job close, and show no status notice:
+the status notices stay pending. The checkpoint, the lease notices and the
+restore and resume checks use the session of the payload.
+
 Checkpoints and sweeps run in a detached process, so that the hook returns
 at once and the work outlives the session.
 """
@@ -85,14 +90,16 @@ def handle(
     if session is None:
         return ""
     resolved = _resolve(cfg, adapter, session)
+    # If the session of the job is not known, write no status and show no
+    # status notice. The backup and the lease checks use the session of the
+    # payload.
+    known = resolved is not None
     if resolved is None:
-        # The session of the job is not known: write no status, and back up
-        # only the transcript of the payload.
         log.info("%s: no status: the job's session is not known", session.session_id)
     else:
         session = resolved
     transcript = str(session.transcript)
-    if event in STATUS_EVENTS and resolved is not None:
+    if event in STATUS_EVENTS and known:
         try:
             state = State(cfg.state_dir)
             try:
@@ -132,7 +139,13 @@ def handle(
         state = State(cfg.state_dir)
         try:
             return session_start_notice(
-                state, adapter, session, cfg.host, cwd, _str(payload, "source")
+                state,
+                adapter,
+                session,
+                cfg.host,
+                cwd,
+                _str(payload, "source"),
+                status_notices=known,
             )
         finally:
             state.close()
@@ -143,7 +156,9 @@ def handle(
             pending = pending_restore_decision(state, session)
             if pending is not None:
                 return json.dumps(pending)
-            notices = state.take_notices(session.harness, session.session_id)
+            notices = state.take_notices(
+                session.harness, session.session_id, None if known else "status"
+            )
             decision = None
             try:
                 url, token = cfg.require_server()
@@ -234,10 +249,13 @@ def notices(payload: dict[str, Any], cfg: Config) -> str:
     session = adapter.session_for_transcript(Path(transcript)) if transcript else None
     if session is None:
         return ""
-    session = _resolve(cfg, adapter, session) or session
+    resolved = _resolve(cfg, adapter, session)
+    # If the session of the job is not known, show only the lease notices.
+    keep = "status" if resolved is None else None
+    session = resolved or session
     state = State(cfg.state_dir)
     try:
-        texts = state.take_notices(session.harness, session.session_id)
+        texts = state.take_notices(session.harness, session.session_id, keep)
     finally:
         state.close()
     if not texts:

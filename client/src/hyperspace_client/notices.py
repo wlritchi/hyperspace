@@ -36,8 +36,10 @@ def session_start_notice(
     host: str,
     cwd: str | None,
     source: str | None,
+    status_notices: bool = True,
 ) -> str:
-    """The text for the SessionStart hook to print. Local state only."""
+    """The text for the SessionStart hook to print. Local state only. With
+    no `status_notices`, the status notices stay pending and do not show."""
     pending = pending_restore_decision(state, session)
     if pending is not None:
         return pending["reason"]
@@ -62,7 +64,8 @@ def session_start_notice(
     # call. Until then, tell the agent only of the mark.
     done = record.status
     if (
-        done is not None
+        status_notices
+        and done is not None
         and done.get("status") == "done"
         and state.has_notice(session.harness, session.session_id, "status")
     ):
