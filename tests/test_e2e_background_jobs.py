@@ -1058,6 +1058,117 @@ def test_a_job_whose_session_is_not_known_takes_no_status_notices(
     assert "unfinished restore" in hook("UserPromptSubmit")
 
 
+def acts_on_none(
+    ctx: Context,
+    cfg: Config,
+    payload: dict[str, Any],
+    sessions: tuple[str, ...],
+) -> None:
+    """The hooks with the payload write no status for any of `sessions`, and
+    take only the lease notices of the payload's session."""
+    sid = Path(payload["transcript_path"]).stem
+    started: list[list[str]] = []
+    handle({**payload, "hook_event_name": "Stop"}, cfg, start=started.append)
+    assert started[0][4] == payload["transcript_path"]
+    for x in sessions:
+        assert ctx.state.wanted_status(H, x) is None
+    ctx.state.add_notice(H, sid, "status", "[hyperspace] marked done")
+    ctx.state.add_notice(H, sid, "lease", "[hyperspace] lease 1")
+    prompted = {**payload, "hook_event_name": "UserPromptSubmit"}
+    out = handle(prompted, cfg, start=started.append)
+    assert out == "[hyperspace] lease 1"
+    ctx.state.add_notice(H, sid, "lease", "[hyperspace] lease 2")
+    tool = {**payload, "hook_event_name": "PostToolUse"}
+    out = json.loads(notices(tool, cfg))
+    assert out["hookSpecificOutput"]["additionalContext"] == "[hyperspace] lease 2"
+    assert ctx.state.has_notice(H, sid, "status")
+
+
+@needs_proc
+@pytest.mark.parametrize("incoming", ["own", "resumed"])
+@pytest.mark.parametrize("competitor", ["own conversation", "continued link"])
+def test_a_job_with_a_competing_session_acts_on_none_under_each_of_its_ids(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    incoming: str,
+    competitor: str,
+) -> None:
+    # The job's state names J and S. J also has a conversation, or the
+    # synced metadata says that T continued in J. The process and the hooks
+    # can name J or S.
+    s, j = background_job(fake)
+    sessions = (s.stem, j.stem)
+    if competitor == "own conversation":
+        fake.write(j, prompt("in a terminal", cwd=WS))
+    else:
+        t = fake.transcript(WS)
+        fake.write(t, prompt("other", cwd=WS))
+        continued(fake, j, t)
+        sync(ctx, t)
+        sessions += (t.stem,)
+    directory = job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
+    hook_env(monkeypatch, fake, directory)
+    register(fake, sessionId=j.stem, jobId="aa")
+    named = j if incoming == "own" else s
+    monkeypatch.setenv(SESSION_ENV, named.stem)
+    assert _current(ctx.state) is None
+    with pytest.raises(Exit, match="the session of this background job is not known"):
+        _target(None, _current(ctx.state))
+    cfg = Config(host="laptop", state_dir=tmp_path / "state")
+    payload = {"transcript_path": str(named), "cwd": WS}
+    acts_on_none(ctx, cfg, payload, sessions)
+
+
+@needs_proc
+def test_a_job_whose_state_has_no_valid_own_id_acts_on_none(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s, _ = background_job(fake)
+    directory = job_dir(fake, "aa", sessionId="not a session", resumeSessionId=s.stem)
+    hook_env(monkeypatch, fake, directory)
+    register(fake, sessionId=s.stem, jobId="aa")
+    monkeypatch.setenv(SESSION_ENV, s.stem)
+    assert _current(ctx.state) is None
+
+
+@needs_proc
+@pytest.mark.parametrize("when", ["missing", "gone"])
+def test_the_hooks_act_on_none_if_the_transcript_of_the_job_session_is_not_found(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    when: str,
+) -> None:
+    # The job resumes S, but this host has no transcript of S, or S's
+    # transcript goes away after the hook resolves the session.
+    s, j = background_job(fake)
+    if when == "missing":
+        s.unlink()
+    else:
+        real = ClaudeCode.resolve
+
+        def resolve(self: ClaudeCode, *args: Any) -> str | None:
+            sid = real(self, *args)
+            s.unlink(missing_ok=True)
+            return sid
+
+        monkeypatch.setattr(ClaudeCode, "resolve", resolve)
+    directory = job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
+    hook_env(monkeypatch, fake, directory)
+    register(fake, sessionId=j.stem, jobId="aa")
+    cfg = Config(host="laptop", state_dir=tmp_path / "state")
+    payload = {"transcript_path": str(j), "cwd": WS}
+    acts_on_none(ctx, cfg, payload, (s.stem, j.stem))
+
+
 @needs_proc
 @pytest.mark.parametrize("start", ["missing", None, "1"])
 def test_a_registry_record_with_no_matching_start_time_does_not_change_the_session(

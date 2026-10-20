@@ -1217,9 +1217,12 @@ on nothing that it would have to guess.
   or a `/proc` stat that cannot be read does not count, and on other platforms
   than Linux no record counts. Else the id does not change, so a foreground
   `claude --resume J` of the stub is the session J, and a stale
-  `CLAUDE_JOB_DIR` or a stale record whose pid is reused changes nothing. If
-  the job has no candidate or more than one, `resolve` gives None: the CLI
-  then has no current session (a command with no session id stops with
+  `CLAUDE_JOB_DIR` or a stale record whose pid is reused changes nothing. In
+  the job, the id can be J or the `resumeSessionId` S. `resolve` then always
+  takes the candidates of J (`writes` with J), so both ids give the same
+  answer. A job state with no valid `sessionId` gives None. If the job has no
+  candidate or more than one, `resolve` gives None: the CLI then has no
+  current session (a command with no session id stops with
   `give a session id; the session of this background job is not known`, and an
   explicit session works and is not the current one), and the hooks write no
   status. A new job whose transcript has no conversation yet thus writes no
@@ -1234,11 +1237,16 @@ on nothing that it would have to guess.
   `test_a_stale_job_dir_does_not_change_the_session`,
   `test_a_registry_record_with_no_matching_start_time_does_not_change_the_session`,
   `test_a_job_that_can_write_more_than_one_session_acts_on_none`,
+  `test_a_job_with_a_competing_session_acts_on_none_under_each_of_its_ids`,
+  `test_a_job_whose_state_has_no_valid_own_id_acts_on_none`,
   `test_a_job_whose_session_is_not_known_acts_on_none`,
   `test_a_notice_for_a_session_flags_the_id_that_it_continued_in`,
   `test_notice_sh_in_a_job_under_its_own_id`. The test helper `register()`
   writes `procStart`.
-- **Hooks in a job whose session is not known** (`_resolve` gives None):
+- **Hooks in a job whose session is not known** (`_resolve` gives None). In
+  the hooks, this also includes a job whose session from `resolve` has no
+  local transcript, also if the transcript goes away after `resolve`. The
+  hooks do not fall back to the session of the payload for the status:
   - no status write for any event in `STATUS_EVENTS`;
   - SessionStart: no `done` notice (`session_start_notice` with
     `status_notices=False`). The restore-pending block, the arrival and move
@@ -1254,7 +1262,8 @@ on nothing that it would have to guess.
   - SessionEnd: no close (the job's `session_id` is None);
   - the checkpoint sync is for the payload's transcript.
 
-  Test: `test_a_job_whose_session_is_not_known_takes_no_status_notices`.
+  Tests: `test_a_job_whose_session_is_not_known_takes_no_status_notices`,
+  `test_the_hooks_act_on_none_if_the_transcript_of_the_job_session_is_not_found`.
 
 - **Limit of `notice.sh`**: in a job under its own id J, the script finds a
   notice for S only by the flag of J or by the flag of the `resumeSessionId`
