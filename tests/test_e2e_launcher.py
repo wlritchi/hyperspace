@@ -21,7 +21,7 @@ import pytest
 
 from _hs import FakeClaude, Server, make_server, prompt, text_reply
 from hyperspace_client import launcher as launcher_mod
-from hyperspace_client.adapters.claude_code import ClaudeCode
+from hyperspace_client.adapters.claude_code import ClaudeCode, ContinuedFrom
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.backfill import RunResult
 from hyperspace_client.cli import _hook_heartbeat, main, status_label
@@ -60,8 +60,10 @@ class Host(ClaudeCode):
         super().__init__(root)
         self.live: list[str] = []
 
-    def live_sessions(self) -> list[str]:
-        return list(self.live)
+    def live_processes(
+        self, continued_from: ContinuedFrom | None = None
+    ) -> list[list[str]]:
+        return [[sid] for sid in self.live]
 
     def is_running(self, session_id: str) -> bool:
         return session_id in self.live

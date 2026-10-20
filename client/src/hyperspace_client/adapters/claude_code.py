@@ -15,6 +15,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,9 +37,13 @@ class Job:
     """A Claude Code background job: `claude rm <short>` removes it."""
 
     short: str
+    # The session whose transcript the job writes (see `ClaudeCode.writes`).
     session_id: str
     # The modification time of the job's state.json.
     mtime: float
+    # The job's own id (`sessionId` in its state). It can differ from
+    # `session_id`.
+    own_id: str
 
 
 # A job directory name that cannot be read as an option.
@@ -79,6 +84,28 @@ _NAME_RECORDS = frozenset({"ai-title", "agent-name", "custom-title"})
 STUB_MAX = 64 * 1024
 # A job id names a directory in `<config dir>/jobs/`.
 _JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# Session id to the sessions whose transcripts have a `continued-in` record
+# with that id (from `State.continued_from`).
+ContinuedFrom = Mapping[str, Collection[str]]
+
+
+def _session_id(value: object) -> str | None:
+    """`value` if it is a valid session id, else None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return validate_session_id(value)
+    except ValueError:
+        return None
+
+
+def _read_state(path: Path) -> dict[str, Any] | None:
+    """The object in a job's state.json, or None."""
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None  # pyright: ignore[reportUnknownVariableType]
 
 
 def _walk(root: Path) -> list[Path]:
@@ -476,32 +503,46 @@ class ClaudeCode:
             index.setdefault(session.session_id, []).append(session.transcript)
         return index
 
-    def live_sessions(self) -> list[str]:
-        """The ids of the sessions that a live Claude Code process on this
-        host has.
-
-        Claude Code writes `<config dir>/sessions/<pid>.json` for each
-        process, with the session id and the process start time (field 22 of
-        /proc/<pid>/stat), so a reused pid does not count."""
+    def live_processes(
+        self, continued_from: ContinuedFrom | None = None
+    ) -> list[list[str]]:
+        """For each live Claude Code process on this host, the ids of the
+        sessions whose transcripts it can write. This is the rule of
+        `is_running`: the process's registry id, the ids in its job's state,
+        and the sessions that continued in its registry id (from
+        `continued_from`). Invalid ids are left out, because the server
+        refuses a heartbeat with one."""
         sessions = self.config_dir / "sessions"
         if not sessions.is_dir():
             return []
-        live: list[str] = []
+        out: list[list[str]] = []
         for path in sorted(sessions.glob("*.json")):
             try:
                 record: dict[str, Any] = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
-            sid = record.get("sessionId")
-            if not isinstance(sid, str) or sid in live:
+            if not isinstance(record, dict) or not _alive(record):  # pyright: ignore[reportUnnecessaryIsInstance]
                 continue
-            try:
-                # The server refuses a heartbeat with an invalid id.
-                validate_session_id(sid)
-            except ValueError:
-                continue
-            if _alive(record):
-                live.append(sid)
+            own = record.get("sessionId")
+            candidates: list[object] = [own]
+            candidates += sorted(self._job_sessions(record.get("jobId")))
+            if isinstance(own, str):
+                candidates += sorted((continued_from or {}).get(own, ()))
+            ids: list[str] = []
+            for candidate in candidates:
+                sid = _session_id(candidate)
+                if sid is not None and sid not in ids:
+                    ids.append(sid)
+            if ids:
+                out.append(ids)
+        return out
+
+    def live_sessions(self, continued_from: ContinuedFrom | None = None) -> list[str]:
+        """The ids of the sessions that a live Claude Code process on this
+        host can write (see `live_processes`)."""
+        live: list[str] = []
+        for ids in self.live_processes(continued_from):
+            live += [sid for sid in ids if sid not in live]
         return live
 
     def is_running(self, session_id: str) -> bool:
@@ -576,11 +617,11 @@ class ClaudeCode:
                 continue
         return found
 
-    def jobs(self) -> list[Job]:
+    def jobs(self, continued_from: ContinuedFrom | None = None) -> list[Job]:
         """The background jobs on this host, from
         `<config dir>/jobs/<short>/state.json`. Claude Code says that this file
         is not a stable interface, so a job with an unexpected name or no
-        session id is left out."""
+        valid session id is left out."""
         jobs = self.config_dir / "jobs"
         if not jobs.is_dir():
             return []
@@ -590,20 +631,75 @@ class ClaudeCode:
             # The name goes to `claude rm` as an argument.
             if not _JOB_NAME.fullmatch(short):
                 continue
+            record = _read_state(path)
             try:
-                record: dict[str, Any] = json.loads(path.read_text())
                 mtime = path.stat().st_mtime
-            except (OSError, ValueError):
+            except OSError:
                 continue
-            sid = record.get("sessionId")
-            if not isinstance(sid, str):
+            own = _session_id(record.get("sessionId")) if record else None
+            if record is None or own is None:
                 continue
-            try:
-                validate_session_id(sid)
-            except ValueError:
-                continue
-            out.append(Job(short, sid, mtime))
+            sid = self.writes(own, record.get("resumeSessionId"), continued_from)
+            out.append(Job(short, sid, mtime, own))
         return out
+
+    def writes(
+        self,
+        own: str,
+        resumes: object = None,
+        continued_from: ContinuedFrom | None = None,
+    ) -> str:
+        """The session whose transcript a process or a job with the id `own`
+        writes. A background job can have its own id and write the transcript
+        of the session that it continues. That session is `resumes` (the
+        `resumeSessionId` of the job's state). If `resumes` is not usable, it
+        is the one session that continued in `own`. If `own` has a local
+        transcript with a conversation, the job writes `own`."""
+        target = _session_id(resumes)
+        if target is None or target == own:
+            sources = {
+                sid
+                for s in (continued_from or {}).get(own, ())
+                if (sid := _session_id(s)) is not None and sid != own
+            }
+            target = next(iter(sources)) if len(sources) == 1 else None
+        if target is None or target == own or self._has_conversation(own):
+            return own
+        return target
+
+    def resolve(
+        self, session_id: str, continued_from: ContinuedFrom | None = None
+    ) -> str:
+        """The session whose transcript the Claude Code process of this
+        environment writes, from its session id (`CLAUDE_CODE_SESSION_ID`, or
+        the session of a hook). In a background job, that id can be the job's
+        own id. Then the job's state (`CLAUDE_JOB_DIR`) or `continued_from`
+        gives the session (see `writes`)."""
+        resumes = None
+        job_dir = os.environ.get("CLAUDE_JOB_DIR")
+        if job_dir:
+            state = _read_state(Path(job_dir) / "state.json") or {}
+            if session_id in (state.get("sessionId"), state.get("resumeSessionId")):
+                resumes = state.get("resumeSessionId")
+        return self.writes(session_id, resumes, continued_from)
+
+    def _has_conversation(self, session_id: str) -> bool:
+        """True if a local transcript of the session is not empty and not a
+        stub."""
+        name = f"{session_id}.jsonl"
+        projects = self.config_dir / "projects"
+        if not _SESSION_FILE.fullmatch(name) or not projects.is_dir():
+            return False
+        for project in projects.iterdir():
+            transcript = project / name
+            try:
+                if transcript.stat().st_size == 0:
+                    continue
+            except OSError:
+                continue
+            if not self.is_stub(LocalSession(HARNESS, session_id, transcript)):
+                return True
+        return False
 
     # --- Status ------------------------------------------------------------------
 

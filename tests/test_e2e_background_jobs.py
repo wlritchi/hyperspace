@@ -21,14 +21,17 @@ from typing import Any
 import pytest
 
 from _hs import FakeClaude, Server, context, make_server, prompt, tool_call
+from hyperspace_client import backfill
 from hyperspace_client.adapters.claude_code import (
     STUB_MAX,
     TRANSCRIPT,
     ClaudeCode,
     is_stub,
 )
-from hyperspace_client.cli import _sweep
+from hyperspace_client.backfill import RunResult
+from hyperspace_client.cli import _hook_heartbeat, _sweep
 from hyperspace_client.config import Config
+from hyperspace_client.launcher import Launcher
 from hyperspace_client.state import LEASE_FIELDS, SessionRecord, State
 from hyperspace_client.sync import REWRITE_SETTLE, Context, Syncer
 from hyperspace_client.teleport import TeleportError, fork, restore, send
@@ -381,3 +384,176 @@ def test_saving_some_fields_keeps_the_others(tmp_path: Path) -> None:
             state.save_session(record, ("workspace; DROP TABLE sessions",))
     finally:
         state.close()
+
+
+# --- Status and liveness of a job that writes another session ---------------------
+
+needs_proc = pytest.mark.skipif(
+    not Path("/proc/self/stat").exists(), reason="needs /proc"
+)
+
+
+def job_dir(fake: FakeClaude, short: str, **state: Any) -> Path:
+    directory = fake.root / "jobs" / short
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "state.json").write_text(json.dumps(state, indent=2))
+    return directory
+
+
+def add_status(ctx: Context, sid: str, status: str, kind: str = "user") -> Any:
+    current = ctx.api.state(H, sid).get("status")
+    body: dict[str, Any] = {
+        "status": status,
+        "source_kind": kind,
+        "explicit": kind != "hook",
+        "base_seq": current["seq"] if current else 0,
+    }
+    return ctx.api.add_status(H, sid, body)  # pyright: ignore[reportArgumentType]
+
+
+def no_start(args: list[str]) -> None:
+    raise AssertionError(f"the launcher started {args}")
+
+
+class Rm:
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> tuple[int, str]:
+        self.calls.append(argv)
+        return 0, ""
+
+
+def launcher(ctx: Context, fake: FakeClaude, **kw: Any) -> Launcher:
+    kw.setdefault("start", no_start)
+    kw.setdefault("run_rm", Rm())
+    return Launcher(ctx, fake.adapter, "claude", 60, None, **kw)
+
+
+def liveness(ctx: Context, sid: str) -> str:
+    return ctx.api.state(H, sid)["liveness"]["state"]  # pyright: ignore[reportTypedDictNotRequiredAccess]
+
+
+@needs_proc
+def test_a_job_under_its_own_id_makes_its_session_live(
+    server: Server, fake: FakeClaude, ctx: Context
+) -> None:
+    s, j = background_job(fake)
+    sync(ctx, s)
+    continued = ctx.state.continued_from(H)
+    assert continued == {j.stem: [s.stem]}
+    # The job's state names only its own id: the continued-in record in S's
+    # synced metadata links the two.
+    job_dir(fake, j.stem[:8], sessionId=j.stem, resumeSessionId=j.stem)
+    register(fake, sessionId=j.stem, jobId=j.stem[:8])
+    assert fake.adapter.live_sessions(continued) == [j.stem, s.stem]
+    launcher(ctx, fake).tick()
+    assert liveness(ctx, s.stem) == "live"
+    # The SessionEnd heartbeat of the job leaves out each id of the job.
+    _hook_heartbeat(Config(host="laptop"), ctx, s.stem, "SessionEnd")
+    assert liveness(ctx, s.stem) == "stopped"
+
+
+@needs_proc
+def test_a_job_makes_the_session_in_its_state_live(fake: FakeClaude) -> None:
+    s = fake.transcript(WS)
+    fake.write(s, prompt("hi", cwd=WS))
+    own = str(uuid.uuid4())
+    job_dir(fake, "abcd1234", sessionId=own, resumeSessionId=s.stem)
+    register(fake, sessionId=own, jobId="abcd1234")
+    assert fake.adapter.live_processes() == [[own, s.stem]]
+    assert fake.adapter.live_sessions() == [own, s.stem]
+
+
+@needs_proc
+def test_the_runner_does_not_resume_a_session_that_a_job_writes(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    s, j = fake.transcript(str(ws)), fake.transcript(str(ws))
+    fake.write(
+        s,
+        prompt("investigate", cwd=str(ws)),
+        {"type": "continued-in", "continuedInSessionId": j.stem, "sessionId": s.stem},
+    )
+    fake.write(j, *stub_records(j.stem))
+    session = fake.adapter.session_for_transcript(s)
+    assert session is not None
+    Syncer(ctx, session, str(ws)).run()
+    add_status(ctx, s.stem, "working", kind="hook")
+    register(fake, sessionId=j.stem, jobId=j.stem[:8])
+    calls: list[list[str]] = []
+
+    def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
+        calls.append(argv)
+        return RunResult(0, "")
+
+    run = launcher(ctx, fake, runner=True, workspace=str(ws), run_claude=bg)
+    run.tick()
+    assert calls == []
+    assert liveness(ctx, s.stem) == "live"
+    # The job stops: the next tick resumes the session.
+    for path in (fake.root / "sessions").iterdir():
+        path.unlink()
+    run.tick()
+    assert [argv[-2] for argv in calls] == [s.stem]
+
+
+def test_a_job_closes_on_the_status_of_the_session_that_it_writes(
+    server: Server, fake: FakeClaude, ctx: Context
+) -> None:
+    # A job whose state names the session that it resumes.
+    s, j = background_job(fake)
+    # A job whose state names only its own id.
+    s2, j2 = background_job(fake)
+    # A job that has a conversation under its own id writes its own
+    # transcript.
+    j3 = fake.transcript(WS)
+    fake.write(j3, prompt("own work", cwd=WS))
+    for t in (s, s2, j3):
+        sync(ctx, t)
+        add_status(ctx, t.stem, "done")
+    job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
+    job_dir(fake, "bb", sessionId=j2.stem, resumeSessionId=j2.stem)
+    job_dir(fake, "cc", sessionId=j3.stem, resumeSessionId=s.stem)
+    jobs = fake.adapter.jobs(ctx.state.continued_from(H))
+    assert [(x.short, x.session_id, x.own_id) for x in jobs] == [
+        ("aa", s.stem, j.stem),
+        ("bb", s2.stem, j2.stem),
+        ("cc", j3.stem, j3.stem),
+    ]
+    rm = Rm()
+    launcher(ctx, fake, run_rm=rm).tick()
+    assert rm.calls == [["claude", "rm", short] for short in ("aa", "bb", "cc")]
+
+
+@needs_proc
+def test_backfill_skips_stubs_and_the_sessions_of_live_jobs(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    s, j, idle = (fake.transcript(str(ws)) for _ in range(3))
+    fake.write(
+        s,
+        prompt("investigate", cwd=str(ws)),
+        {"type": "continued-in", "continuedInSessionId": j.stem, "sessionId": s.stem},
+    )
+    fake.write(j, *stub_records(j.stem))
+    fake.write(idle, prompt("idle", cwd=str(ws)))
+    # Also a stub that an older client already backed up.
+    for t in (s, j, idle):
+        session = fake.adapter.session_for_transcript(t)
+        assert session is not None
+        Syncer(ctx, session, str(ws)).run()
+    register(fake, sessionId=j.stem, jobId=j.stem[:8])
+    selection = backfill.select(ctx, fake.adapter, 3600, time.time())
+    assert [c.session.session_id for c in selection.candidates] == [idle.stem]
+    assert selection.skipped == {"live": 2}
+    # When the job stops, the stub is still not messaged.
+    for path in (fake.root / "sessions").iterdir():
+        path.unlink()
+    selection = backfill.select(ctx, fake.adapter, 3600, time.time())
+    assert {c.session.session_id for c in selection.candidates} == {s.stem, idle.stem}
+    assert selection.skipped == {"no conversation": 1}
