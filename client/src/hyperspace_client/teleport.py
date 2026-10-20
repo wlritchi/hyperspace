@@ -22,7 +22,13 @@ from typing import Any, cast
 import httpx
 
 from hyperspace_client.adapters import LocalFile
-from hyperspace_client.adapters.claude_code import TRANSCRIPT, ClaudeCode, sanitize_path
+from hyperspace_client.adapters.claude_code import (
+    STUB_MAX,
+    TRANSCRIPT,
+    ClaudeCode,
+    is_stub,
+    sanitize_path,
+)
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.state import Cursor, Segment, SessionRecord, State
 from hyperspace_client.sync import CHUNK, Context, Syncer
@@ -137,7 +143,9 @@ def _send(
         session = adapter.session_for_transcript(transcript)
         assert session is not None
         workspace = record.workspace or adapter.first_cwd(session) or str(Path.cwd())
-        result = Syncer(ctx, session, workspace).run()
+        # The surrender needs the server copy to match the local file, also
+        # when the file is now shorter with no new record.
+        result = Syncer(ctx, session, workspace, empty_rewrites=True).run()
         if result.errors:
             raise TeleportError("cannot surrender: " + "; ".join(result.errors))
         metadata = ctx.state.session(harness, session_id).metadata
@@ -420,6 +428,9 @@ def _restore(
         prepared.append((entry, path, data))
     if target not in originals:
         raise TeleportError("the session has no restorable transcript")
+    transcript = next(data for _, path, data in prepared if path == target)
+    if is_stub(transcript) and not force and not replay:
+        raise TeleportError(_stub_message(ctx, adapter, session_id, transcript))
 
     # Download everything before touching local files. Keep rollback copies
     # until the conditional lease request succeeds. Cursors save afterward.
@@ -561,6 +572,36 @@ def _save_log_cursor(
     )
 
 
+def _stub_message(ctx: Context, adapter: ClaudeCode, sid: str, data: bytes) -> str:
+    """Why a restore of a stub stops, and the sessions that can hold its
+    conversation: a session that continued in it, or one with its title."""
+    title = adapter.update_metadata({}, TRANSCRIPT, data).get("title")
+    lines = [
+        (
+            f"the backup of {sid} holds no conversation, only records that name "
+            "it. It is probably the id of a Claude Code background job, and the "
+            "conversation is in the session that the job continued."
+        )
+    ]
+    try:
+        summaries = ctx.api.sessions(harness=adapter.harness, limit="1000")
+    except (ApiError, httpx.HTTPError):
+        summaries = []
+    for summary in summaries:
+        meta = summary["metadata"]
+        if summary["session_id"] == sid:
+            continue
+        if meta.get("links", {}).get("continued_in") != sid and (
+            not title or meta.get("title") != title
+        ):
+            continue
+        where = summary.get("last_placement")
+        place = f" on {where['host']}:{where['workspace']}" if where else ""
+        lines.append(f"Possible session: {summary['session_id']}{place}")
+    lines.append("Use --force to restore it anyway.")
+    return "\n".join(lines)
+
+
 # --- Fork ----------------------------------------------------------------------------
 
 
@@ -604,6 +645,13 @@ def fork(
     if branch not in generations:
         raise TeleportError(f"no generation {branch} in the transcript")
     length = generations[branch]["length"]
+    if length <= STUB_MAX and is_stub(
+        _log_bytes(ctx.api, harness, session_id, branch, length)
+    ):
+        raise TeleportError(
+            f"{session_id} holds no conversation, only records that name it; "
+            "there is nothing to fork"
+        )
     event = ctx.api.fork(harness, session_id, branch, length)
     new_id = validate_session_id(event["session_id"])
     # Copy every remote file, not only files discoverable on this host.

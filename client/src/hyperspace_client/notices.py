@@ -15,7 +15,7 @@ import httpx
 from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import ApiError
-from hyperspace_client.state import SessionRecord, State
+from hyperspace_client.state import LEASE_FIELDS, SessionRecord, State
 from hyperspace_client.sync import Context, _matching_prefix
 from hyperspace_client.teleport import move_aside
 
@@ -127,7 +127,8 @@ def check_resume(ctx: Context, session: LocalSession) -> dict[str, str] | None:
         record.lease_host = body["lease"].get("host")
         record.state = body["state"]
         record.state_updated = time.time()
-        ctx.state.save_session(record)
+        # This hook does not hold the session lock.
+        ctx.state.save_session(record, LEASE_FIELDS)
     problem = _problem(record, ctx.host)
     if problem is None:
         return None

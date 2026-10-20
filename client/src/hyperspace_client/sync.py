@@ -21,7 +21,13 @@ from typing import Any, cast
 
 from hyperspace_client.adapters import Adapter, LocalFile, LocalSession
 from hyperspace_client.api import Api, ApiError, AppendConflict
-from hyperspace_client.state import Cursor, Segment, SessionRecord, State
+from hyperspace_client.state import (
+    LEASE_FIELDS,
+    Cursor,
+    Segment,
+    SessionRecord,
+    State,
+)
 from hyperspace_protocol import MAX_BODY, SessionMetadata, SessionStateBody
 
 log = logging.getLogger("hyperspace")
@@ -148,10 +154,20 @@ def _last_segment_ok(path: Path, cursor: Cursor) -> bool:
 
 
 class Syncer:
-    def __init__(self, ctx: Context, session: LocalSession, workspace: str) -> None:
+    def __init__(
+        self,
+        ctx: Context,
+        session: LocalSession,
+        workspace: str,
+        empty_rewrites: bool = False,
+    ) -> None:
+        """`empty_rewrites`: fork a `rewrite` generation also when the
+        rewritten file has no new complete record. Without it, the fork
+        waits for such a record (see `sync_log`)."""
         self.ctx = ctx
         self.session = session
         self.workspace = workspace
+        self.empty_rewrites = empty_rewrites
         self.result = SyncResult()
 
     @property
@@ -236,7 +252,13 @@ class Syncer:
             ]
         return cursor
 
-    def _prepare_cursor(self, f: LocalFile, st: os.stat_result) -> Cursor | None:
+    def _prepare_cursor(
+        self, f: LocalFile, st: os.stat_result
+    ) -> tuple[Cursor | None, bool]:
+        """The cursor of `f`, and True if the file was rewritten. For a
+        rewrite, the cursor moves back to the end of the segments that still
+        match, and its generation is the one to fork from. It is not saved:
+        `_fork_rewrite` saves it."""
         state = self.ctx.state
         cursor = state.cursor(f.path, self.ctx.api.cache_identity)
         if cursor is None or (cursor.harness, cursor.session_id, cursor.rel_path) != (
@@ -244,18 +266,24 @@ class Syncer:
             self._sid,
             f.rel_path,
         ):
-            return None
+            return None, False
         if _unchanged(cursor, st):
-            return cursor
+            return cursor, False
         rewritten = (
             (st.st_dev, st.st_ino) != (cursor.dev, cursor.ino)
             or st.st_size < cursor.length
             or not _last_segment_ok(f.path, cursor)
         )
         if not rewritten:
-            return cursor
+            return cursor, False
         end, kept = _matching_prefix(f.path, cursor.segments)
-        log.info("%s changed on disk; fork at %d", f.path, end)
+        cursor.length = end
+        cursor.segments = kept
+        cursor.dev, cursor.ino = st.st_dev, st.st_ino
+        return cursor, True
+
+    def _fork_rewrite(self, f: LocalFile, cursor: Cursor) -> None:
+        log.info("%s changed on disk; fork at %d", f.path, cursor.length)
         gen = self.ctx.api.create_generation(
             self._h,
             self._sid,
@@ -263,31 +291,38 @@ class Syncer:
             f.rel_path,
             "rewrite",
             cursor.generation,
-            end,
+            cursor.length,
         )
         cursor.generation = gen["id"]
-        cursor.length = end
-        cursor.segments = kept
-        cursor.dev, cursor.ino = st.st_dev, st.st_ino
-        state.save_cursor(cursor)
-        return cursor
+        self.ctx.state.save_cursor(cursor)
 
     def sync_log(self, f: LocalFile, metadata: dict[str, Any]) -> dict[str, Any]:
         try:
             st = f.path.stat()
         except FileNotFoundError:
             return metadata
-        cursor = self._prepare_cursor(f, st)
+        cursor, rewritten = self._prepare_cursor(f, st)
         if cursor is not None and _unchanged(cursor, st):
             return metadata
         start = cursor.length if cursor is not None else 0
         pending = _read(f.path, start)
         end = start + self.ctx.adapter.commit_boundary(f.rel_path, pending)
         if end <= start:
+            if rewritten and not self.empty_rewrites:
+                # A file that Claude Code is writing again (for example, set
+                # aside and started again) can be empty or shorter for a
+                # moment. Its fork would become the active branch, which a
+                # restore then gives. The saved cursor does not change, so
+                # the next sync finds the rewrite again.
+                return metadata
             if cursor is not None:
+                if rewritten:
+                    self._fork_rewrite(f, cursor)
                 _mark_read(cursor, st)
                 self.ctx.state.save_cursor(cursor)
             return metadata
+        if cursor is not None and rewritten:
+            self._fork_rewrite(f, cursor)
         if cursor is None:
             try:
                 gen = self.ctx.api.create_generation(
@@ -497,9 +532,13 @@ class Syncer:
             )
             record.sent_metadata = server_meta
         record.metadata = metadata
+        fields = ("workspace", "transcript", "metadata", "sent_metadata")
         if self.result.session is not None:
             _note_session_state(record, self.result.session, self.ctx.host)
-        state.save_session(record)
+            fields += (*LEASE_FIELDS, "held_lease")
+        # Only the columns that this sync sets: a hook that does not hold the
+        # lock can save a newer lease state during the sync.
+        state.save_session(record, fields)
         return self.result
 
 

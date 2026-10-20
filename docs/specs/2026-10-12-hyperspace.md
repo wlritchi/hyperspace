@@ -93,7 +93,9 @@ They control the design.
   directory (`/cd`, and entry into a worktree), or set it aside
   (`.orphaned-*`, `.superseded-*`). The client must detect a rewrite and must
   not assume that the server copy is a prefix of the local file. Claude Code
-  writes each record as one line, so a reader can see a partial last line.
+  writes each record as one line, so a reader can see a partial last line. An
+  interrupted write can also leave NUL bytes before a record on the same line;
+  readers ignore leading NULs when they parse a line.
 - **Records contain absolute paths**: `cwd` on every message, tool inputs such
   as `file_path`, tool-result spill paths, and `worktreeSession` paths. Claude
   Code does not change these on resume.
@@ -109,7 +111,16 @@ They control the design.
 - **Live sessions.** Claude Code writes a file for each running process in
   `~/.claude/sessions/<pid>.json`, with `sessionId`, `pid`, `procStart`,
   `cwd`, and (for background sessions) `jobId`. A client can use it to find
-  out whether a session runs on the host.
+  out whether a session runs on the host. The state of each background job is
+  in `~/.claude/jobs/<job id>/state.json`, with `sessionId` and
+  `resumeSessionId`.
+- **Background jobs.** When Claude Code 2.1.301 sends a session S to the
+  background, it can give the job a new id J. It writes a `continued-in`
+  record with J into S's transcript, and a transcript `J.jsonl` that holds
+  only title records (`ai-title`, `agent-name`). The job then continues to
+  write its conversation into S's transcript. Thus a live process can register
+  under J while it writes S, and `claude --resume J` finds no conversation.
+  Some jobs use the same id as their session; the client must handle both.
 - **Hook output is part of the transcript.** Claude Code writes the output of
   a SessionStart hook into the transcript as an `attachment` record of type
   `hook_success`, and gives it to the model. A synchronous SessionStart hook
@@ -196,8 +207,17 @@ than one session, and a session can leave its first workspace.
 - **Harness.** The agent program, for example `claude-code`.
 - **Session.** The key is `(account, harness, session id)`. The session id is
   the harness's id, and it does not change when the session is teleported.
-  Claude Code makes a new id for `--fork-session`, `/branch` and `/clear`; the
-  adapter records these links (`forkedFrom`, `continued-in`) as metadata.
+  Claude Code makes a new id for `--fork-session`, `/branch` and `/clear`, and
+  for some background jobs; the adapter records these links (`forkedFrom`,
+  `continued-in`) as metadata. A `continued-in` link does not always mean that
+  the old transcript stopped: a background job continues to write it (see
+  "Background jobs").
+- **Stub.** A transcript whose records only name the session (`ai-title`,
+  `agent-name`, `custom-title`). The client does not start the backup of a
+  stub: its backup starts when it gets any other record. A restore or fork of
+  a stub that an older client backed up stops, and names the sessions that can
+  hold its conversation (one with a `continued-in` link to it, or one with its
+  title). `restore --force` restores the stub.
 - **File.** A path relative to the session root, for example
   `transcript.jsonl`, `subagents/agent-a1b2.jsonl`, or `tool-results/x.txt`.
   The adapter selects these names. They do not depend on the local layout. A
@@ -270,7 +290,12 @@ and the list of its segments (offset, length, sha256). If the file is shorter
 than the cursor length, if the inode changed, or if the last segment's bytes
 have a different hash, the client finds the last segment that still matches
 the local file and forks a new generation at the end of that segment. Then it
-uploads the rest of the file to the new generation.
+uploads the rest of the file to the new generation. The fork waits until the
+rest of the file holds a complete record. Claude Code can set a transcript
+aside and start it again, and the new file can be empty for a moment; a fork
+at that time would make the empty file the active branch. The surrender of a
+teleport does not wait, because it needs the server copy to match the local
+file.
 
 ### Metadata
 
@@ -300,8 +325,10 @@ state of agent-initiated teleport (see "Later").
      reads the live-session registry (`~/.claude/sessions/<pid>.json`, which
      has `sessionId`, `pid` and `procStart`) and checks that each process is
      alive and has the same start time on Linux. On other systems, a live pid
-     conservatively blocks the move when its start time cannot be compared. If
-     the session runs, stop.
+     conservatively blocks the move when its start time cannot be compared. A
+     process also runs the session if its job state names the session, or if
+     the session's transcript has a `continued-in` record with the process's
+     session id (see "Background jobs"). If the session runs, stop.
   2. Sync the session. If the server cannot be reached, stop: a surrender must
      not leave bytes that only this host has. This includes an incomplete last
      JSONL record: surrender stops until that record can be backed up.
@@ -1018,7 +1045,8 @@ The Claude Code adapter maps local paths to session file names like this:
 | `plans/<slug>.md` (slug from the transcript)    | `plans/<slug>.md`  | blob |
 
 It skips `.orphaned-*`, `.superseded-*`, and `*.bak` files, and the legacy
-top-level `agent-*.jsonl` files.
+top-level `agent-*.jsonl` files. It discovers stubs (see "Sessions and
+files"), but the client does not back them up until they hold a conversation.
 
 ## Plugin
 

@@ -49,6 +49,17 @@ _SERVER_KEYS = (
 
 _SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}")
 
+# Record types that name a session but hold no conversation. Claude Code
+# writes a transcript with only these records for the id of a background
+# job, while the job writes its conversation into the transcript of the
+# session that it continues. Any other record type, also an unknown one,
+# makes a transcript a real session.
+_NAME_RECORDS = frozenset({"ai-title", "agent-name", "custom-title"})
+# A transcript larger than this is never a stub, and is not read to check.
+STUB_MAX = 64 * 1024
+# A job id names a directory in `<config dir>/jobs/`.
+_JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
 
 def _walk(root: Path) -> list[Path]:
     """The regular files below `root`, sorted. Symbolic links (to files or
@@ -94,18 +105,70 @@ def sanitize_path(path: str) -> str:
     return encoded[:200] + "-" + (suffix or "0")
 
 
+def _parse(line: bytes) -> dict[str, Any] | None:
+    """The record on one transcript line, or None. An interrupted write can
+    leave NUL bytes before a record on the same line, so leading NULs are
+    ignored. (Python's JSON decoder reads leading NULs as UTF-32.)"""
+    try:
+        value = json.loads(line.lstrip(b"\x00"))
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None  # pyright: ignore[reportUnknownVariableType]
+
+
 def _records(data: bytes) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for line in data.splitlines():
         if not line.strip():
             continue
-        try:
-            value = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(value, dict):
-            out.append(value)  # pyright: ignore[reportUnknownArgumentType]
+        record = _parse(line)
+        if record is not None:
+            out.append(record)
     return out
+
+
+def is_stub(data: bytes) -> bool:
+    """True if `data` has records and every line is a record that only names
+    the session (see `_NAME_RECORDS`). A line that is not a record, or a
+    record of another type, makes this False."""
+    found = False
+    for line in data.splitlines():
+        if not line.strip():
+            continue
+        record = _parse(line)
+        if record is None or record.get("type") not in _NAME_RECORDS:
+            return False
+        found = True
+    return found
+
+
+def _alive(record: dict[str, Any]) -> bool:
+    """True if the process of a live-session registry record runs."""
+    pid = record.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if sys.platform != "linux":
+        # The registry's procStart format is platform-specific.
+        # Until it can be compared, a live/reused pid must block a
+        # destructive move rather than be treated as stopped.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    # The process name (field 2) can contain spaces; the fields after
+    # its closing parenthesis are fixed.
+    fields = stat[stat.rfind(")") + 2 :].split()
+    start = fields[19] if len(fields) > 19 else None
+    return record.get("procStart") in (None, start)
 
 
 def is_prompt(record: dict[str, Any]) -> bool:
@@ -313,15 +376,22 @@ class ClaudeCode:
         try:
             with open(session.transcript, "rb") as f:
                 for _, line in zip(range(200), f, strict=False):
-                    try:
-                        record = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(record, dict) and isinstance(record.get("cwd"), str):  # pyright: ignore[reportUnknownMemberType]
-                        return str(record["cwd"])  # pyright: ignore[reportUnknownArgumentType]
+                    record = _parse(line)
+                    if record is not None and isinstance(record.get("cwd"), str):
+                        return str(record["cwd"])
         except OSError:
             return None
         return None
+
+    def is_stub(self, session: LocalSession) -> bool:
+        """True if the transcript only names the session (see `is_stub`).
+        False if the file is large or cannot be read."""
+        try:
+            with open(session.transcript, "rb") as f:
+                data = f.read(STUB_MAX + 1)
+        except OSError:
+            return False
+        return len(data) <= STUB_MAX and is_stub(data)
 
     # --- Teleport support -------------------------------------------------------
 
@@ -343,48 +413,76 @@ class ClaudeCode:
         return index
 
     def is_running(self, session_id: str) -> bool:
-        """True if a live Claude Code process on this host has the session.
+        """True if a live Claude Code process on this host can write the
+        session's transcript.
 
         Claude Code writes `<config dir>/sessions/<pid>.json` for each
         process, with the session id and the process start time (field 22 of
-        /proc/<pid>/stat), so a reused pid does not count."""
+        /proc/<pid>/stat), so a reused pid does not count. A background job
+        can register under its own id and write the transcript of the
+        session that it continues. Thus a process also counts if its job's
+        state names the session, or if the session's transcript records
+        that it continued in the process's session id."""
         sessions = self.config_dir / "sessions"
         if not sessions.is_dir():
             return False
+        continued: set[str] | None = None
         for path in sessions.glob("*.json"):
             try:
                 record: dict[str, Any] = json.loads(path.read_text())
             except (OSError, ValueError):
                 continue
-            if record.get("sessionId") != session_id:
+            if not isinstance(record, dict) or not _alive(record):  # pyright: ignore[reportUnnecessaryIsInstance]
                 continue
-            pid = record.get("pid")
-            if not isinstance(pid, int) or pid <= 0:
-                continue
-            if sys.platform != "linux":
-                # The registry's procStart format is platform-specific.
-                # Until it can be compared, a live/reused pid must block a
-                # destructive move rather than be treated as stopped.
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    continue
-                except OSError:
-                    return True
+            if record.get("sessionId") == session_id:
                 return True
-            try:
-                stat = Path(f"/proc/{pid}/stat").read_text()
-            except FileNotFoundError:
-                continue
-            except OSError:
+            if session_id in self._job_sessions(record.get("jobId")):
                 return True
-            # The process name (field 2) can contain spaces; the fields after
-            # its closing parenthesis are fixed.
-            fields = stat[stat.rfind(")") + 2 :].split()
-            start = fields[19] if len(fields) > 19 else None
-            if record.get("procStart") in (None, start):
+            if continued is None:
+                continued = self._continued_in(session_id)
+            if record.get("sessionId") in continued:
                 return True
         return False
+
+    def _job_sessions(self, job_id: object) -> set[str]:
+        """The session ids in the state of a background job: its own id, and
+        the id of the session that it resumes."""
+        if not isinstance(job_id, str) or not _JOB_ID.fullmatch(job_id):
+            return set()
+        try:
+            state = json.loads(
+                (self.config_dir / "jobs" / job_id / "state.json").read_text()
+            )
+        except (OSError, ValueError):
+            return set()
+        if not isinstance(state, dict):
+            return set()
+        fields: dict[str, Any] = state  # pyright: ignore[reportUnknownVariableType]
+        return {
+            v
+            for k in ("sessionId", "resumeSessionId")
+            if isinstance(v := fields.get(k), str)
+        }
+
+    def _continued_in(self, session_id: str) -> set[str]:
+        """The ids in the `continued-in` records of the session's local
+        transcripts."""
+        found: set[str] = set()
+        for transcript in self.find_transcripts(session_id):
+            try:
+                with open(transcript, "rb") as f:
+                    for line in f:
+                        if b'"continued-in"' not in line:
+                            continue
+                        record = _parse(line)
+                        if record is None or record.get("type") != "continued-in":
+                            continue
+                        target = record.get("continuedInSessionId")
+                        if isinstance(target, str):
+                            found.add(target)
+            except OSError:
+                continue
+        return found
 
     @staticmethod
     def fork_records(data: bytes, old_id: str, new_id: str) -> bytes:
@@ -392,18 +490,14 @@ class ClaudeCode:
         for `--fork-session`: each record gets the new `sessionId`, and each
         record with a `uuid` also gets `forkedFrom` with the old session id
         and that uuid. Other fields do not change. Lines that are not JSON
-        objects are copied as they are."""
+        objects are copied as they are. NUL bytes before a record stay."""
         out: list[bytes] = []
         for line in data.splitlines(keepends=True):
-            try:
-                record = json.loads(line)
-            except ValueError:
+            fields = _parse(line)
+            if fields is None:
                 out.append(line)
                 continue
-            if not isinstance(record, dict):
-                out.append(line)
-                continue
-            fields: dict[str, Any] = record  # pyright: ignore[reportUnknownVariableType]
+            prefix = line[: len(line) - len(line.lstrip(b"\x00"))]
             if "sessionId" in fields:
                 fields["sessionId"] = new_id
             if isinstance(fields.get("uuid"), str):
@@ -421,7 +515,7 @@ class ClaudeCode:
                 encoded = json.dumps(
                     fields, ensure_ascii=True, separators=(",", ":")
                 ).encode()
-            out.append(encoded + newline)
+            out.append(prefix + encoded + newline)
         return b"".join(out)
 
     @staticmethod

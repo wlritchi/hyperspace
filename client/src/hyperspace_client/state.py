@@ -131,6 +131,10 @@ class SessionRecord:
     held_lease: bool = False
 
 
+# The columns that the server's session state sets.
+LEASE_FIELDS = ("lease_state", "lease_host", "state", "state_updated")
+
+
 class State:
     def __init__(self, directory: Path) -> None:
         self.directory = directory
@@ -300,32 +304,41 @@ class State:
             held_lease=bool(row["held_lease"]),
         )
 
-    def save_session(self, record: SessionRecord) -> None:
-        if record == self.session(record.harness, record.session_id):
-            return
+    def save_session(
+        self, record: SessionRecord, fields: tuple[str, ...] | None = None
+    ) -> None:
+        """Save a session's row. With `fields`, set only those columns, and
+        keep the others. A process that does not hold the session's lock must
+        use `fields`, so that it does not write back columns that a sync
+        changed after this process read them."""
+        values: dict[str, object] = {
+            "workspace": record.workspace,
+            "transcript": record.transcript,
+            "lease_state": record.lease_state,
+            "lease_host": record.lease_host,
+            "state": record.state,
+            "state_updated": record.state_updated,
+            "metadata": json.dumps(record.metadata),
+            "sent_metadata": json.dumps(record.sent_metadata),
+            "last_placement": record.last_placement,
+            "held_lease": int(record.held_lease),
+        }
+        if fields is None:
+            if record == self.session(record.harness, record.session_id):
+                return
+            columns = list(values)
+        else:
+            columns = list(fields)
+            unknown = set(columns) - values.keys()
+            if unknown:
+                raise ValueError(f"unknown session columns: {sorted(unknown)}")
+        assign = ", ".join(f"{c} = excluded.{c}" for c in columns)
         with self._db:
             self._db.execute(
-                """
-                INSERT OR REPLACE INTO sessions
-                (harness, session_id, workspace, transcript, lease_state,
-                 lease_host, state, state_updated, metadata, sent_metadata,
-                 last_placement, held_lease)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record.harness,
-                    record.session_id,
-                    record.workspace,
-                    record.transcript,
-                    record.lease_state,
-                    record.lease_host,
-                    record.state,
-                    record.state_updated,
-                    json.dumps(record.metadata),
-                    json.dumps(record.sent_metadata),
-                    record.last_placement,
-                    int(record.held_lease),
-                ),
+                f"INSERT INTO sessions (harness, session_id, {', '.join(columns)}) "
+                f"VALUES ({', '.join('?' * (len(columns) + 2))}) "
+                f"ON CONFLICT (harness, session_id) DO UPDATE SET {assign}",
+                (record.harness, record.session_id, *(values[c] for c in columns)),
             )
 
     def known_sessions(self) -> list[SessionRecord]:

@@ -102,6 +102,14 @@ def _sync_one(
     if _excluded(cfg, workspace):
         log.info("%s: workspace %s is excluded", session.session_id, workspace)
         return
+    if ctx.state.cursor(
+        session.transcript, ctx.api.cache_identity
+    ) is None and ctx.adapter.is_stub(session):
+        # For example, the id of a background job, whose conversation is in
+        # the transcript of the session that it continues. The backup
+        # starts when the transcript gets a conversation record.
+        log.info("%s: no conversation; not backed up", session.session_id)
+        return
     result = Syncer(ctx, session, workspace).run()
     if isinstance(ctx.adapter, ClaudeCode):
         after_sync(ctx, ctx.adapter, session)
@@ -133,7 +141,8 @@ def cmd_sync(args: argparse.Namespace, cfg: Config) -> int:
         record = state.session(session.harness, session.session_id)
         record.workspace = workspace
         record.transcript = str(session.transcript)
-        state.save_session(record)
+        # Before the lock: another process can be syncing this session.
+        state.save_session(record, ("workspace", "transcript"))
 
         def run() -> None:
             _sync_one(cfg, ctx, session, workspace)
@@ -532,7 +541,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--steal", action="store_true", help="take a lease that a gone host holds"
     )
-    p.add_argument("--force", action="store_true", help="move other local copies aside")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="move other local copies aside; restore a session with no conversation",
+    )
     p.add_argument("--no-tool-results", action="store_true")
     p.set_defaults(func=cmd_restore)
 

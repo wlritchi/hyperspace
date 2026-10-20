@@ -69,3 +69,8 @@ class Adapter(Protocol):
     def first_cwd(self, session: LocalSession) -> str | None:
         """The working directory of the session's first record, if known."""
         ...
+
+    def is_stub(self, session: LocalSession) -> bool:
+        """True if the transcript holds no conversation, only records that
+        name it. The client does not start the backup of such a session."""
+        ...
