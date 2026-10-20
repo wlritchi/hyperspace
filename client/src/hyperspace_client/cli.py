@@ -502,9 +502,38 @@ def cmd_show(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
-def _target(session: str | None) -> str:
-    """The session to act on: the argument, else the current session."""
-    sid = session or os.environ.get(SESSION_ENV)
+def _current(state: State | None = None) -> str | None:
+    """The session whose transcript the Claude Code process of this command
+    writes. `CLAUDE_CODE_SESSION_ID` can hold the own id of a background job
+    (see `ClaudeCode.resolve`). `state` gives the sessions that continued in
+    an id."""
+    sid = os.environ.get(SESSION_ENV)
+    if not sid:
+        return None
+    try:
+        validate_session_id(sid)
+    except ValidationError as exc:
+        raise Exit(2, f"{SESSION_ENV}: {exc}") from None
+    continued = state.continued_from(ClaudeCode.harness) if state else None
+    return ClaudeCode().resolve(sid, continued)
+
+
+def _current_for(cfg: Config) -> str | None:
+    """The current session. Opens the client state to find the sessions that
+    continued in the id."""
+    if not os.environ.get(SESSION_ENV):
+        return None
+    state = State(cfg.state_dir)
+    try:
+        return _current(state)
+    finally:
+        state.close()
+
+
+def _target(session: str | None, current: str | None = None) -> str:
+    """The session to act on: the argument, else the current session
+    (`current`, or else from the environment)."""
+    sid = session or current or _current()
     if not sid:
         raise Exit(2, f"give a session id; {SESSION_ENV} is not set")
     try:
@@ -513,12 +542,14 @@ def _target(session: str | None) -> str:
         raise Exit(2, str(exc)) from None
 
 
-def _targets(sessions: list[str], by_user: bool) -> list[str]:
+def _targets(
+    sessions: list[str], by_user: bool, current: str | None = None
+) -> list[str]:
     """The sessions for a status command: the arguments, else the current
     session. In a backfill turn, only the current session, not as the user."""
-    sids = [_target(s) for s in sessions] or [_target(None)]
+    sids = [_target(s) for s in sessions] or [_target(None, current)]
     if os.environ.get(backfill.SELF_ONLY_ENV) == "1" and (
-        by_user or sids != [os.environ.get(SESSION_ENV)]
+        by_user or sids != [current or _current()]
     ):
         raise Exit(
             2,
@@ -536,10 +567,12 @@ def _request(
     wake: str | None,
     note: str | None,
     by_user: bool,
+    current: str | None = None,
 ) -> dict[str, Any]:
     """An explicit status write from the CLI. The source is the agent when
-    the command runs in a Claude Code session, unless `by_user` is set."""
-    current = os.environ.get(SESSION_ENV)
+    the command runs in a Claude Code session, unless `by_user` is set.
+    `current` is the current session, else it comes from the environment."""
+    current = current or _current()
     if status == "ready" and reason is None:
         reason = "idle"
     body: dict[str, Any] = {
@@ -573,7 +606,7 @@ def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent |
     or None if the write was dropped or queued."""
     harness = ClaudeCode.harness
     state = ctx.state
-    if sid != os.environ.get(SESSION_ENV):
+    if sid != _current(state):
         base = seq(ctx.api.state(harness, sid).get("status"))
         # A session with a copy on this host keeps its saved status current,
         # so that its hooks base their writes on this event. A later sync
@@ -644,7 +677,8 @@ def _write_all(
 
 
 def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
-    (sid,) = _targets([args.session] if args.session else [], args.by_user)
+    current = _current_for(cfg)
+    (sid,) = _targets([args.session] if args.session else [], args.by_user, current)
     if args.status is None:
         url, token = cfg.require_server()
         with Api(url, token) as api:
@@ -669,25 +703,40 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
         wake=args.wake,
         note=args.note,
         by_user=args.by_user,
+        current=current,
     )
     return _write_all(cfg, [sid], request, args)
 
 
 def cmd_done(args: argparse.Namespace, cfg: Config) -> int:
-    sids = _targets(args.sessions, args.by_user)
+    current = _current_for(cfg)
+    sids = _targets(args.sessions, args.by_user, current)
     code = 0
     for sid in sids:
         request = _request(
-            "done", sid, reason=None, wake=None, note=args.note, by_user=args.by_user
+            "done",
+            sid,
+            reason=None,
+            wake=None,
+            note=args.note,
+            by_user=args.by_user,
+            current=current,
         )
         code = max(code, _write_all(cfg, [sid], request, args))
     return code
 
 
 def cmd_reopen(args: argparse.Namespace, cfg: Config) -> int:
-    (sid,) = _targets([args.session], args.by_user)
+    current = _current_for(cfg)
+    (sid,) = _targets([args.session], args.by_user, current)
     request = _request(
-        "ready", sid, reason="idle", wake=None, note=args.note, by_user=args.by_user
+        "ready",
+        sid,
+        reason="idle",
+        wake=None,
+        note=args.note,
+        by_user=args.by_user,
+        current=current,
     )
     return _write_all(cfg, [sid], request, args)
 
@@ -723,7 +772,7 @@ def tail(api: Api, sid: str, turns: int) -> str:
 
 
 def cmd_tail(args: argparse.Namespace, cfg: Config) -> int:
-    sid = _target(args.session)
+    sid = _target(args.session) if args.session else _target(None, _current_for(cfg))
     url, token = cfg.require_server()
     with Api(url, token) as api:
         print(printable(tail(api, sid, args.n)))

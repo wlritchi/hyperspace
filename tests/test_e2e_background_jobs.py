@@ -29,8 +29,19 @@ from hyperspace_client.adapters.claude_code import (
     is_stub,
 )
 from hyperspace_client.backfill import RunResult
-from hyperspace_client.cli import _hook_heartbeat, _sweep
+from hyperspace_client.cli import (
+    SESSION_ENV,
+    Exit,
+    _current,
+    _hook_heartbeat,
+    _request,
+    _sweep,
+    _target,
+    _targets,
+    set_status,
+)
 from hyperspace_client.config import Config
+from hyperspace_client.hooks import handle
 from hyperspace_client.launcher import Launcher
 from hyperspace_client.state import LEASE_FIELDS, SessionRecord, State
 from hyperspace_client.sync import REWRITE_SETTLE, Context, Syncer
@@ -528,6 +539,52 @@ def test_a_job_closes_on_the_status_of_the_session_that_it_writes(
     assert rm.calls == [["claude", "rm", short] for short in ("aa", "bb", "cc")]
 
 
+def hook_env(
+    monkeypatch: pytest.MonkeyPatch, fake: FakeClaude, directory: Path
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake.root))
+    monkeypatch.setenv("CLAUDE_JOB_DIR", str(directory))
+
+
+def test_the_hooks_of_a_job_under_its_own_id_act_on_its_session(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s, j = background_job(fake)
+    sync(ctx, s)
+    event = add_status(ctx, s.stem, "working", kind="hook")
+    ctx.state.save_status(H, s.stem, event, None)
+    directory = job_dir(
+        fake,
+        "aa",
+        sessionId=j.stem,
+        resumeSessionId=s.stem,
+        inFlight={"tasks": 2},
+    )
+    hook_env(monkeypatch, fake, directory)
+    cfg = Config(host="laptop", state_dir=tmp_path / "state")
+    # The hooks name the job's own id.
+    payload = {"transcript_path": str(j), "cwd": WS}
+    started: list[list[str]] = []
+    # The in-flight tasks of the job are for S.
+    handle({**payload, "hook_event_name": "Stop"}, cfg, start=started.append)
+    assert started[0][:5] == ["--quiet", "sync", "--checkpoint", "--transcript", str(s)]
+    queued = ctx.state.wanted_status(H, s.stem)
+    assert queued is not None
+    assert (queued[0]["status"], queued[0]["wake"]) == ("waiting", "local")
+    assert ctx.state.wanted_status(H, j.stem) is None
+    # At the end of the job, the close depends on the status of S.
+    ctx.state.drop_wanted_status(H, s.stem)
+    event = add_status(ctx, s.stem, "done")
+    ctx.state.save_status(H, s.stem, event, None)
+    started.clear()
+    handle({**payload, "hook_event_name": "SessionEnd"}, cfg, start=started.append)
+    assert ["--quiet", "launcher", "--close-job", "aa"] in started
+
+
 @needs_proc
 def test_backfill_skips_stubs_and_the_sessions_of_live_jobs(
     server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
@@ -557,3 +614,47 @@ def test_backfill_skips_stubs_and_the_sessions_of_live_jobs(
     selection = backfill.select(ctx, fake.adapter, 3600, time.time())
     assert {c.session.session_id for c in selection.candidates} == {s.stem, idle.stem}
     assert selection.skipped == {"no conversation": 1}
+
+
+def test_the_cli_acts_on_the_session_that_a_job_writes(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s, j = background_job(fake)
+    sync(ctx, s)
+    directory = job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
+    hook_env(monkeypatch, fake, directory)
+    monkeypatch.setenv(SESSION_ENV, j.stem)
+    assert _target(None) == s.stem
+    assert _current(ctx.state) == s.stem
+    # With no job state, the continued-in record of S gives S.
+    monkeypatch.delenv("CLAUDE_JOB_DIR")
+    assert _current() == j.stem
+    assert _current(ctx.state) == s.stem
+    monkeypatch.setenv("CLAUDE_JOB_DIR", str(directory))
+    # A write for the current session is the agent's declaration for S.
+    request = _request("done", s.stem, reason=None, wake=None, note="x", by_user=False)
+    assert request["source_kind"] == "agent" and "source_session" not in request
+    assert set_status(ctx, s.stem, request) is not None
+    assert ctx.state.session(H, s.stem).declared == request
+    # A backfill turn accepts exactly the resolved session.
+    monkeypatch.setenv(backfill.SELF_ONLY_ENV, "1")
+    assert _targets([], by_user=False) == [s.stem]
+    assert _targets([s.stem], by_user=False) == [s.stem]
+    with pytest.raises(Exit):
+        _targets([j.stem], by_user=False)
+
+
+def test_a_notice_for_a_session_flags_the_id_that_it_continued_in(
+    server: Server, fake: FakeClaude, ctx: Context
+) -> None:
+    s, j = background_job(fake)
+    sync(ctx, s)
+    ctx.state.add_notice(H, s.stem, "status", "[hyperspace] marked done")
+    assert ctx.state.notice_flag(s.stem).exists()
+    assert ctx.state.notice_flag(j.stem).exists()
+    assert ctx.state.take_notices(H, s.stem) == ["[hyperspace] marked done"]
+    assert not ctx.state.notice_flag(s.stem).exists()
+    assert not ctx.state.notice_flag(j.stem).exists()

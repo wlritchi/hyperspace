@@ -160,6 +160,40 @@ def test_notice_sh_without_session_id(fake: dict[str, str], tmp_path: Path) -> N
     assert [c["argv"] for c in calls(env)] == [["hook", "--notices"]]
 
 
+@pytest.mark.parametrize(
+    ("state", "runs"),
+    [
+        ('{\n  "sessionId": "j1",\n  "resumeSessionId": "s1"\n}\n', True),
+        ('{"resumeSessionId":"s1","sessionId":"j1"}', True),
+        ('{"sessionId": "j1", "resumeSessionId": "j1"}', False),
+        ('{"sessionId": "j1", "resumeSessionId": null, "x": "s1"}', False),
+        ('{"sessionId": "j1", "resumeSessionId": "../s1"}', False),
+        ('{"sessionId": "j1"}', False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_notice_sh_in_a_job_under_its_own_id(
+    fake: dict[str, str], tmp_path: Path, state: str | None, runs: bool
+) -> None:
+    # The job has its own id j1 and writes the transcript of s1.
+    job = tmp_path / "jobs" / "aa"
+    job.mkdir(parents=True)
+    if state is not None:
+        (job / "state.json").write_text(state)
+    env = notice_env(
+        fake, tmp_path, CLAUDE_CODE_SESSION_ID="j1", CLAUDE_JOB_DIR=str(job)
+    )
+    flags = tmp_path / "state" / "hyperspace" / "notify"
+    flags.mkdir(parents=True)
+    # A path outside the flag directory must not count.
+    (flags.parent / "s1").touch()
+    (flags / "s1").touch()
+    done = notice(env)
+    assert (done.returncode, done.stderr) == (0, "")
+    assert len(calls(env)) == (1 if runs else 0)
+
+
 def test_notice_sh_hides_an_old_cli(tmp_path: Path) -> None:
     # A client without --notices fails; the hook still exits 0 quietly.
     bin_dir = tmp_path / "bin"
