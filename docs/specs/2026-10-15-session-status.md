@@ -241,22 +241,45 @@ makes a job, and stops the Monitors of the session. The job can have its own
 id J, and continue to write the transcript of S (main spec, "Background
 jobs"). Then the job's state has `sessionId` J and can have `resumeSessionId`
 S, and S's transcript has a `continued-in` record with J. Some jobs have the
-same id as their session. The rules for background jobs then apply to S, the
-session whose transcript the job writes: the adapter keys a job on S, and the
-hooks, the status and the `inFlight` hint of the job are for S. A job that has
-a transcript with a conversation under its own id writes that transcript, and
-is its own session. Else the candidates for S are `resumeSessionId` and the
-sessions whose synced metadata says that they continued in J. One candidate is
-S. With more than one candidate, or with none, the session of the job is not
-known, and the client acts on no session that it would have to guess. The
-synced metadata keeps only the last `continued-in` link of a session, so a
-missing link does not show that the job writes J.
+same id as their session. It is not confirmed which ids Claude Code puts in
+the live-session registry, in the hook payloads, and in
+`CLAUDE_CODE_SESSION_ID` of such a job. Thus the client does not guess. The
+candidates for the session of a job are:
 
-Only the job that runs a process changes the id of that process to S: its
-`CLAUDE_JOB_DIR` names the job, the job's state names the id, and a live
-`sessions/<pid>.json` of the process or of a parent process has that `jobId`.
-A foreground `claude --resume J` writes J's transcript, so it stays J. A stale
+- J, if J has a local transcript with a conversation;
+- `resumeSessionId`, if the job's state has it and it is not J;
+- each session whose synced metadata says that it continued in J.
+
+With exactly one candidate, that is the session of the job: the hooks, the
+status and the `inFlight` hint of the job are for it. With no candidate or
+more than one, the session of the job is not known, and the client acts on no
+session that it would have to guess. A `resumeSessionId` that is not a session
+id gives no candidates. The synced metadata keeps only the last `continued-in`
+link of a session, so a missing link does not show that the job writes J. A
+new job whose transcript has no conversation yet has no candidate, so its
+hooks write no status until the first prompt is in the transcript.
+
+Only the job that runs a process changes the id of that process: its
+`CLAUDE_JOB_DIR` names the job, the job's state names the id, and a
+`sessions/<pid>.json` of the process or of a parent process has that `jobId`
+and a `procStart` that is the start time of that process. A record with no
+`procStart`, or a start time that the client cannot read (on Linux, field 22
+of `/proc/<pid>/stat`; on other platforms, never), does not count. Thus a
+stale record whose pid is now this process does not confirm a job. A
+foreground `claude --resume J` writes J's transcript, so it stays J. A stale
 `CLAUDE_JOB_DIR` changes nothing. The CLI and the hooks use this one rule.
+
+In a job whose session is not known, the hooks:
+
+- queue no status write;
+- show no status notice: SessionStart shows no `done` notice, and
+  UserPromptSubmit and the PostToolUse notice hook show only the lease
+  notices. The status notices stay pending;
+- start no close of the job at SessionEnd.
+
+The checkpoint sync, the lease notices, and the restore and resume checks at
+SessionStart and UserPromptSubmit stay on the session of the payload's
+transcript, as for a session that is not a job.
 
 ### Liveness
 
@@ -355,31 +378,50 @@ the end of a turn, because the user can be attached.
 Two triggers do step 4:
 
 - The SessionEnd hook of a background job (`CLAUDE_JOB_DIR` is set) whose
-  status is `done` starts a detached process that waits for the job's process
-  to stop, syncs, and runs `claude rm`. The status is that of the session
-  whose transcript the job writes, also when the job has its own id.
+  session is beyond doubt (see below) and `done` starts a detached process
+  that waits for the job's process to stop, syncs, and runs `claude rm`.
 - A sweep in the launcher finds jobs that are not live and whose session is
   `done`. This catches a session that was marked `done` from a different host
   after its job stopped, and a SessionEnd hook that did not run. The sweep
   asks the server for the status of a stopped job when it first sees the job,
   when the job's state file changes, and every 15 minutes.
 
-Both triggers ask the server for the status just before they run `claude rm`,
-and act only on `done`. When `claude rm` refuses, the launcher records the
-reason and sends it in each heartbeat, until the job goes away or its state
-file changes.
+Both triggers ask the server for the status, and read the job's state and the
+synced metadata again, just before they run `claude rm`. They act only on
+`done`. When `claude rm` refuses, the launcher records the reason and sends it
+in each heartbeat, until the job goes away or its state file changes.
 
-A job whose session is not known (see "Transitions") is never closed
-automatically. The sweep records it while it does not run, on the job's own id
-and on each candidate session, with the reason
-`job <short> can write more than one session` or
-`the session of job <short> is not known`. When a job has its own id J and
-writes S, it also stays while J runs or has a status that is not `done`. An
-older client, or a user, can have written the status of the job's work under
-J, so that status can be the true one. The reason is
-`job <short> has its own id <J>, which is not done`. The sweep checks these
-jobs again at each check, also if the state file does not change. The user
-closes such a job with `claude rm`, or marks J `done`.
+Only a job whose session is beyond doubt closes automatically. That is a job
+with its own id J (`sessionId` in its state) for which all of these are true:
+
+- J has a local transcript with a conversation;
+- the job's state has no `resumeSessionId`, or its `resumeSessionId` is J;
+- the synced metadata of no other session says that it continued in J.
+
+Then J is the one candidate (see "Transitions"), and the triggers decide on
+the status of J. Every other job is never closed automatically: a job under
+its own id that writes another session, a job whose session is not known, and
+a job whose own id has a conversation while another session is also a
+candidate (for example after a foreground `claude --resume J`). While such a
+job does not run, the sweep records it on J and on each candidate, with one of
+these reasons:
+
+- `job <short> writes another session; close it yourself` (one candidate,
+  which is not J);
+- `job <short> can write more than one session; close it yourself`;
+- `the session of job <short> is not known; close it yourself` (no candidate).
+
+The sweep checks these jobs again at each check, also if the state file does
+not change. When a job can close but its backup fails, or the server does not
+have its session, that reason replaces the earlier reason of the job, also on
+the earlier candidates. The user closes such a job with `claude rm`.
+
+This is a limit of the current client: a `done` job that writes another
+session must be closed by hand, also when its session is clear from the job's
+state, for example a session that the user sent to the background, or a job
+that `claude --bg --resume <sid>` started under a new id. When live checks
+confirm which ids Claude Code gives such a job (see "Resolved questions"), the
+client can close it automatically.
 
 ## Launcher
 
@@ -531,11 +573,13 @@ The CLI gives the overview stories their commands:
   `hyperspace reopen <sid>` (U4, O3). With no `STATUS`, it shows the status.
   With no session id, the command applies to the current session, from
   `CLAUDE_CODE_SESSION_ID` (A1, A2). In a background job, this variable can
-  hold the job's own id J. The client then uses the session whose transcript
-  the job writes (see "Transitions"). If the job can write more than one
-  session, a command with no session id stops with an error. The source is
-  `agent` when the command runs in a Claude Code session, and `user` otherwise
-  or with `--by-user`.
+  hold the job's own id J. The client then uses the session of the job (see
+  "Transitions"). If the session of the job is not known, a command with no
+  session id stops with the error
+  `give a session id; the session of this background job is not known`. A
+  command with an explicit session id still works. The source is `agent` when
+  the command runs in a Claude Code session, and `user` otherwise or with
+  `--by-user`.
 
 The plugin adds:
 
@@ -635,15 +679,20 @@ A heartbeat applies only to the credential's own host.
 ## Resolved questions
 
 - `CLAUDE_CODE_SESSION_ID` is set in the shell tool's environment of every
-  Claude Code session, foreground and background. In a background job under
-  its own id, it is not known whether it holds the job's id or the id of the
-  session that the job writes; the client handles both.
+  Claude Code session, foreground and background.
+- Open: in a background job under its own id J that writes a session S, it is
+  not known whether `CLAUDE_CODE_SESSION_ID`, the hook payloads and the
+  live-session registry hold J or S. The client acts on S only when S is the
+  one candidate (see "Transitions"). It never closes such a job automatically
+  (see "Closing a done session"), so until live checks confirm the ids, the
+  user closes a `done` job that writes another session by hand.
 - A launcher resumes a session as a background job with
   `claude --bg --resume <sid>`, in the session's workspace. Claude Code then
   continues the session under the same id. If the session already runs, Claude
   Code starts a copy under a new id, so the launcher first checks that the
   session does not run on the host, also in a job under the job's own id.
-  Hyperspace never writes Claude Code's job state.
+  Hyperspace never writes Claude Code's job state. If the job gets its own id,
+  it closes only by hand (see "Closing a done session").
 - Tests will show whether the SessionEnd hook runs when the Claude Code daemon
   stops an idle job. The sweep makes the design correct without it.
 - The heartbeat interval is 60 seconds, so a heartbeat expires after 3

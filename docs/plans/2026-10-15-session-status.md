@@ -432,7 +432,8 @@ below). `State.add_notice` therefore also creates the flag of the id in S's
 `links.continued_in`, and when J has no flag, the script reads
 `resumeSessionId` from `$CLAUDE_JOB_DIR/state.json` with shell builtins, only
 in a job and only if some flag exists. Outside a job, a missing flag ends the
-script with no directory listing.
+script with no directory listing. For the cases that the script misses, see
+"Limit of `notice.sh`" under "Jobs under their own id".
 
 ### CLI
 
@@ -545,9 +546,10 @@ assumptions 1 to 3 are in `status.transition`:
   session has a flag, and the CLI reads the session from the hook's JSON.
 - Facts 8 to 10: the client handles both answers (see "Jobs under their own
   id" below).
-- Fact 11: if it is false, `ClaudeCode.current_job` finds no job. Then the CLI
-  and the hooks of a job under its own id act on J, and no job closes on the
-  wrong session.
+- Fact 11: if it is false, or if the record has no `procStart`,
+  `ClaudeCode.current_job` finds no job. Then the CLI and the hooks of a job
+  under its own id act on J. No job closes on the wrong session, because only
+  a job whose session is J closes.
 
 These eleven checks are open. The user does them, because they need live
 Claude Code sessions.
@@ -1141,16 +1143,16 @@ Claude Code 2.1.301 can give a job its own id J when the user sends a session
 S to the background, while the job writes S's transcript (main spec,
 "Background jobs"). The job's state has `sessionId` J and can have
 `resumeSessionId` S; S's transcript has a `continued-in` record with J. Facts
-8 to 10 are open, so the client handles each answer. A job that has a
-transcript with a conversation under its own id is its own session.
+8 to 10 are open, so the client does not guess which id a job writes.
 
-`ClaudeCode.writes` gives a `Writer`: the session, or None when the session is
-not known. The candidates are `resumeSessionId` and the sessions that
-continued in J. One candidate is the session. With more than one, the writer
-is ambiguous. With none, and no conversation under J, the session is not
-known: the metadata keeps only the last `continued-in` link of each session,
-so a stale or missing link cannot show that the job writes J. The client then
-acts on nothing that it would have to guess.
+`ClaudeCode.writes` gives the candidates: J if it has a local transcript with
+a conversation, `resumeSessionId` if it is not J, and the sessions that
+continued in J (from `State.continued_from`). A `resumeSessionId` that is not
+a session id gives no candidates. With exactly one candidate, that is the
+session of the job. With none or more than one, the session is not known: the
+metadata keeps only the last `continued-in` link of each session, so a stale
+or missing link cannot show which session the job writes. The client then acts
+on nothing that it would have to guess.
 
 - **Liveness**: `ClaudeCode.live_processes` gives each live process the ids
   that `is_running` accepts: the registry id, the ids in its job's state, and
@@ -1163,53 +1165,106 @@ acts on nothing that it would have to guess.
   process. Tests: `test_a_job_under_its_own_id_makes_its_session_live`,
   `test_a_job_makes_the_session_in_its_state_live`,
   `test_the_runner_does_not_resume_a_session_that_a_job_writes`.
-- **Close**: `Job.session_id` is the session that the job writes, or None.
-  `Job.own_id` is J, and `Job.candidates` holds the candidates. The sweep,
-  `close_job`, the SessionEnd trigger and `close_after_exit` decide on that
-  session's status. A job with no known session is never closed. While it is
-  not live, the sweep records it in the `unclosed` list on J and on each
-  candidate, with the reason `job <short> can write more than one session` or
-  `the session of job <short> is not known`. When J differs from the session,
-  `close_job` also keeps the job while J runs, or has a status on the server
-  or in the queue that is not `done`: an older client, or a user, can have
-  written the status of the job's work under J. It records
-  `job <short> has its own id <J>, which is not done` on the session. These
-  two kinds of entry have `recheck`: the sweep checks the job again, also if
-  its state file does not change. Tests:
-  `test_a_job_closes_on_the_status_of_the_session_that_it_writes`,
+- **Close**: only a job whose session is beyond doubt closes automatically.
+  `Job.candidates` holds the candidates, and `Job.session_id` is J only when
+  the candidates are exactly J: J has a conversation, `resumeSessionId` is
+  absent or J, and no synced metadata of another session has `continued_in` J.
+  Every other job is never removed automatically: a job that writes another
+  session, a job whose session is not known, and a job whose own id has a
+  conversation while another session is also a candidate (a foreground
+  `claude --resume J` while the job wrote S). While such a job is not live,
+  the sweep records it in the `unclosed` list on J and on each candidate, with
+  `job <short> writes another session; close it yourself`,
+  `job <short> can write more than one session; close it yourself`, or
+  `the session of job <short> is not known; close it yourself`. These entries
+  have `recheck`: the sweep checks the job again, also if its state file does
+  not change. `close_job` decides on the status of J only, and reads the job
+  again (`ClaudeCode.job`) after the backup and just before `claude rm`. The
+  SessionEnd trigger and `close_after_exit` read only their own job, and start
+  no close when it has no state. `try_close` records a failed backup, or a
+  session that the server does not have, as the job's current reason; this
+  replaces an earlier entry with candidates that are out of date. The check of
+  a status on J while the job writes S (`_own_id_open`) is gone, because such
+  a job no longer closes. Tests:
+  `test_only_a_job_that_writes_its_own_id_closes`,
+  `test_a_job_whose_own_id_has_a_competing_conversation_is_not_closed`,
+  `test_a_link_to_the_job_during_the_close_keeps_the_job`,
   `test_a_job_that_more_than_one_session_continued_in_is_not_closed`,
   `test_a_job_with_no_mapping_to_its_session_is_not_closed`,
   `test_a_job_with_a_stale_mapping_to_its_session_is_not_closed`,
-  `test_a_job_is_not_closed_while_its_own_id_is_not_done`.
+  `test_a_failed_close_replaces_the_old_reason`, and in
+  `test_unit_client_hooks.py`, `test_session_end_closes_a_done_job`.
+- **Limit**: a `done` job that writes another session must be closed by hand
+  (`claude rm <short>`), also when its state names that session, until the
+  live checks of facts 8 to 10 confirm the id shapes. This includes a session
+  that the user sent to the background, and a runner job that
+  `claude --bg --resume <sid>` started under a new id. `docs/deploy.md` says
+  so.
 - **Backfill**: `select` skips a stub (`no conversation`), and each id that a
   live process covers. Test:
   `test_backfill_skips_stubs_and_the_sessions_of_live_jobs`.
 - **Current session**: `ClaudeCode.resolve` maps the id in
-  `CLAUDE_CODE_SESSION_ID`, or the session of a hook, to the session that the
-  job writes (`writes`, with `resumeSessionId` and `State.continued_from`). It
-  does this only in the job that runs the process (`current_job`):
-  `CLAUDE_JOB_DIR` names the job, the job's state names the id, and a live
-  registry record of the process or of a parent process has that `jobId`. Else
-  the id does not change, so a foreground `claude --resume J` of the stub is
-  the session J, and a stale `CLAUDE_JOB_DIR` changes nothing. If the job can
-  write more than one session, `resolve` gives None: the CLI then has no
-  current session (a command with no session id stops, and an explicit session
-  is not the current one), and the hooks write no status. The CLI and the
-  hooks use this one rule. `status`, `done`, `reopen` and `tail` with no
-  session id, `set_status`, and the backfill turn's self-only check use it. In
-  a job, the hooks use it too, so the sync, the status and the `inFlight` hint
-  are for S also if the payload names J. For `notice.sh`, see "Notices during
-  a turn". Tests: `test_the_cli_acts_on_the_session_that_a_job_writes`,
+  `CLAUDE_CODE_SESSION_ID`, or the session of a hook, to the one candidate
+  from `writes`. It does this only in the job that runs the process
+  (`current_job`): `CLAUDE_JOB_DIR` names the job, the job's state names the
+  id, and a registry record of the process or of a parent process has that
+  `jobId` and a `procStart` that matches the start time of that process
+  (`_alive(record, proven=True)`). A record with no `procStart`, a null one,
+  or a `/proc` stat that cannot be read does not count, and on other platforms
+  than Linux no record counts. Else the id does not change, so a foreground
+  `claude --resume J` of the stub is the session J, and a stale
+  `CLAUDE_JOB_DIR` or a stale record whose pid is reused changes nothing. If
+  the job has no candidate or more than one, `resolve` gives None: the CLI
+  then has no current session (a command with no session id stops with
+  `give a session id; the session of this background job is not known`, and an
+  explicit session works and is not the current one), and the hooks write no
+  status. A new job whose transcript has no conversation yet thus writes no
+  status at its first prompt. The CLI and the hooks use this one rule.
+  `status`, `done`, `reopen` and `tail` with no session id, `set_status`, and
+  the backfill turn's self-only check use it. In a job, the hooks use it too,
+  so the sync, the status and the `inFlight` hint are for S also if the
+  payload names J. Tests:
+  `test_the_cli_acts_on_the_session_that_a_job_writes`,
   `test_the_hooks_of_a_job_under_its_own_id_act_on_its_session`,
   `test_a_foreground_resume_of_a_stub_is_its_own_session`,
   `test_a_stale_job_dir_does_not_change_the_session`,
+  `test_a_registry_record_with_no_matching_start_time_does_not_change_the_session`,
   `test_a_job_that_can_write_more_than_one_session_acts_on_none`,
+  `test_a_job_whose_session_is_not_known_acts_on_none`,
   `test_a_notice_for_a_session_flags_the_id_that_it_continued_in`,
-  `test_notice_sh_in_a_job_under_its_own_id`.
+  `test_notice_sh_in_a_job_under_its_own_id`. The test helper `register()`
+  writes `procStart`.
+- **Hooks in a job whose session is not known** (`_resolve` gives None):
+  - no status write for any event in `STATUS_EVENTS`;
+  - SessionStart: no `done` notice (`session_start_notice` with
+    `status_notices=False`). The restore-pending block, the arrival and move
+    notices, the `resumed` mark and the lease notices stay, for the payload's
+    session;
+  - UserPromptSubmit: the restore-pending block and `check_resume` stay, for
+    the payload's session. `take_notices` keeps the status notices pending and
+    gives only the lease notices;
+  - `hook --notices` (PostToolUse): only the lease notices of the payload's
+    session. The status notices stay pending, so their flag stays, and
+    `notice.sh` runs the CLI after each tool call until a hook whose session
+    is known takes them;
+  - SessionEnd: no close (the job's `session_id` is None);
+  - the checkpoint sync is for the payload's transcript.
+
+  Test: `test_a_job_whose_session_is_not_known_takes_no_status_notices`.
+
+- **Limit of `notice.sh`**: in a job under its own id J, the script finds a
+  notice for S only by the flag of J or by the flag of the `resumeSessionId`
+  in the job's state. `State.add_notice` sets the flag of J only from S's last
+  synced `continued_in` link, at the time of the notice. Thus if S's link
+  names a later job, or the link is synced after the notice, and the job's
+  state does not name S, the notice does not show during the turn. The next
+  prompt shows it, if the hooks know that the job's session is S. This stays
+  as it is: a fix needs a directory listing or a Python process at each tool
+  call.
 - **Liveness is a superset**: `live_processes` gives a process every
-  candidate, also when the writer is ambiguous. Thus an ambiguous job makes
-  each candidate live: the runner does not resume it and the backfill skips
-  it. These are the safe answers.
+  candidate, also when the session is not known, and `_alive` accepts a record
+  with no `procStart`. Thus such a job makes each candidate live: the runner
+  does not resume it and the backfill skips it. These are the safe answers.
 
 ## Step 6: outside this repo
 
