@@ -5,8 +5,44 @@
 # other process: the CLI runs only when the client left a flag file for the
 # session in its state directory.
 dir="${XDG_STATE_HOME:-$HOME/.local/state}/hyperspace/notify"
+
+# The session id in the `resumeSessionId` field of the background job's
+# state, in $resumed, with only shell builtins. A job can have its own id in
+# CLAUDE_CODE_SESSION_ID and write the transcript of the session that it
+# continues, whose flag the client sets.
+job_session() {
+    resumed=""
+    file="${CLAUDE_JOB_DIR:-}/state.json"
+    [ -n "${CLAUDE_JOB_DIR:-}" ] && [ -r "$file" ] || return 1
+    text=""
+    while IFS= read -r line || [ -n "$line" ]; do
+        text="$text$line"
+    done 2>/dev/null <"$file"
+    case "$text" in
+        *'"resumeSessionId"'*) ;;
+        *) return 1 ;;
+    esac
+    rest="${text#*\"resumeSessionId\"}"
+    # Only a colon and white space can come before the value's quote.
+    case "${rest%%\"*}" in
+        *[!:\ \	]*) return 1 ;;
+    esac
+    rest="${rest#*\"}"
+    value="${rest%%\"*}"
+    case "$value" in
+        "" | [!0-9A-Za-z]* | *[!0-9A-Za-z._-]*) return 1 ;;
+    esac
+    resumed="$value"
+}
+
 if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
-    [ -e "$dir/$CLAUDE_CODE_SESSION_ID" ] || exit 0
+    if [ ! -e "$dir/$CLAUDE_CODE_SESSION_ID" ]; then
+        # The state of a job is read only if some session has a flag.
+        set -- "$dir"/*
+        [ -e "$1" ] || exit 0
+        job_session || exit 0
+        [ -e "$dir/$resumed" ] || exit 0
+    fi
 else
     # No session id in the environment: any flag is a reason to ask the CLI,
     # which reads the session from the hook's JSON.

@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from hyperspace_protocol import validate_session_id
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS remote_cursors (
     server TEXT NOT NULL,
@@ -605,6 +607,21 @@ class State:
         plugin's notice hook checks it with no Python process."""
         return self.directory / "notify" / session_id
 
+    def _notice_flags(self, harness: str, session_id: str) -> list[Path]:
+        """The flag of the session, and the flag of the id that the session
+        continued in (`links.continued_in`). A background job can have its
+        own id in its environment and write the transcript of the session
+        that it continues, so the notice hook can look for either flag."""
+        flags = [self.notice_flag(session_id)]
+        links = self.session(harness, session_id).metadata.get("links")
+        target = links.get("continued_in") if isinstance(links, dict) else None
+        if isinstance(target, str) and target != session_id:
+            try:
+                flags.append(self.notice_flag(validate_session_id(target)))
+            except ValueError:
+                pass
+        return flags
+
     def add_notice(
         self,
         harness: str,
@@ -616,9 +633,10 @@ class State:
         """Queue a notice, if no earlier notice of `kind` (delivered or not)
         has the same `key`. With no `key`, the text is the key. Thus a sync
         that sees the same problem again does not repeat its notice."""
-        flag = self.notice_flag(session_id)
-        flag.parent.mkdir(exist_ok=True)
-        flag.touch()
+        flags = self._notice_flags(harness, session_id)
+        flags[0].parent.mkdir(exist_ok=True)
+        for flag in flags:
+            flag.touch()
         with self._db:
             exists = self._db.execute(
                 "SELECT 1 FROM notices WHERE harness = ? AND session_id = ? "
@@ -638,10 +656,11 @@ class State:
     ) -> list[str]:
         """Return the pending notices and mark them as delivered. Notices of
         the kind `keep` stay pending, and their flag file stays."""
-        # Remove the flag first: a notice that arrives during the read keeps
-        # a new flag.
-        flag = self.notice_flag(session_id)
-        flag.unlink(missing_ok=True)
+        # Remove the flags first: a notice that arrives during the read keeps
+        # new flags.
+        flags = self._notice_flags(harness, session_id)
+        for flag in flags:
+            flag.unlink(missing_ok=True)
         with self._db:
             rows = self._db.execute(
                 "SELECT id, kind, text FROM notices WHERE harness = ? "
@@ -654,7 +673,8 @@ class State:
                     "UPDATE notices SET delivered = 1 WHERE id = ?", (r[0],)
                 )
         if len(taken) < len(rows):
-            flag.touch()
+            for flag in flags:
+                flag.touch()
         return [str(r[2]) for r in taken]
 
     def has_notice(self, harness: str, session_id: str, kind: str) -> bool:
@@ -669,9 +689,10 @@ class State:
     def drop_notices(self, harness: str, session_id: str, kind: str) -> None:
         """Mark the pending notices of `kind` as delivered, with no output.
         Keep the flag only if a different notice is pending."""
-        # Remove the flag first, as `take_notices` does.
-        flag = self.notice_flag(session_id)
-        flag.unlink(missing_ok=True)
+        # Remove the flags first, as `take_notices` does.
+        flags = self._notice_flags(harness, session_id)
+        for flag in flags:
+            flag.unlink(missing_ok=True)
         with self._db:
             self._db.execute(
                 "UPDATE notices SET delivered = 1 WHERE harness = ? "
@@ -684,7 +705,8 @@ class State:
                 (harness, session_id),
             ).fetchone()
         if pending is not None:
-            flag.touch()
+            for flag in flags:
+                flag.touch()
 
     # --- Wanted status -------------------------------------------------------------
 
