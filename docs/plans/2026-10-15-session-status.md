@@ -426,16 +426,22 @@ only, and exits at once if it is not there. If it is there, it runs
 `hyperspace hook` with the payload, and the client prints the pending notices
 as `hookSpecificOutput.additionalContext` and removes the flag. Thus a tool
 call costs one `test -e` in the usual case. `State.add_notice` creates the
-flag file.
+flag file. A background job can have its own id J in `CLAUDE_CODE_SESSION_ID`
+and write the transcript of the session S (see "Jobs under their own id"
+below). `State.add_notice` therefore also creates the flag of the id in S's
+`links.continued_in`, and when J has no flag, the script reads
+`resumeSessionId` from `$CLAUDE_JOB_DIR/state.json` with shell builtins, only
+if some flag exists.
 
 ### CLI
 
 - `hyperspace status [STATUS] [--session SID] [--reason R] [--wake W] [--note TEXT] [--by-user] [--json]`.
-  With no `STATUS`, it prints the current status. `--session` defaults to
-  `CLAUDE_CODE_SESSION_ID`. The source kind is `agent` when
-  `CLAUDE_CODE_SESSION_ID` is set and `--by-user` is not given, else `user`.
-  `source_session` is `CLAUDE_CODE_SESSION_ID` when it differs from the
-  target.
+  With no `STATUS`, it prints the current status. `--session` defaults to the
+  current session: `CLAUDE_CODE_SESSION_ID`, resolved to the session whose
+  transcript a background job writes (`ClaudeCode.resolve`). The source kind
+  is `agent` when `CLAUDE_CODE_SESSION_ID` is set and `--by-user` is not
+  given, else `user`. `source_session` is the current session when it differs
+  from the target.
 - `hyperspace done [SID ...] [--note TEXT] [--by-user]`: explicit `done` for
   each session (the current session when none is given).
 - `hyperspace reopen SID [--note TEXT]`: explicit `ready`, reason `idle`.
@@ -504,6 +510,14 @@ recorded in the test module docstring, before the step is done:
    fast path.
 7. Claude Code lists the plugin's `/done` command and both skills. Prettier
    wraps their `description` over several lines, which is valid YAML.
+8. In a background job with its own id J that writes the transcript of S (send
+   a foreground session to the background), the `sessionId` in the job's
+   `sessions/<pid>.json` is J or S.
+9. In such a job, the hook payloads have `session_id` J or S, and
+   `transcript_path` J.jsonl or S.jsonl.
+10. In such a job, `CLAUDE_CODE_SESSION_ID` in the hook and shell tool
+    environments is J or S, and `CLAUDE_JOB_DIR` is set in the shell tool
+    environment.
 
 Live checks use the real `~/.claude`, because the Claude Code credentials are
 there. Follow the memory note on the live test hazard: use a throwaway server,
@@ -525,8 +539,10 @@ assumptions 1 to 3 are in `status.transition`:
   with wake `local`.
 - Fact 6: without `CLAUDE_CODE_SESSION_ID`, `notice.sh` runs the CLI when any
   session has a flag, and the CLI reads the session from the hook's JSON.
+- Facts 8 to 10: the client handles both answers (see "Jobs under their own
+  id" below).
 
-These seven checks are open. The user does them, because they need live Claude
+These ten checks are open. The user does them, because they need live Claude
 Code sessions.
 
 ### Step 2 as built
@@ -625,7 +641,7 @@ The code follows this step, with these changes and additions:
 ### Done when
 
 - [ ] All tests pass, also with `UV_PYTHON=3.12`; ruff and pyright are clean.
-- [ ] The five facts are confirmed, or the spec records what differs.
+- [ ] The ten facts are confirmed, or the spec records what differs.
 - [ ] `hyperspace ls --open` on the workstation lists live sessions with the
       right status after a day of use.
 - [ ] Commit type `feat(client)`, plus `feat(plugin)` changes in the same
@@ -893,6 +909,8 @@ session, stop and record an `UnclosedSession`-style reason in the heartbeat
   starts with the prompt.
 - On a runner with a fresh harness config directory, `restore --held` and then
   `claude --bg --resume` work with no job state.
+- The job that `claude --bg --resume <sid>` makes has `sessionId` and
+  `resumeSessionId` in its state, and which ids they hold.
 
 ### Tests
 
@@ -1109,6 +1127,46 @@ without it.
   `test_temporary_proxy_errors_from_the_transport`,
   `test_launcher_waits_for_the_server_at_start`,
   `test_launcher_start_fails_at_once_for_a_local_error`.
+
+### Jobs under their own id
+
+Claude Code 2.1.301 can give a job its own id J when the user sends a session
+S to the background, while the job writes S's transcript (main spec,
+"Background jobs"). The job's state has `sessionId` J and can have
+`resumeSessionId` S; S's transcript has a `continued-in` record with J. Facts
+8 to 10 are open, so the client handles each answer. A job that has a
+transcript with a conversation under its own id is its own session.
+
+- **Liveness**: `ClaudeCode.live_processes` gives each live process the ids
+  that `is_running` accepts: the registry id, the ids in its job's state, and
+  the sessions that continued in the registry id. `State.continued_from` gives
+  the last from the synced metadata (`links.continued_in`), so no transcript
+  is read. `live_sessions` is their union. The heartbeat, the backfill and
+  `resume_held` use it, so S is live while J writes it. `resume` already
+  checked `is_running`, so the runner did not start a second writer before
+  this fix either. The SessionEnd heartbeat leaves out every id of the ending
+  process. Tests: `test_a_job_under_its_own_id_makes_its_session_live`,
+  `test_a_job_makes_the_session_in_its_state_live`,
+  `test_the_runner_does_not_resume_a_session_that_a_job_writes`.
+- **Close**: `Job.session_id` is the session that the job writes
+  (`ClaudeCode.writes`): `resumeSessionId`, else the one session that
+  continued in J. `Job.own_id` is J. The sweep, `close_job`, the SessionEnd
+  trigger and `close_after_exit` decide on that session's status. Test:
+  `test_a_job_closes_on_the_status_of_the_session_that_it_writes`.
+- **Backfill**: `select` skips a stub (`no conversation`), and each id that a
+  live process covers. Test:
+  `test_backfill_skips_stubs_and_the_sessions_of_live_jobs`.
+- **Current session**: `ClaudeCode.resolve` maps the id in
+  `CLAUDE_CODE_SESSION_ID`, or the session of a hook, to the session that the
+  job writes, from `$CLAUDE_JOB_DIR/state.json` or from
+  `State.continued_from`. `status`, `done`, `reopen` and `tail` with no
+  session id, `set_status`, and the backfill turn's self-only check use it. In
+  a job, the hooks use it too, so the sync, the status and the `inFlight` hint
+  are for S also if the payload names J. For `notice.sh`, see "Notices during
+  a turn". Tests: `test_the_cli_acts_on_the_session_that_a_job_writes`,
+  `test_the_hooks_of_a_job_under_its_own_id_act_on_its_session`,
+  `test_a_notice_for_a_session_flags_the_id_that_it_continued_in`,
+  `test_notice_sh_in_a_job_under_its_own_id`.
 
 ## Step 6: outside this repo
 
