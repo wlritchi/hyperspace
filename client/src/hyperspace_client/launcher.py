@@ -289,10 +289,9 @@ def close_job(
     then run `claude rm`. Return why the job stays, or None if it closed or
     if it is not ready to close.
 
-    Only a job whose session is beyond doubt closes (see `Job`). The job is
-    left as it is if its session runs, if a sync of its session runs, or if
-    the server does not have every local byte. It is also left if the status
-    of the session on the server or in the queue is not `done`. Raise
+    Only a job whose session is beyond doubt closes (see `Job`). The job
+    stays if its session runs, if a sync of its session runs, or if the
+    status of the session on the server or in the queue is not `done`. Raise
     `TeleportError` if the server does not have every local byte, and
     `NotFound` if the server does not have the session."""
     harness = adapter.harness
