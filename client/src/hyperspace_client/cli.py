@@ -207,10 +207,14 @@ def _hook_heartbeat(cfg: Config, ctx: Context, session_id: str, event: str) -> N
     try:
         if not ctx.api.has_capability(CAP_LIVENESS):
             return
-        live = ctx.adapter.live_sessions()
+        groups = ctx.adapter.live_processes(
+            ctx.state.continued_from(ctx.adapter.harness)
+        )
         if event == "SessionEnd":
             # The process can still be alive while its SessionEnd hook runs.
-            live = [sid for sid in live if sid != session_id]
+            # It is live for each id that it can write.
+            groups = [ids for ids in groups if session_id not in ids]
+        live = list(dict.fromkeys(sid for ids in groups for sid in ids))
         launcher.send_heartbeat(ctx, ctx.adapter, live, cfg.heartbeat_interval)
     except (ApiError, httpx.HTTPError) as exc:
         log.info("%s: no heartbeat: %s", session_id, exc)

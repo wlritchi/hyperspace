@@ -166,6 +166,10 @@ def _local_reason(
         return "messaged before", ""
     if sid in live:
         return "live", ""
+    if adapter.is_stub(session):
+        # For example, the own id of a background job: its conversation is
+        # in the transcript of the session that it continues.
+        return "no conversation", ""
     record = ctx.state.session(adapter.harness, sid)
     workspace = record.workspace or adapter.first_cwd(session) or ""
     if not workspace or not Path(workspace).is_dir():
@@ -211,7 +215,7 @@ def select(
         if st.st_size > 0 and st.st_mtime >= now - since:
             recent.append((st.st_mtime, session))
     recent.sort(key=lambda item: item[0], reverse=True)
-    live = set(adapter.live_sessions())
+    live = set(adapter.live_sessions(ctx.state.continued_from(adapter.harness)))
     for modified, session in recent:
         if limit is not None and len(out.candidates) >= limit:
             break

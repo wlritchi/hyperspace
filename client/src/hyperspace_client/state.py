@@ -440,6 +440,20 @@ class State:
             done_seen=row["done_seen"],
         )
 
+    def continued_from(self, harness: str) -> dict[str, list[str]]:
+        """Session id to the sessions whose synced metadata says that they
+        continued in it (`links.continued_in`)."""
+        rows = self._db.execute(
+            "SELECT session_id, json_extract(metadata, '$.links.continued_in') "
+            "FROM sessions WHERE harness = ? AND json_type(metadata, "
+            "'$.links.continued_in') = 'text' ORDER BY session_id",
+            (harness,),
+        ).fetchall()
+        out: dict[str, list[str]] = {}
+        for sid, target in rows:
+            out.setdefault(str(target), []).append(str(sid))
+        return out
+
     def save_session(
         self, record: SessionRecord, fields: tuple[str, ...] | None = None
     ) -> None:

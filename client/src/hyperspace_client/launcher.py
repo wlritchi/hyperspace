@@ -314,7 +314,8 @@ def close_after_exit(
     """For the SessionEnd hook of a `done` background job: wait for the
     session's process to stop, then close the job. The launcher's sweep
     covers a job that this misses."""
-    job = next((j for j in adapter.jobs() if j.short == short), None)
+    jobs = adapter.jobs(ctx.state.continued_from(adapter.harness))
+    job = next((j for j in jobs if j.short == short), None)
     if job is None:
         return
     deadline = clock() + wait
@@ -441,7 +442,7 @@ class Launcher:
     def sweep(self, live: list[str]) -> None:
         """Close the stopped jobs of `done` sessions."""
         now = self.clock()
-        jobs = self.adapter.jobs()
+        jobs = self.adapter.jobs(self.ctx.state.continued_from(self.adapter.harness))
         by_name = {j.short: j for j in jobs}
         entries = load_unclosed(self.ctx.state, self.adapter)
         # A refusal holds until the job goes away or its state changes.
@@ -566,7 +567,9 @@ class Launcher:
     def tick(self) -> list[str]:
         """One heartbeat and one sweep, and in runner mode the restores and
         the resumes. Return the live sessions."""
-        live = self.adapter.live_sessions()
+        live = self.adapter.live_sessions(
+            self.ctx.state.continued_from(self.adapter.harness)
+        )
         try:
             if self.before_tick is not None:
                 self.before_tick()
