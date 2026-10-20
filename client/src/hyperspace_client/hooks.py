@@ -121,7 +121,7 @@ def handle(
     start(sync)
 
     if event == "SessionEnd":
-        _close_if_done(cfg, adapter, session.session_id, start)
+        _close_if_done(cfg, adapter, start)
 
     if event == "SessionStart":
         sweep = ["--quiet", "sync", "--all", "--if-stale", SWEEP_EVERY]
@@ -198,13 +198,11 @@ def _resolve(
     return LocalSession(session.harness, sid, max(found, key=mtime))
 
 
-def _close_if_done(
-    cfg: Config, adapter: ClaudeCode, session_id: str, start: launcher.Detach
-) -> None:
+def _close_if_done(cfg: Config, adapter: ClaudeCode, start: launcher.Detach) -> None:
     """At the end of a background job whose session is `done`, close the
     job when its process stops. Claude Code sets `CLAUDE_JOB_DIR` only in
-    a background job. The job's session is the one whose transcript it
-    writes. A job whose session is not known stays."""
+    a background job. Only a job whose session is beyond doubt closes (see
+    `Job`)."""
     job_dir = os.environ.get("CLAUDE_JOB_DIR")
     if not job_dir or launcher.off():
         return
@@ -212,9 +210,8 @@ def _close_if_done(
     harness = adapter.harness
     state = State(cfg.state_dir)
     try:
-        jobs = adapter.jobs(state.continued_from(harness))
-        job = next((j for j in jobs if j.short == short), None)
-        sid = job.session_id if job is not None else session_id
+        job = adapter.job(short, state.continued_from(harness))
+        sid = job.session_id if job is not None else None
         if sid is None:
             return
         status = state.session(harness, sid).status

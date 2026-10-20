@@ -263,23 +263,6 @@ def _done(ctx: Context, harness: str, sid: str) -> bool:
     return event is not None and event["status"] == "done"
 
 
-def _own_id_open(ctx: Context, adapter: ClaudeCode, job: Job) -> bool:
-    """True if the job's own id differs from its session and runs, or has a
-    status that is not `done`. The hooks of an older client, or a user, can
-    write a status for the own id while the job writes its session. Then
-    that status can be the true status of the job's work."""
-    own, harness = job.own_id, adapter.harness
-    if own == job.session_id:
-        return False
-    if adapter.is_running(own) or queued_reopen(ctx.state, harness, own):
-        return True
-    try:
-        event = ctx.api.state(harness, own).get("status")
-    except NotFound:
-        return False
-    return event is not None and event["status"] != "done"
-
-
 @dataclass(frozen=True)
 class NotClosed:
     """Why `close_job` kept a job, for the heartbeat's `unclosed` list."""
@@ -290,11 +273,13 @@ class NotClosed:
     refused: bool = True
 
 
-def unknown_reason(job: Job) -> str:
-    """Why a job whose session is not known stays."""
+def blocked_reason(job: Job) -> str:
+    """Why a job whose session is not beyond doubt stays (see `Job`)."""
     if len(job.candidates) > 1:
-        return f"job {job.short} can write more than one session"
-    return f"the session of job {job.short} is not known"
+        return f"job {job.short} can write more than one session; close it yourself"
+    if job.candidates:
+        return f"job {job.short} writes another session; close it yourself"
+    return f"the session of job {job.short} is not known; close it yourself"
 
 
 def close_job(
@@ -304,33 +289,30 @@ def close_job(
     then run `claude rm`. Return why the job stays, or None if it closed or
     if it is not ready to close.
 
-    The job is left as it is if its session is not known, if its session or
-    its own id runs, if a sync of its session runs, or if the server does not
-    have every local byte. It is also left if the status of the session on
-    the server or in the queue is not `done`, or if its own id has a status
-    that is not `done`. Raise `TeleportError` if the server does not have
-    every local byte, and `NotFound` if the server does not have the
-    session."""
+    Only a job whose session is beyond doubt closes (see `Job`). The job is
+    left as it is if its session runs, if a sync of its session runs, or if
+    the server does not have every local byte. It is also left if the status
+    of the session on the server or in the queue is not `done`. Raise
+    `TeleportError` if the server does not have every local byte, and
+    `NotFound` if the server does not have the session."""
     harness = adapter.harness
     sid = job.session_id
     if sid is None:
-        return NotClosed(unknown_reason(job), refused=False)
-    own_open = NotClosed(
-        f"job {job.short} has its own id {job.own_id}, which is not done",
-        refused=False,
-    )
+        return NotClosed(blocked_reason(job), refused=False)
     with ctx.state.try_lock(harness, sid) as locked:
         if not locked or adapter.is_running(sid) or not _done(ctx, harness, sid):
             return None
-        if _own_id_open(ctx, adapter, job):
-            return own_open
         back_up(ctx, adapter, sid, adapter.find_transcripts(sid), "close")
         # The backup sends a queued status write, which can reopen the
-        # session, so ask again just before `claude rm`.
+        # session, and a sync of another session can link it to the job's
+        # id. Thus check again just before `claude rm`.
         if adapter.is_running(sid) or not _done(ctx, harness, sid):
             return None
-        if _own_id_open(ctx, adapter, job):
-            return own_open
+        again = adapter.job(job.short, ctx.state.continued_from(harness))
+        if again is None:
+            return None
+        if again.session_id != sid:
+            return NotClosed(blocked_reason(again), refused=False)
         # Never with --discard-unpushed or --force-remove-worktree: a refusal
         # keeps the work, and the user decides.
         code, output = run([claude, "rm", job.short])
@@ -345,16 +327,17 @@ def close_job(
 def record_refusal(
     state: State, adapter: ClaudeCode, job: Job, reason: str, recheck: bool = False
 ) -> None:
-    """Record why the launcher did not close the job, for the heartbeat. A
-    job whose session is not known has the reason on its own id and on each
-    session that it can write."""
+    """Record why the launcher did not close the job, for the heartbeat. The
+    reason is on the job's own id and on each other session that the job can
+    write."""
     entry: dict[str, Any] = {
-        "session_id": job.session_id or job.own_id,
+        "session_id": job.own_id,
         "reason": reason,
         "mtime": job.mtime,
     }
-    if job.session_id is None and job.candidates:
-        entry["also"] = list(job.candidates)
+    also = [sid for sid in job.candidates if sid != job.own_id]
+    if also:
+        entry["also"] = also
     if recheck:
         entry["recheck"] = True
     entries = load_unclosed(state, adapter)
@@ -388,13 +371,12 @@ def close_after_exit(
     """For the SessionEnd hook of a `done` background job: wait for the
     session's process to stop, then close the job. The launcher's sweep
     covers a job that this misses."""
-    jobs = adapter.jobs(ctx.state.continued_from(adapter.harness))
-    job = next((j for j in jobs if j.short == short), None)
+    job = adapter.job(short, ctx.state.continued_from(adapter.harness))
     if job is None:
         return
     sid = job.session_id
     if sid is None:
-        log.info("%s: not closed: %s", job.own_id, unknown_reason(job))
+        log.info("%s: not closed: %s", job.own_id, blocked_reason(job))
         return
     deadline = clock() + wait
     while adapter.is_running(sid):
@@ -519,7 +501,7 @@ class Launcher:
 
     def sweep(self, live: list[str]) -> None:
         """Close the stopped jobs of `done` sessions. A job whose session is
-        not known is never closed; the heartbeat says why."""
+        not beyond doubt is never closed; the heartbeat says why."""
         state, adapter = self.ctx.state, self.adapter
         now = self.clock()
         jobs = adapter.jobs(state.continued_from(adapter.harness))
@@ -542,7 +524,7 @@ class Launcher:
                     forget_recheck(state, adapter, job.short)
                 else:
                     record_refusal(
-                        state, adapter, job, unknown_reason(job), recheck=True
+                        state, adapter, job, blocked_reason(job), recheck=True
                     )
                 continue
             if job.session_id in live:
