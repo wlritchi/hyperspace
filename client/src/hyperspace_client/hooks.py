@@ -16,8 +16,8 @@ Events in `STATUS_EVENTS` also queue a status write (see `status.py`), which
 the checkpoint sends. With `--notices`, the hook only prints the pending
 notices for the agent, for the plugin's synchronous PostToolUse hook.
 
-In a background job whose session is not known (`ClaudeCode.resolve`), the
-hooks queue no status write, start no job close, and show no status notice:
+In a background job whose session is not known (`ClaudeCode.resolve`), or
+whose session has no transcript on this host, the hooks queue no status write, start no job close, and show no status notice:
 the status notices stay pending. The checkpoint, the lease notices and the
 restore and resume checks use the session of the payload.
 
@@ -188,7 +188,7 @@ def _resolve(
     of the CLI (`ClaudeCode.resolve`). The hook of a background job can name
     the job's own id. Only a job continues another session, so the hook of a
     process that is not a job keeps its session. None if the session of the
-    job is not known."""
+    job is not known, or if this host has no transcript of it."""
     if not os.environ.get("CLAUDE_JOB_DIR"):
         return session
     state = State(cfg.state_dir)
@@ -209,7 +209,7 @@ def _resolve(
 
     found = adapter.find_transcripts(sid)
     if not found:
-        return session
+        return None
     return LocalSession(session.harness, sid, max(found, key=mtime))
 
 

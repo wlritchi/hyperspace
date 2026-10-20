@@ -267,7 +267,11 @@ and a `procStart` that is the start time of that process. A record with no
 of `/proc/<pid>/stat`; on other platforms, never), does not count. Thus a
 stale record whose pid is now this process does not confirm a job. A
 foreground `claude --resume J` writes J's transcript, so it stays J. A stale
-`CLAUDE_JOB_DIR` changes nothing. The CLI and the hooks use this one rule.
+`CLAUDE_JOB_DIR` changes nothing. In the job, the id can be J or the
+`resumeSessionId`. Both give the session of the job, from the candidates of J.
+If the job's state has no valid id J, the session of the job is not known. The
+CLI and the hooks use this one rule. A hook also counts the session of the job
+as not known if this host has no transcript of that session.
 
 In a job whose session is not known, the hooks:
 
