@@ -236,9 +236,17 @@ If the file or the field is missing, the adapter writes `ready`, reason
 `idle`. A foreground session has no `inFlight`, so only an agent declaration
 can set `waiting` there (A2).
 
-When the user sends a foreground session to the background, Claude Code makes
-a job with the same session id. The rules for background jobs then apply.
-Claude Code stops the Monitors of the session at that time.
+When the user sends a foreground session S to the background, Claude Code
+makes a job, and stops the Monitors of the session. The job can have its own
+id J, and continue to write the transcript of S (main spec, "Background
+jobs"). Then the job's state has `sessionId` J and can have `resumeSessionId`
+S, and S's transcript has a `continued-in` record with J. Some jobs have the
+same id as their session. The rules for background jobs then apply to S, the
+session whose transcript the job writes: the adapter keys a job on S (on
+`resumeSessionId` if the state has it, else on the one session that continued
+in J), and the hooks, the status and the `inFlight` hint of the job are for S.
+A job that has a transcript with a conversation under its own id writes that
+transcript, and is its own session.
 
 ### Liveness
 
@@ -257,9 +265,13 @@ process and no lease. Lists and the prevention hook show a warning for the
 second case before the stale host appends.
 
 Each host sends a _heartbeat_: the list of the sessions that run on the host,
-from the adapter's live-process check (`is_running` in the main spec). The
-heartbeat also gives its interval. SessionStart and SessionEnd send an extra
-heartbeat at once, so that a change shows without a wait.
+from the adapter's live-process check (`is_running` in the main spec). A
+process is live for each session whose transcript it can write: its registry
+id, the ids in its job's state, and the sessions that continued in its
+registry id. Thus a job under its own id J makes the session S that it writes
+live. The heartbeat also gives its interval. SessionStart and SessionEnd send
+an extra heartbeat at once, so that a change shows without a wait. The
+SessionEnd heartbeat leaves out every id of the ending process.
 
 A host can have more than one harness config directory, each with its own
 launcher. Each heartbeat therefore has a _source_: the client's id for its
@@ -334,7 +346,8 @@ Two triggers do step 4:
 
 - The SessionEnd hook of a background job (`CLAUDE_JOB_DIR` is set) whose
   status is `done` starts a detached process that waits for the job's process
-  to stop, syncs, and runs `claude rm`.
+  to stop, syncs, and runs `claude rm`. The status is that of the session
+  whose transcript the job writes, also when the job has its own id.
 - A sweep in the launcher finds jobs that are not live and whose session is
   `done`. This catches a session that was marked `done` from a different host
   after its job stopped, and a SessionEnd hook that did not run. The sweep
@@ -495,8 +508,11 @@ The CLI gives the overview stories their commands:
   with the short forms `hyperspace done [<sid>...]` and
   `hyperspace reopen <sid>` (U4, O3). With no `STATUS`, it shows the status.
   With no session id, the command applies to the current session, from
-  `CLAUDE_CODE_SESSION_ID` (A1, A2). The source is `agent` when the command
-  runs in a Claude Code session, and `user` otherwise or with `--by-user`.
+  `CLAUDE_CODE_SESSION_ID` (A1, A2). In a background job, this variable can
+  hold the job's own id J. The client then uses the session whose transcript
+  the job writes: `resumeSessionId` in `$CLAUDE_JOB_DIR/state.json`, else the
+  one session that continued in J. The source is `agent` when the command runs
+  in a Claude Code session, and `user` otherwise or with `--by-user`.
 
 The plugin adds:
 
@@ -521,8 +537,10 @@ asks the agent to set its status with a note, and to change nothing else.
   mode: it does not load the user's settings or MCP servers, and Bash is the
   only tool. In the turn, `hyperspace status`, `done` and `reopen` act only on
   the session of the turn, and not as the user, so text in one transcript
-  cannot change the status of other sessions. It skips sessions that are live,
-  that have a status, or whose lease a different host holds.
+  cannot change the status of other sessions. It skips sessions that are live
+  (also a session that a job under its own id writes), that have a status, or
+  whose lease a different host holds, and transcripts that hold no
+  conversation (the stub of a job's own id).
 - It records each session that it messages before the resume starts. A second
   run, for example after an interruption, skips these sessions unless
   `--retry` is given. `--dry-run` lists the sessions and messages none.
@@ -594,13 +612,15 @@ A heartbeat applies only to the credential's own host.
 ## Resolved questions
 
 - `CLAUDE_CODE_SESSION_ID` is set in the shell tool's environment of every
-  Claude Code session, foreground and background.
+  Claude Code session, foreground and background. In a background job under
+  its own id, it is not known whether it holds the job's id or the id of the
+  session that the job writes; the client handles both.
 - A launcher resumes a session as a background job with
   `claude --bg --resume <sid>`, in the session's workspace. Claude Code then
   continues the session under the same id. If the session already runs, Claude
   Code starts a copy under a new id, so the launcher first checks that the
-  session does not run on the host. Hyperspace never writes Claude Code's job
-  state.
+  session does not run on the host, also in a job under the job's own id.
+  Hyperspace never writes Claude Code's job state.
 - Tests will show whether the SessionEnd hook runs when the Claude Code daemon
   stops an idle job. The sweep makes the design correct without it.
 - The heartbeat interval is 60 seconds, so a heartbeat expires after 3
