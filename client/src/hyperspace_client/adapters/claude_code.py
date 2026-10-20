@@ -200,12 +200,17 @@ def is_stub(data: bytes) -> bool:
     return found
 
 
-def _alive(record: dict[str, Any]) -> bool:
-    """True if the process of a live-session registry record runs."""
+def _alive(record: dict[str, Any], proven: bool = False) -> bool:
+    """True if the process of a live-session registry record runs. With
+    `proven`, only if the record has a `procStart` that matches the start
+    time of the process: a stale record whose pid is now another process
+    must not count."""
     pid = record.get("pid")
     if not isinstance(pid, int) or pid <= 0:
         return False
     if sys.platform != "linux":
+        if proven:
+            return False
         # The registry's procStart format is platform-specific.
         # Until it can be compared, a live/reused pid must block a
         # destructive move rather than be treated as stopped.
@@ -221,11 +226,13 @@ def _alive(record: dict[str, Any]) -> bool:
     except FileNotFoundError:
         return False
     except OSError:
-        return True
+        return not proven
     # The process name (field 2) can contain spaces; the fields after
     # its closing parenthesis are fixed.
     fields = stat[stat.rfind(")") + 2 :].split()
     start = fields[19] if len(fields) > 19 else None
+    if proven:
+        return start is not None and record.get("procStart") == start
     return record.get("procStart") in (None, start)
 
 
@@ -722,7 +729,8 @@ class ClaudeCode:
         `CLAUDE_JOB_DIR` names the job. Its value can be stale, for example in
         a process that a job started and that outlives the job. Thus a live
         registry record of this process or of a parent process must also
-        name the job."""
+        name the job, with a `procStart` that matches the start time of that
+        process."""
         job_dir = os.environ.get("CLAUDE_JOB_DIR")
         sessions = self.config_dir / "sessions"
         if not job_dir or not sessions.is_dir():
@@ -740,7 +748,7 @@ class ClaudeCode:
                 isinstance(record, dict)  # pyright: ignore[reportUnnecessaryIsInstance]
                 and record.get("jobId") == short
                 and record.get("pid") in ancestors
-                and _alive(record)
+                and _alive(record, proven=True)
             ):
                 return _read_state(self.config_dir / "jobs" / short / "state.json")
         return None

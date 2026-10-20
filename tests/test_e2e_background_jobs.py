@@ -208,10 +208,18 @@ def test_restore_and_fork_refuse_a_stub(
 # --- Running jobs ----------------------------------------------------------------
 
 
+def proc_start(pid: int) -> str:
+    """Field 22 of /proc/<pid>/stat, as Claude Code records it."""
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    return stat[stat.rfind(")") + 2 :].split()[19]
+
+
 def register(fake: FakeClaude, **record: Any) -> None:
-    """Register this test process as a live Claude Code process."""
+    """Register this test process as a live Claude Code process, with its
+    start time unless `record` gives one."""
     sessions = fake.root / "sessions"
     sessions.mkdir(exist_ok=True)
+    record.setdefault("procStart", proc_start(os.getpid()))
     (sessions / f"{os.getpid()}.json").write_text(
         json.dumps({"pid": os.getpid(), **record})
     )
@@ -1048,3 +1056,39 @@ def test_a_job_whose_session_is_not_known_takes_no_status_notices(
     # The prevention checks still apply to the session of the payload.
     ctx.state.put(f"restore_pending:{H}:{j.stem}", "1")
     assert "unfinished restore" in hook("UserPromptSubmit")
+
+
+@needs_proc
+@pytest.mark.parametrize("start", ["missing", None, "1"])
+def test_a_registry_record_with_no_matching_start_time_does_not_change_the_session(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start: str | None,
+) -> None:
+    s, j = background_job(fake)
+    sync(ctx, s)
+    directory = job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
+    hook_env(monkeypatch, fake, directory)
+    monkeypatch.setenv(SESSION_ENV, j.stem)
+    # A stale record whose pid is now this process's pid.
+    register(fake, sessionId=j.stem, jobId="aa", procStart=start)
+    if start == "missing":
+        record = fake.root / "sessions" / f"{os.getpid()}.json"
+        fields = json.loads(record.read_text())
+        del fields["procStart"]
+        record.write_text(json.dumps(fields))
+    assert _current(ctx.state) == j.stem
+    cfg = Config(host="laptop", state_dir=tmp_path / "state")
+    started: list[list[str]] = []
+    payload = {"transcript_path": str(j), "cwd": WS, "hook_event_name": "Stop"}
+    handle(payload, cfg, start=started.append)
+    assert started[0][4] == str(j)
+    assert ctx.state.wanted_status(H, s.stem) is None
+    # The liveness check still counts a record with no start time.
+    assert fake.adapter.is_running(s.stem) == (start != "1")
+    # With the start time of this process, the id changes.
+    register(fake, sessionId=j.stem, jobId="aa")
+    assert _current(ctx.state) == s.stem
