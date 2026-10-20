@@ -711,7 +711,8 @@ def test_the_cli_acts_on_the_session_that_a_job_writes(
     (directory / "state.json").write_text(
         json.dumps({"sessionId": j.stem, "resumeSessionId": j.stem})
     )
-    assert _current() == j.stem
+    # With no synced metadata, the session of the job is not known.
+    assert _current() is None
     assert _current(ctx.state) == s.stem
     # Outside a job, the id does not change.
     monkeypatch.delenv("CLAUDE_JOB_DIR")
@@ -942,7 +943,7 @@ def test_a_job_that_can_write_more_than_one_session_acts_on_none(
     register(fake, sessionId=j.stem, jobId="aa")
     monkeypatch.setenv(SESSION_ENV, j.stem)
     assert _current(ctx.state) is None
-    with pytest.raises(Exit, match="give a session id"):
+    with pytest.raises(Exit, match="the session of this background job is not known"):
         _target(None, _current(ctx.state))
     # An explicit session is not the current session.
     request = _request(
@@ -959,3 +960,36 @@ def test_a_job_that_can_write_more_than_one_session_acts_on_none(
     assert started[0][4] == str(j)
     for sid in (s.stem, t.stem, j.stem):
         assert ctx.state.wanted_status(H, sid) is None
+
+
+@needs_proc
+def test_a_job_whose_session_is_not_known_acts_on_none(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # J is a stub, and no synced metadata links a session to J.
+    j = fake.transcript(WS)
+    fake.write(j, *stub_records(j.stem))
+    directory = job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=j.stem)
+    hook_env(monkeypatch, fake, directory)
+    register(fake, sessionId=j.stem, jobId="aa")
+    monkeypatch.setenv(SESSION_ENV, j.stem)
+    assert _current(ctx.state) is None
+    with pytest.raises(Exit, match="the session of this background job is not known"):
+        _target(None, _current(ctx.state))
+    with pytest.raises(Exit, match="give a session id"):
+        _targets([], by_user=False)
+    # An explicit session id still works.
+    assert _target(j.stem) == j.stem
+    cfg = Config(host="laptop", state_dir=tmp_path / "state")
+    started: list[list[str]] = []
+    handle(
+        {"transcript_path": str(j), "cwd": WS, "hook_event_name": "Stop"},
+        cfg,
+        start=started.append,
+    )
+    assert started[0][4] == str(j)
+    assert ctx.state.wanted_status(H, j.stem) is None

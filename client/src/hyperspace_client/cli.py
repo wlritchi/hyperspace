@@ -507,8 +507,8 @@ def _current(state: State | None = None) -> str | None:
     """The session whose transcript the Claude Code process of this command
     writes. `CLAUDE_CODE_SESSION_ID` can hold the own id of a background job
     (see `ClaudeCode.resolve`). `state` gives the sessions that continued in
-    an id. None if the variable is not set, or if the job can write more than
-    one session."""
+    an id. None if the variable is not set, or if the session of the job is
+    not known."""
     sid = os.environ.get(SESSION_ENV)
     if not sid:
         return None
@@ -540,7 +540,7 @@ def _target(session: str | None, current: str | None | EllipsisType = ...) -> st
     if not session and os.environ.get(SESSION_ENV):
         raise Exit(
             2,
-            "give a session id; this background job can write more than one session",
+            "give a session id; the session of this background job is not known",
         )
     if not session:
         raise Exit(2, f"give a session id; {SESSION_ENV} is not set")
