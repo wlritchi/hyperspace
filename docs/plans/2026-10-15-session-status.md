@@ -568,6 +568,23 @@ The code follows this step, with these changes and additions:
   session during one sync). An explicit write tries once more, but an agent's
   write does not write over an explicit `done` from someone else; the CLI then
   exits 1 and the agent gets the notice.
+- A write that a hook or the CLI queues in place of a queued write keeps the
+  request fields of the replaced write, and of the writes that the replaced
+  write replaced (at most four), under `_replaced` (`status.queue`). The sync
+  does not send this key. A sync can send the replaced write while the hook
+  decides on top of it with the older base. Thus on `409 stale_status` the
+  write also tries once more if the current event is newer than its base and
+  has the fields of a replaced write, from this host (`status._of_replaced`).
+  The hook and the CLI read the queue before the session record, because the
+  sync saves the event of a write before it removes the write from the queue.
+  A live check with Claude Code 2.1.301 found the race: the Stop hook of a
+  cron turn ran while the sync sent the reopen of a `done` session, so the
+  `ready` got `409` on the reopen and was dropped, and the session stayed
+  `working`. Tests: `test_a_stop_during_the_send_of_a_reopen_is_written`,
+  `test_a_cli_write_during_the_send_of_a_queued_cli_write_is_written`,
+  `test_a_write_does_not_retry_on_an_event_that_it_did_not_replace`,
+  `test_a_write_does_not_retry_on_an_event_after_the_replaced_write`,
+  `test_an_automatic_write_with_no_replaced_write_does_not_retry`.
 - If the current status is `done`, only `UserPromptSubmit` writes. This
   explicit reopen also drops the pending `done` notices, so that the hook does
   not print "Finish the current step and stop" for the prompt that reopens the

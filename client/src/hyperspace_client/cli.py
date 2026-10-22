@@ -30,7 +30,7 @@ from hyperspace_client.credentials import CredentialError
 from hyperspace_client.hooks import handle, notices
 from hyperspace_client.notices import after_sync, refresh_states
 from hyperspace_client.state import State
-from hyperspace_client.status import clean_note, printable, seq, write
+from hyperspace_client.status import clean_note, printable, queue, seq, write
 from hyperspace_client.sync import Context, Syncer, register_host
 from hyperspace_client.teleport import (
     TeleportError,
@@ -632,9 +632,13 @@ def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent |
             notify=True,
         )
     with state.lock(harness, sid, STATUS_LOCK_WAIT) as locked:
+        # A sync that holds the lock can send the queued write now. Read the
+        # queue before the record, as a hook does (see `status.on_hook`).
+        queued = state.wanted_status(harness, sid)
         record = state.session(harness, sid)
         if not locked:
-            state.want_status(harness, sid, {**request, "base_seq": seq(record.status)})
+            want = {**request, "base_seq": seq(record.status)}
+            queue(state, harness, sid, want, queued)
             state.set_declared(harness, sid, request)
             return None
         state.drop_wanted_status(harness, sid)

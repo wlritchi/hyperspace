@@ -13,17 +13,22 @@ import os
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from _hs import FakeClaude, prompt, text_reply, tool_call
+from hyperspace_client import cli as cli_mod
+from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
+from hyperspace_client.api import Api, StatusConflict
+from hyperspace_client.cli import SESSION_ENV, _request, set_status
 from hyperspace_client.state import _ADDED_COLUMNS, _SCHEMA, State
 from hyperspace_client.status import (
+    REPLACED,
     WITH_EXCERPT,
     Known,
     clean_note,
@@ -32,9 +37,16 @@ from hyperspace_client.status import (
     observe,
     on_hook,
     printable,
+    send_wanted,
     transition,
 )
-from hyperspace_protocol import MAX_STATUS_EXCERPT, MAX_STATUS_NOTE, StatusEvent
+from hyperspace_client.sync import Context
+from hyperspace_protocol import (
+    MAX_STATUS_EXCERPT,
+    MAX_STATUS_NOTE,
+    StatusEvent,
+    validate_status_request,
+)
 
 SID = "11111111-1111-1111-1111-111111111111"
 
@@ -644,3 +656,241 @@ def test_live_sessions_skips_invalid_ids(tmp_path: Path) -> None:
             json.dumps({"sessionId": sid, "pid": os.getpid()})
         )
     assert ClaudeCode(tmp_path).live_sessions() == [SID]
+
+
+# --- A write queued on top of a queued write -------------------------------------
+
+H = "claude-code"
+REOPEN = {"note": "reopened by a prompt", "source_kind": "user"}
+
+
+class StatusServer:
+    """The status writes of the server for one session, in memory: an event
+    is added only if `base_seq` is the latest seq. `during_add` runs once,
+    at the start of the next write, for example a hook that runs while a
+    sync sends a write."""
+
+    def __init__(self) -> None:
+        self.latest: StatusEvent | None = None
+        self.requests: list[dict[str, Any]] = []
+        self.during_add: Callable[[], object] | None = None
+
+    def has_capability(self, name: str) -> bool:
+        return True
+
+    def add_status(
+        self, harness: str, sid: str, request: dict[str, Any], host: str = "laptop"
+    ) -> StatusEvent:
+        run, self.during_add = self.during_add, None
+        if run is not None:
+            run()
+        # The request has only the fields of the protocol.
+        assert set(request) == set(validate_status_request(dict(request)))
+        self.requests.append(request)
+        current = self.latest["seq"] if self.latest else 0
+        if request["base_seq"] != current:
+            raise StatusConflict(
+                f"{sid}: the latest status event is {current}", self.latest
+            )
+        source: dict[str, Any] = {"kind": request["source_kind"], "host": host}
+        if "source_session" in request:
+            source["session_id"] = request["source_session"]
+        event: dict[str, Any] = {
+            "seq": current + 1,
+            "status": request["status"],
+            "source": source,
+            "explicit": request["explicit"],
+            "received": "2026-10-22T01:48:00Z",
+        }
+        for key in ("reason", "wake", "note"):
+            if key in request:
+                event[key] = request[key]
+        self.latest = cast(StatusEvent, event)
+        return self.latest
+
+    def mark(
+        self, status: str, host: str, kind: str = "user", **more: Any
+    ) -> StatusEvent:
+        """A write on the latest event, from a different writer."""
+        base = self.latest["seq"] if self.latest else 0
+        request = {
+            "status": status,
+            "source_kind": kind,
+            "explicit": kind != "hook",
+            "base_seq": base,
+            **more,
+        }
+        return self.add_status(H, SID, request, host=host)
+
+
+@pytest.fixture
+def server() -> StatusServer:
+    return StatusServer()
+
+
+@pytest.fixture
+def ctx(
+    server: StatusServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Context]:
+    monkeypatch.delenv("CLAUDE_JOB_DIR", raising=False)
+    adapter = ClaudeCode(tmp_path / "claude")
+    c = Context(cast(Api, server), State(tmp_path / "state"), adapter, "laptop")
+    yield c
+    c.state.close()
+
+
+def _session(ctx: Context) -> LocalSession:
+    transcript = ctx.state.directory / f"{SID}.jsonl"
+    FakeClaude.write(transcript, prompt("hi"), text_reply("All set."))
+    return LocalSession(H, SID, transcript)
+
+
+def _hook(ctx: Context, event: str) -> Callable[[], None]:
+    adapter = ctx.adapter
+    assert isinstance(adapter, ClaudeCode)
+    return lambda: on_hook(ctx.state, adapter, H, SID, event, {})
+
+
+def _seen(ctx: Context, event: StatusEvent | None) -> None:
+    observe(ctx.state, ctx.state.session(H, SID), event, ctx.host, notify=False)
+
+
+def _latest(server: StatusServer) -> tuple[Any, ...]:
+    event = server.latest
+    assert event is not None
+    return (
+        event["seq"],
+        event["status"],
+        event.get("reason") or event.get("wake"),
+        event["explicit"],
+        event["source"]["kind"],
+    )
+
+
+def _done_session(ctx: Context, server: StatusServer) -> LocalSession:
+    """A session that is `done` at seq 13, as the client saw it."""
+    server.latest = _done(13, "laptop")
+    _seen(ctx, server.latest)
+    return _session(ctx)
+
+
+def test_a_stop_during_the_send_of_a_reopen_is_written(
+    ctx: Context, server: StatusServer
+) -> None:
+    # A cron turn reopens a done session. Its Stop hook runs while the sync
+    # sends the reopen, so the hook sees the queued reopen and the old base.
+    session = _done_session(ctx, server)
+    _hook(ctx, "UserPromptSubmit")()
+    server.during_add = _hook(ctx, "Stop")
+    send_wanted(ctx, session)
+    assert _latest(server) == (14, "working", None, True, "user")
+    queued = ctx.state.wanted_status(H, SID)
+    assert queued is not None
+    assert (queued[0]["status"], queued[0]["base_seq"]) == ("ready", 13)
+    assert queued[0][REPLACED] == [{"status": "working", "explicit": True, **REOPEN}]
+    # The next sync gets 409 on the reopen, and writes on top of it.
+    send_wanted(ctx, session)
+    assert _latest(server) == (15, "ready", "idle", False, "hook")
+    assert [r["base_seq"] for r in server.requests] == [13, 13, 14]
+    assert ctx.state.wanted_status(H, SID) is None
+    assert ctx.state.session(H, SID).status == server.latest
+
+
+OTHER_SESSION = "22222222-2222-2222-2222-222222222222"
+
+
+@pytest.mark.parametrize(
+    "between",
+    [
+        # The user marks the session done from another host.
+        {"status": "done", "host": "desk", "note": "merged"},
+        # The user marks it done on this host.
+        {"status": "done", "host": "laptop", "note": "merged"},
+        # The fields of the reopen, from another host.
+        {"status": "working", "host": "desk", **REOPEN},
+        # The fields of the reopen, from an agent in another session.
+        {"status": "working", "host": "laptop", "source_session": OTHER_SESSION}
+        | REOPEN,
+    ],
+)
+def test_a_write_does_not_retry_on_an_event_that_it_did_not_replace(
+    ctx: Context, server: StatusServer, between: dict[str, Any]
+) -> None:
+    session = _done_session(ctx, server)
+    _hook(ctx, "UserPromptSubmit")()
+    _hook(ctx, "Stop")()
+    fields = dict(between)
+    server.mark(fields.pop("status"), fields.pop("host"), **fields)
+    before = server.latest
+    send_wanted(ctx, session)
+    assert server.latest == before
+    assert ctx.state.wanted_status(H, SID) is None
+
+
+def test_a_write_does_not_retry_on_an_event_after_the_replaced_write(
+    ctx: Context, server: StatusServer
+) -> None:
+    # The reopen became an event, then another host marked the session done.
+    session = _done_session(ctx, server)
+    _hook(ctx, "UserPromptSubmit")()
+    server.during_add = _hook(ctx, "Stop")
+    send_wanted(ctx, session)
+    server.mark("done", "desk", note="merged")
+    send_wanted(ctx, session)
+    assert _latest(server) == (15, "done", None, True, "user")
+    assert ctx.state.wanted_status(H, SID) is None
+
+
+def test_an_automatic_write_with_no_replaced_write_does_not_retry(
+    ctx: Context, server: StatusServer
+) -> None:
+    # The queue was empty when the Stop hook ran, so the reopen from a
+    # different writer is not one that the write replaced.
+    session = _session(ctx)
+    _seen(ctx, server.mark("working", "laptop", kind="hook"))
+    server.mark("working", "laptop", **REOPEN)
+    _hook(ctx, "Stop")()
+    queued = ctx.state.wanted_status(H, SID)
+    assert queued is not None and REPLACED not in queued[0]
+    send_wanted(ctx, session)
+    assert _latest(server) == (2, "working", None, True, "user")
+
+
+def test_a_prompt_during_the_send_of_a_done_is_written(
+    ctx: Context, server: StatusServer
+) -> None:
+    # /done is queued, and the next prompt comes while the sync sends it.
+    session = _session(ctx)
+    _seen(ctx, server.mark("working", "laptop", kind="hook"))
+    done = {"status": "done", "source_kind": "user", "explicit": True, "base_seq": 1}
+    ctx.state.want_status(H, SID, done)
+    server.during_add = _hook(ctx, "UserPromptSubmit")
+    send_wanted(ctx, session)
+    assert _latest(server) == (2, "done", None, True, "user")
+    send_wanted(ctx, session)
+    assert _latest(server) == (3, "working", None, True, "user")
+
+
+def test_a_cli_write_during_the_send_of_a_queued_cli_write_is_written(
+    ctx: Context, server: StatusServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The agent marks its session done, then changes it to waiting. A sync
+    # holds the lock, so both writes are queued, and the sync sends the
+    # first while the second is queued.
+    monkeypatch.setenv(SESSION_ENV, SID)
+    monkeypatch.setattr(cli_mod, "STATUS_LOCK_WAIT", 0.05)
+    session = _session(ctx)
+    _seen(ctx, server.mark("working", "laptop", kind="hook"))
+    done = _request("done", SID, reason=None, wake=None, note=None, by_user=False)
+    later = _request(
+        "waiting", SID, reason=None, wake="message", note="CI", by_user=False
+    )
+    with ctx.state.try_lock(H, SID) as locked:
+        assert locked
+        assert set_status(ctx, SID, done) is None
+        server.during_add = lambda: set_status(ctx, SID, later)
+        send_wanted(ctx, session)
+        assert _latest(server) == (2, "done", None, True, "agent")
+        send_wanted(ctx, session)
+    assert _latest(server) == (3, "waiting", "message", True, "agent")
+    assert ctx.state.wanted_status(H, SID) is None
