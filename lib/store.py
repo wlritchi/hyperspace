@@ -309,8 +309,9 @@ _MIGRATIONS: list[str] = [
     ) WHERE parent IS NOT NULL;
     """,
     # The newest event of each event table that has a copy in the session
-    # row (see `_repair_copies`). A mark of 0 makes the next start fill the
-    # copies of every session.
+    # row (see `_advance_copies`). A mark of 0 makes the next start fill the
+    # copies of every session. Migrations 4 and 5 filled them, but this
+    # migration cannot know that no older server wrote events after them.
     """
     CREATE TABLE copy_marks (
         events TEXT PRIMARY KEY,
@@ -323,10 +324,11 @@ _MIGRATIONS: list[str] = [
 
 # The event tables whose latest event has a copy in the session row, with an
 # expression that identifies an event. A server before migration 4 writes
-# events and does not update the copies. Each write of this server sets the
-# mark to its event in the same transaction. Thus an event above the mark,
-# or a mark whose event is gone or is a different event (a deleted row whose
-# id SQLite gave again), shows a write that did not update the copies.
+# events and does not update the copies. This server moves a mark only in
+# `_advance_copies`, which first makes the copies of all events above the
+# mark current. Thus an event above the mark, or a mark whose event is gone
+# or is a different event (a deleted row whose id SQLite gave again), shows
+# a write that did not update the copies.
 _COPY_MARKS = {
     "status_events": "session || ':' || seq || ':' || received",
     "metadata_events": "session || ':' || received",
@@ -736,42 +738,54 @@ class Store:
     def _repair_copies(self) -> None:
         """Fill the copies of the latest status and metadata in the session
         rows again where a server that does not keep them wrote events, for
-        example after a rollback to an older server and a new upgrade. Only
-        the sessions with events above the mark get new copies, unless the
-        mark cannot be trusted; then all sessions do."""
+        example after a rollback to an older server and a new upgrade."""
         with self._tx():
-            for table, key in _COPY_MARKS.items():
-                mark = self._db.execute(
-                    "SELECT last_id, last_key FROM copy_marks WHERE events = ?",
-                    (table,),
-                ).fetchone()
-                last_id = mark["last_id"] if mark is not None else 0
-                trusted = mark is not None
-                if trusted and last_id:
-                    row = self._db.execute(
-                        f"SELECT {key} AS k FROM {table} WHERE rowid = ?", (last_id,)
-                    ).fetchone()
-                    trusted = row is not None and row["k"] == mark["last_key"]
-                if trusted:
-                    newer = self._db.execute(
-                        f"SELECT COUNT(DISTINCT session) AS n FROM {table} "
-                        "WHERE rowid > ?",
-                        (last_id,),
-                    ).fetchone()["n"]
-                    if not newer:
-                        continue
-                    where = f"id IN (SELECT session FROM {table} WHERE rowid > :mark)"
-                    log.info("%s: new copies for %d sessions", table, newer)
-                else:
-                    where = "1"
-                    log.warning("%s: the mark is not valid; new copies for all", table)
-                for statement in _FILL_COPIES[table]:
-                    self._db.execute(statement.format(where=where), {"mark": last_id})
-                self._mark_copy(table)
+            for table in _COPY_MARKS:
+                self._advance_copies(table)
 
-    def _mark_copy(self, table: str) -> None:
-        """Set the mark of an event table to its newest event, in the
-        transaction that wrote or deleted events (see `_COPY_MARKS`)."""
+    def _advance_copies(self, table: str, written: int | None = None) -> None:
+        """Make the copies of every event of `table` above its mark current,
+        then set the mark to the newest event. `written` is the id of an
+        event that the caller wrote and copied in this transaction.
+
+        Only the sessions with events above the mark get new copies, so that
+        with no such event this is one indexed query. If the event of the
+        mark is gone or is a different event (SQLite can give the id of a
+        deleted row again), all sessions get new copies. Each write and each
+        purge goes through here, so that no mark passes an event whose copy
+        another server did not write."""
+        mark = self._db.execute(
+            "SELECT last_id, last_key FROM copy_marks WHERE events = ?", (table,)
+        ).fetchone()
+        last_id = mark["last_id"] if mark is not None else 0
+        trusted = mark is not None
+        if trusted and last_id:
+            row = self._db.execute(
+                f"SELECT {_COPY_MARKS[table]} AS k FROM {table} WHERE rowid = ?",
+                (last_id,),
+            ).fetchone()
+            trusted = row is not None and row["k"] == mark["last_key"]
+        params = {"mark": last_id, "written": -1 if written is None else written}
+        newer = f"SELECT session FROM {table} WHERE rowid > :mark AND rowid != :written"
+        if not trusted:
+            where = "1"
+            log.warning("%s: the mark is not valid; new copies for all", table)
+        elif self._db.execute(f"{newer} LIMIT 1", params).fetchone() is not None:
+            where = f"id IN ({newer})"
+            count = self._db.execute(
+                f"SELECT COUNT(DISTINCT session) AS n FROM ({newer})", params
+            ).fetchone()["n"]
+            log.info("%s: new copies for %d sessions", table, count)
+        else:
+            where = None
+        if where is not None:
+            for statement in _FILL_COPIES[table]:
+                self._db.execute(statement.format(where=where), params)
+        self._set_mark(table)
+
+    def _set_mark(self, table: str) -> None:
+        """Set the mark of `table` to its newest event. Only after
+        `_advance_copies` in the same transaction."""
         self._db.execute(
             "INSERT OR REPLACE INTO copy_marks (events, last_id, last_key) "
             f"SELECT ?, m.id, COALESCE((SELECT {_COPY_MARKS[table]} FROM {table} "
@@ -1310,17 +1324,17 @@ class Store:
         top_level = parent is None and "automation" not in metadata
         with self._tx():
             session = self._ensure_session(key)
-            self._db.execute(
+            written = self._db.execute(
                 "INSERT INTO metadata_events (session, host, received, body) "
                 "VALUES (?, ?, ?, ?)",
                 (session["id"], writer.host, self.now(), body),
-            )
+            ).lastrowid
             self._db.execute(
                 "UPDATE sessions SET metadata = ?, parent = ?, top_level = ? "
                 "WHERE id = ?",
                 (body, parent, int(top_level), session["id"]),
             )
-            self._mark_copy("metadata_events")
+            self._advance_copies("metadata_events", written)
 
     def _latest_metadata(self, session: int) -> SessionMetadata:
         row = self._db.execute(
@@ -1867,7 +1881,7 @@ class Store:
             current = latest[0]["seq"] if latest is not None else 0
             if request["base_seq"] != current:
                 raise StaleStatus(latest[0] if latest is not None else None)
-            self._db.execute(
+            written = self._db.execute(
                 """
                 INSERT INTO status_events
                 (session, seq, status, reason, wake, note, excerpt, source_kind,
@@ -1888,12 +1902,12 @@ class Store:
                     int(request["explicit"]),
                     self.now(),
                 ),
-            )
+            ).lastrowid
             self._db.execute(
                 "UPDATE sessions SET status = ? WHERE id = ?",
                 (request["status"], session),
             )
-            self._mark_copy("status_events")
+            self._advance_copies("status_events", written)
             added = self._latest_status(session)
             assert added is not None
             return added[0]
@@ -2237,6 +2251,8 @@ class Store:
         with self._tx():
             session = self._require_session(key)
             sid = session["id"]
+            for table in _COPY_MARKS:
+                self._advance_copies(table)
             files = self._db.execute(
                 "SELECT id FROM files WHERE session = ?", (sid,)
             ).fetchall()
@@ -2269,8 +2285,10 @@ class Store:
             ).rowcount
             self._db.execute("DELETE FROM files WHERE session = ?", (sid,))
             self._db.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+            # `_advance_copies` ran at the start of this transaction, and a
+            # delete makes no copy stale.
             for table in _COPY_MARKS:
-                self._mark_copy(table)
+                self._set_mark(table)
             orphans = self._unreferenced(digests)
             self._record_purge(
                 f"session {key.account}/{key.harness}/{key.session_id}", reason

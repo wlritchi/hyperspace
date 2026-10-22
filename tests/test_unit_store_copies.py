@@ -163,3 +163,36 @@ def test_a_fresh_index_has_valid_marks(tmp_path: Path) -> None:
             "SELECT last_id FROM copy_marks WHERE events = 'metadata_events'"
         ).fetchone()
         assert row["last_id"] == 1
+
+
+@pytest.mark.parametrize("action", ["purge", "metadata", "status"])
+def test_a_write_beside_an_older_server_does_not_pass_its_events(
+    tmp_path: Path, action: str
+) -> None:
+    # A new admin script runs beside a server that was rolled back: its
+    # Store repairs at start, then the older server writes, then the script
+    # writes or purges, which moves the marks.
+    data = tmp_path / "data"
+    with closing(Store(data)) as store:
+        for sid in ("a", "b", "c"):
+            store.add_metadata(key(sid), LAPTOP, {"title": sid})
+            status(store, sid, "working")
+    with closing(Store(data)) as store:
+        with closing(old_server(data)) as db:
+            old_metadata(db, "a", {"automation": "security-review"})
+            old_status(db, "a", 2, "done")
+        if action == "purge":
+            store.purge_session(key("b"), "test")
+        elif action == "metadata":
+            store.add_metadata(key("c"), LAPTOP, {"title": "c again"})
+        else:
+            status(store, "c", "waiting")
+        # The write made the copies of the older server's events current in
+        # the tables whose marks it moved.
+        if action != "status":
+            assert "a" not in ids(store, top_level=True)
+        if action != "metadata":
+            assert ids(store, statuses={"done"}) == ["a"]
+    with closing(Store(data)) as store:
+        assert "a" not in ids(store, top_level=True)
+        assert ids(store, statuses={"done"}) == ["a"]
