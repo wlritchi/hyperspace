@@ -310,6 +310,60 @@ and links to other sessions. The server stores each metadata update as an
 event and shows the latest one. The server does not need to parse the harness
 format, and list filters still work.
 
+### Child sessions
+
+A _child session_ is a session that a tool starts for the work of another
+session, its _parent_. Its metadata has `links.parent = <parent sid>`, next to
+`continued_in` and `forked_from`. A session that a tool started, with or
+without a known parent, also has `automation`: the name of the tool. Lists
+show only the _top-level_ sessions (no parent and no `automation`) when the
+client asks for them, and `hyperspace show <sid>` lists the children of a
+session.
+
+The first child sessions are the reviews of the official `security-guidance`
+plugin. Its hooks review the change of a session (at the end of a turn, and
+after a commit or a push) with the Python Agent SDK, in two passes. Each pass
+is a separate Claude Code session in the project directory of the reviewed
+checkout. The SDK starts them with no settings, so no Hyperspace hook runs in
+them, and nothing in their transcripts names the reviewed session. The Claude
+Code adapter knows them by their first prompt: its records have
+`entrypoint: "sdk-py"`, and the text starts with
+`Review this change for security vulnerabilities.` (the first pass, with a
+list of changed files and a diff) or with
+`You previously flagged these candidate vulnerabilities` (the second pass,
+with the same diff). The paths of the changed files are relative to the
+review's `cwd`. These reviews get `automation: "security-review"`.
+
+The parent of a review is the session on this host that changed the files of
+the review with an edit tool (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`,
+also in a subagent) in the 12 hours before the review started. Of these
+sessions, the parent changed the most of the review's files, and of those, it
+changed one of them last. If two sessions are equal (for example a session and
+its fork, which has a copy of the same records), or no session matches (for
+example, a change made with shell commands, or the changes of a commit made
+earlier), the review has no parent. It still has `automation`, so lists of
+top-level sessions do not show it. The second pass gets its parent the same
+way, from the paths of its diff: both passes review the same change, so both
+are children of the same session, and no record ties the second pass to the
+first pass.
+
+On a local sample of about 1,000 reviews, 70% got a parent, 2% were equal
+matches, and most of the others reviewed files that no session changed with an
+edit tool.
+
+The client finds child sessions in the sweep, before it syncs the sessions. It
+reads the first prompt of each session once. For the new reviews, it reads the
+edits of the transcripts that changed in the window, and of each of these only
+the end that covers the window. It searches for the parent of a review only
+once. A review that the server already has, for example from an older client,
+gets its new metadata in the same sweep, for at most 200 sessions in each
+sweep. Thus the reviews on a host get their links at the first sweeps after
+the host gets the new client.
+
+If subagents and child sessions are ever made into one model, subagents will
+change toward the model of the parent link, and not the reverse. This release
+does not change subagents.
+
 ## Teleport
 
 ### Leases
@@ -731,26 +785,26 @@ returns only `ok`, with no version or other details. Request bodies of file
 data use `Content-Encoding: zstd`. One request carries at most 8 MiB of
 uncompressed data. The client splits larger appends.
 
-| Method and path                                               | Scope            | Purpose                                                                                                                                                                                                      |
-| ------------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET /whoami`                                                 | any              | Account, host, and scopes of the credential                                                                                                                                                                  |
-| `PUT /hosts/self`                                             | `append`         | Register or update the host's kind and attributes                                                                                                                                                            |
-| `PUT /hosts/self/heartbeat`                                   | `append`         | Replace the live sessions of one config directory of the host (see the session status spec)                                                                                                                  |
-| `GET /hosts`, `GET /workspaces`                               | `read`           | List hosts and workspaces                                                                                                                                                                                    |
-| `GET /sessions?harness=&host=&workspace=&since=&title=`       | `read`           | List readable sessions with their latest metadata and placement, newest first. Status filters: `status=`, `open=1`, `lease_host=`, `liveness=`. Pages: `limit=`, `cursor=` (the `next` of the previous page) |
-| `GET /sessions/{harness}/{sid}`                               | `read`           | Manifest: metadata, placements, files, generation tree, heads, blob versions                                                                                                                                 |
-| `POST /sessions/{harness}/{sid}/meta`                         | `append`         | Add a metadata event                                                                                                                                                                                         |
-| `GET /sessions/{harness}/{sid}/state`                         | `read`           | Lease holder, state (`normal` or `conflicted`), branches, status, and liveness. Small, for hooks                                                                                                             |
-| `POST /sessions/{harness}/{sid}/status`                       | `append`         | Add a status event, if `base_seq` is the latest seq. `409 stale_status` otherwise. Needs read access to the session                                                                                          |
-| `POST /sessions/{harness}/{sid}/lease/surrender`              | `append`         | Surrender the caller's lease, optionally reserved for a named host. `409` if the caller does not hold it                                                                                                     |
-| `POST /sessions/{harness}/{sid}/teleports`                    | `read`, `append` | Take the lease for the caller's host and record a teleport. `409` if the session is conflicted, or a different host holds the lease (unless `steal` is set)                                                  |
-| `POST /sessions/{harness}/{sid}/forks`                        | `read`, `append` | Fork a branch; the server returns the new session id                                                                                                                                                         |
-| `POST /sessions/{harness}/{sid}/generations`                  | `append`         | Create a generation of a log (`path`, `parent`, `fork_offset`, `cause`)                                                                                                                                      |
-| `POST /sessions/{harness}/{sid}/generations/{gen}/append`     | `append`         | Append (see "Append protocol")                                                                                                                                                                               |
-| `GET /sessions/{harness}/{sid}/generations/{gen}?start=&end=` | `read`           | Read the content, including the inherited prefix                                                                                                                                                             |
-| `PUT /sessions/{harness}/{sid}/blobs/{path}`                  | `append`         | Add a blob version (sha256 in a header; no-op if it is the latest version)                                                                                                                                   |
-| `GET /sessions/{harness}/{sid}/blobs/{path}?version=`         | `read`           | Read a blob version                                                                                                                                                                                          |
-| `POST /sessions/{harness}/{sid}/grants`                       | `grant`          | Let another host read this session                                                                                                                                                                           |
+| Method and path                                               | Scope            | Purpose                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------- | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /whoami`                                                 | any              | Account, host, and scopes of the credential                                                                                                                                                                                                      |
+| `PUT /hosts/self`                                             | `append`         | Register or update the host's kind and attributes                                                                                                                                                                                                |
+| `PUT /hosts/self/heartbeat`                                   | `append`         | Replace the live sessions of one config directory of the host (see the session status spec)                                                                                                                                                      |
+| `GET /hosts`, `GET /workspaces`                               | `read`           | List hosts and workspaces                                                                                                                                                                                                                        |
+| `GET /sessions?harness=&host=&workspace=&since=&title=`       | `read`           | List readable sessions with their latest metadata and placement, newest first. Status filters: `status=`, `open=1`, `lease_host=`, `liveness=`. Pages: `limit=`, `cursor=` (the `next` of the previous page). Children: `top_level=1`, `parent=` |
+| `GET /sessions/{harness}/{sid}`                               | `read`           | Manifest: metadata, placements, files, generation tree, heads, blob versions                                                                                                                                                                     |
+| `POST /sessions/{harness}/{sid}/meta`                         | `append`         | Add a metadata event                                                                                                                                                                                                                             |
+| `GET /sessions/{harness}/{sid}/state`                         | `read`           | Lease holder, state (`normal` or `conflicted`), branches, status, and liveness. Small, for hooks                                                                                                                                                 |
+| `POST /sessions/{harness}/{sid}/status`                       | `append`         | Add a status event, if `base_seq` is the latest seq. `409 stale_status` otherwise. Needs read access to the session                                                                                                                              |
+| `POST /sessions/{harness}/{sid}/lease/surrender`              | `append`         | Surrender the caller's lease, optionally reserved for a named host. `409` if the caller does not hold it                                                                                                                                         |
+| `POST /sessions/{harness}/{sid}/teleports`                    | `read`, `append` | Take the lease for the caller's host and record a teleport. `409` if the session is conflicted, or a different host holds the lease (unless `steal` is set)                                                                                      |
+| `POST /sessions/{harness}/{sid}/forks`                        | `read`, `append` | Fork a branch; the server returns the new session id                                                                                                                                                                                             |
+| `POST /sessions/{harness}/{sid}/generations`                  | `append`         | Create a generation of a log (`path`, `parent`, `fork_offset`, `cause`)                                                                                                                                                                          |
+| `POST /sessions/{harness}/{sid}/generations/{gen}/append`     | `append`         | Append (see "Append protocol")                                                                                                                                                                                                                   |
+| `GET /sessions/{harness}/{sid}/generations/{gen}?start=&end=` | `read`           | Read the content, including the inherited prefix                                                                                                                                                                                                 |
+| `PUT /sessions/{harness}/{sid}/blobs/{path}`                  | `append`         | Add a blob version (sha256 in a header; no-op if it is the latest version)                                                                                                                                                                       |
+| `GET /sessions/{harness}/{sid}/blobs/{path}?version=`         | `read`           | Read a blob version                                                                                                                                                                                                                              |
+| `POST /sessions/{harness}/{sid}/grants`                       | `grant`          | Let another host read this session                                                                                                                                                                                                               |
 
 ### Compatible protocol extensions
 
@@ -780,6 +834,16 @@ cursor is opaque to the client, and a cursor that the server cannot read gives
 `400 bad_request`. Without the `title` and `liveness` filters, a response has
 `next` only if more sessions follow; with them, the last page can be empty.
 The response was already a JSON object, so an old client ignores `next`.
+
+The server also advertises `child-sessions`. `GET /sessions` then takes
+`top_level=1`, which keeps only the sessions with no `links.parent` and no
+`automation` in their latest metadata, and `parent=<sid>`, which keeps the
+children of a session. Without these parameters, the list has every session,
+as for an old client. An old server ignores them, so the client sends them
+only to a server with the capability. The server keeps a copy of
+`links.parent`, and whether the session is top-level, in the session row, and
+updates them with each metadata event. Indexes cover both filters. The server
+reads only the metadata, never the transcript.
 
 The list order is the time of the last activity (or the creation time, for a
 session with no activity), newest first, then the harness and the session id.
@@ -1080,7 +1144,10 @@ the first request. The CLI then gives the message
 launcher tries again at its next tick.
 
 `hyperspace ls` shows one page (`--limit`, default 50). `ls --all-pages` reads
-every page, with `--limit` as the page size (default 1000).
+every page, with `--limit` as the page size (default 1000). With a server that
+has `child-sessions`, `ls` shows only top-level sessions (`top_level=1`), and
+`ls --all` shows every session. The internal lists above do not hide child
+sessions.
 
 ### Checkpoint scheduling
 

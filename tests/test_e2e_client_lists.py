@@ -301,6 +301,8 @@ def test_refresh_states_reads_every_page(
     requests = list_requests(server)
     assert refresh_states(ctx, fake.adapter) == 3
     assert len(requests) == 3
+    # The internal lists do not hide child sessions.
+    assert all("top_level" not in r.url.params for r in requests)
     for sid in sids:
         assert ctx.state.session(HARNESS, sid).lease_host == "laptop"
 
@@ -327,4 +329,5 @@ def test_restore_held_reads_every_page(
         assert fresh.adapter.find_transcripts(sid)
     # The list asks only for the sessions whose lease this host holds.
     assert {r.url.params.get("lease_host") for r in requests} == {"agent-1"}
+    assert all("top_level" not in r.url.params for r in requests)
     assert len(requests) == 3
