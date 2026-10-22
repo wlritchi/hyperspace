@@ -759,7 +759,16 @@ $HYPERSPACE_DATA_DIR/
   its latest metadata event. The write of a status or metadata event updates
   the copy in the same transaction. The session list filters and sorts in SQL
   with these copies, and reads the other data only for the sessions that it
-  returns. The event tables stay the source of truth.
+  returns. The event tables stay the source of truth. The copies are also the
+  parent link and the top-level state (see "Child sessions").
+- A server before these copies writes events and does not update them, for
+  example after a rollback. Thus the server keeps a mark of the newest status
+  event and the newest metadata event, which each write of an event sets in
+  the same transaction. At start, the server fills the copies again for the
+  sessions with events above the mark. If the event of the mark is gone or is
+  a different event (SQLite can give the id of a deleted row again), it fills
+  the copies of all sessions. A purge sets the marks to the newest remaining
+  events.
 - Write order: append the frame, `fsync`, then commit the index row. At
   startup, the server truncates each generation file to the end of its last
   committed frame. This removes only bytes that no index row refers to.
