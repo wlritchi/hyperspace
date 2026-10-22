@@ -139,6 +139,22 @@ def test_a_repeated_cursor_stops_the_pass() -> None:
     assert calls[1].url.params.get("cursor") == "same"
 
 
+def test_a_pass_stops_after_the_most_pages(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    calls: list[httpx.Request] = []
+
+    def endless(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"sessions": [], "next": str(len(calls))})
+
+    monkeypatch.setattr(api_mod, "MAX_PAGES", 5)
+    api = mock_api(endless, [CAP_LIST_CURSOR])
+    assert list(api.all_sessions()) == []
+    assert len(calls) == 5
+    assert "stopped after 5 pages" in caplog.text
+
+
 def test_an_empty_page_with_a_cursor_does_not_stop_the_pass() -> None:
     # With the title filter, a page can be empty and the list not at its end.
     pages = {

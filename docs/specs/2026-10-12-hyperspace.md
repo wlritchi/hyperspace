@@ -1066,7 +1066,8 @@ server that advertises `list-cursor`, because an older server ignores the
 parameter and gives the first page again. To an older server, the client sends
 one request for 1000 sessions, the most that it gives. The client also stops
 at a page with no `next`, or with a `next` that an earlier page gave. Thus a
-pass cannot loop.
+pass cannot loop on an older server. As a last limit, a pass stops with a
+warning after 10,000 pages.
 
 A server with slow storage can need much more time for a list than for other
 requests. Thus a list request has a read timeout of 120 s, and other requests
