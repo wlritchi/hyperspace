@@ -30,7 +30,14 @@ from hyperspace_client.credentials import CredentialError
 from hyperspace_client.hooks import handle, notices
 from hyperspace_client.notices import after_sync, refresh_states
 from hyperspace_client.state import State
-from hyperspace_client.status import clean_note, printable, queue, seq, write
+from hyperspace_client.status import (
+    clean_note,
+    end_continued,
+    printable,
+    queue,
+    seq,
+    write,
+)
 from hyperspace_client.sync import Context, Syncer, register_host
 from hyperspace_client.teleport import (
     TeleportError,
@@ -145,6 +152,10 @@ def _sync_one(
     result = Syncer(ctx, session, workspace).run()
     if isinstance(ctx.adapter, ClaudeCode):
         after_sync(ctx, ctx.adapter, session)
+        # The copy of a session in a background job can come after the sync
+        # of the session's link to the job, or before it. Thus the syncs of
+        # both check.
+        end_continued(ctx, ctx.adapter, session.session_id)
     if result.uploaded:
         log.info(
             "%s: uploaded %d bytes in %d files",

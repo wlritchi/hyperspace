@@ -40,6 +40,7 @@ from hyperspace_client.cli import (
     _hook_heartbeat,
     _request,
     _sweep,
+    _sync_one,
     _target,
     _targets,
     set_status,
@@ -423,13 +424,16 @@ def job_dir(fake: FakeClaude, short: str, **state: Any) -> Path:
     return directory
 
 
-def add_status(ctx: Context, sid: str, status: str, kind: str = "user") -> Any:
+def add_status(
+    ctx: Context, sid: str, status: str, kind: str = "user", **more: Any
+) -> Any:
     current = ctx.api.state(H, sid).get("status")
     body: dict[str, Any] = {
         "status": status,
         "source_kind": kind,
         "explicit": kind != "hook",
         "base_seq": current["seq"] if current else 0,
+        **more,
     }
     return ctx.api.add_status(H, sid, body)  # pyright: ignore[reportArgumentType]
 
@@ -855,6 +859,164 @@ def test_a_job_before_the_copy_of_its_session_acts_on_none(
     assert _current(ctx.state) == j.stem
     sync(ctx, s)
     assert _current(ctx.state) == j.stem
+
+
+# --- Sessions that continued in a job that copied them ------------------------------
+
+
+def sync_one(ctx: Context, transcript: Path, tmp_path: Path) -> None:
+    """A checkpoint or sweep sync of one session, with its checks after the
+    sync."""
+    session = ctx.adapter.session_for_transcript(transcript)
+    assert session is not None
+    with ctx.state.try_lock(H, session.session_id) as locked:
+        assert locked
+        _sync_one(Config(host="laptop", state_dir=tmp_path / "state"), ctx, session, WS)
+
+
+def status_of(ctx: Context, sid: str) -> Any:
+    return ctx.api.state(H, sid).get("status")
+
+
+def background_before_copy(
+    ctx: Context, fake: FakeClaude, tmp_path: Path
+) -> tuple[Path, Path]:
+    """`/background` in a session S that is `ready`: S gets a `continued-in`
+    record with J and ends, and the job J starts with no conversation in
+    J.jsonl. The sync at the end of S sends the link."""
+    s, j = fake.transcript(WS), fake.transcript(WS)
+    fake.write(s, {**prompt("investigate", cwd=WS), "sessionId": s.stem})
+    sync(ctx, s)
+    event = add_status(ctx, s.stem, "ready", kind="hook", reason="idle")
+    ctx.state.save_status(H, s.stem, event, None)
+    fake.write(
+        s,
+        {"type": "continued-in", "continuedInSessionId": j.stem, "sessionId": s.stem},
+    )
+    fake.write(j, *stub_records(j.stem))
+    job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=j.stem)
+    sync_one(ctx, s, tmp_path)
+    return s, j
+
+
+def copy(fake: FakeClaude, j: Path) -> None:
+    fake.write(j, {**prompt("investigate", cwd=WS), "sessionId": j.stem})
+
+
+def test_a_session_that_a_job_copied_is_done_after_the_copy(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
+) -> None:
+    s, j = background_before_copy(ctx, fake, tmp_path)
+    before = status_of(ctx, s.stem)
+    launcher(ctx, fake).tick()
+    sync_one(ctx, s, tmp_path)
+    assert status_of(ctx, s.stem) == before
+    # Before the copy, the hooks of the job can act on S. The sync did not
+    # send this write yet.
+    want = {"status": "working", "source_kind": "hook", "explicit": False}
+    ctx.state.want_status(H, s.stem, want)
+    copy(fake, j)
+    sync_one(ctx, j, tmp_path)
+    event = status_of(ctx, s.stem)
+    assert (event["status"], event["note"]) == ("done", f"continued in {j.stem}")
+    assert (event["source"]["kind"], event["explicit"]) == ("hook", False)
+    assert event["seq"] == before["seq"] + 1
+    # The done replaced the queued write of the job from before the copy.
+    assert ctx.state.wanted_status(H, s.stem) is None
+    assert ctx.state.session(H, s.stem).status == event
+    # No agent runs in S, so the done gives no notice.
+    assert not ctx.state.has_notice(H, s.stem, "status")
+    for sid in (s.stem, j.stem):
+        assert not ctx.state.notice_flag(sid).exists()
+    # The client writes the done once. A reopen of S stays.
+    add_status(ctx, s.stem, "ready", reason="idle")
+    reopened = status_of(ctx, s.stem)
+    for t in (s, j):
+        sync_one(ctx, t, tmp_path)
+    launcher(ctx, fake).tick()
+    assert status_of(ctx, s.stem) == reopened
+
+
+def test_a_link_that_is_synced_after_the_copy_also_marks_the_session_done(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
+) -> None:
+    s, j = copied_job(fake)
+    job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=j.stem)
+    # The job syncs before the link of S is synced.
+    sync_one(ctx, j, tmp_path)
+    assert ctx.state.wanted_status(H, s.stem) is None
+    sync_one(ctx, s, tmp_path)
+    assert status_of(ctx, s.stem)["status"] == "done"
+
+
+def test_the_launcher_marks_the_session_done_after_the_copy(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
+) -> None:
+    # The job is idle after the copy, so that no sync of it comes.
+    s, j = background_before_copy(ctx, fake, tmp_path)
+    copy(fake, j)
+    sync(ctx, j)
+    launcher(ctx, fake).tick()
+    assert status_of(ctx, s.stem)["status"] == "done"
+
+
+def test_a_session_that_a_job_of_the_older_shape_writes_stays_open(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
+) -> None:
+    s, j = background_job(fake)
+    job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=j.stem)
+    sync_one(ctx, s, tmp_path)
+    add_status(ctx, s.stem, "working", kind="hook")
+    for t in (s, j):
+        sync_one(ctx, t, tmp_path)
+    launcher(ctx, fake).tick()
+    assert status_of(ctx, s.stem)["status"] == "working"
+
+
+def test_a_session_that_is_done_gets_no_second_done(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
+) -> None:
+    s, j = background_before_copy(ctx, fake, tmp_path)
+    add_status(ctx, s.stem, "done")
+    done = status_of(ctx, s.stem)
+    copy(fake, j)
+    sync_one(ctx, j, tmp_path)
+    assert status_of(ctx, s.stem) == done
+
+
+@pytest.mark.parametrize("has_state", [True, False])
+def test_a_job_that_resumes_another_session_or_has_no_state_leaves_it_open(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path, has_state: bool
+) -> None:
+    s, j = background_before_copy(ctx, fake, tmp_path)
+    before = status_of(ctx, s.stem)
+    if has_state:
+        other = str(uuid.uuid4())
+        job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=other)
+    else:
+        (fake.root / "jobs" / "aa" / "state.json").unlink()
+    copy(fake, j)
+    for t in (j, s):
+        sync_one(ctx, t, tmp_path)
+    launcher(ctx, fake).tick()
+    assert status_of(ctx, s.stem) == before
+
+
+@needs_proc
+def test_a_session_whose_own_process_runs_stays_open(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
+) -> None:
+    s, j = background_before_copy(ctx, fake, tmp_path)
+    copy(fake, j)
+    # A process under the id of S, for example `claude --resume S`.
+    register(fake, sessionId=s.stem)
+    sync_one(ctx, j, tmp_path)
+    assert status_of(ctx, s.stem)["status"] == "ready"
+    # The process of the job does not make S run for this check.
+    register(fake, sessionId=j.stem, jobId="aa")
+    assert fake.adapter.is_running(s.stem)
+    sync_one(ctx, j, tmp_path)
+    assert status_of(ctx, s.stem)["status"] == "done"
 
 
 # --- Jobs whose session is not known ------------------------------------------------

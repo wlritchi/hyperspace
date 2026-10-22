@@ -1202,6 +1202,35 @@ session). Tests: `test_a_job_that_copied_its_session_acts_on_its_own_id`,
 `test_a_done_job_that_copied_its_session_closes`,
 `test_a_job_before_the_copy_of_its_session_acts_on_none`.
 
+- **Sessions that continued in a copy**: after the copy, S gets no more
+  records, but it stayed on the open list with its last status, next to J.
+  `status.end_continued` marks S `done` with the note `continued in <J>`. It
+  takes the pairs (S, J) from `State.continued_from`, and acts only if exactly
+  one job has the own id J and its `Job.session_id` is J (J has a
+  conversation, and `resumeSessionId` is absent or J), if
+  `ClaudeCode.own_process_runs(S)` is false (`is_running` counts the process
+  of J), if S's local transcript has the `continued-in` record with J
+  (`ClaudeCode.continued_in`), and if the known status of S (queue, else
+  record) is not `done`. A job with no state does not mark S: a foreground
+  `claude --resume J` of a stub of the older shape also gives J a
+  conversation. The write goes into S's queue (it replaces a write of a hook
+  of J from before the copy) with the base of the saved event, and
+  `send_wanted` sends it at once. It is `source_kind` `hook` and not explicit,
+  so it gives no done notice, and a prompt or `hyperspace reopen` reopens S as
+  usual. The state key `continued_done:<harness>:<S>` holds J after the
+  decision, also when S was already `done`, so the client never writes it
+  again for the same J. Triggers: `_sync_one` after the sync of S or of J
+  (with the sync lock of the synced session, and `try_lock` for S), and
+  `Launcher.sweep` at each tick, for a job that is idle after the copy. Before
+  the copy, J has no conversation, so no trigger marks S while the hooks of J
+  can still act on S. Tests:
+  `test_a_session_that_a_job_copied_is_done_after_the_copy`,
+  `test_a_link_that_is_synced_after_the_copy_also_marks_the_session_done`,
+  `test_the_launcher_marks_the_session_done_after_the_copy`,
+  `test_a_session_that_a_job_of_the_older_shape_writes_stays_open`,
+  `test_a_session_that_is_done_gets_no_second_done`,
+  `test_a_job_that_resumes_another_session_or_has_no_state_leaves_it_open`,
+  `test_a_session_whose_own_process_runs_stays_open`.
 - **Liveness**: `ClaudeCode.live_processes` gives each live process the ids
   that `is_running` accepts: the registry id, the ids in its job's state, and
   the sessions that continued in the registry id. `State.continued_from` gives
