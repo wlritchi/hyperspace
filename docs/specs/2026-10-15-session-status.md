@@ -245,19 +245,28 @@ If the file or the field is missing, the adapter writes `ready`, reason
 `idle`. A foreground session has no `inFlight`, so only an agent declaration
 can set `waiting` there (A2).
 
-When the user sends a foreground session S to the background, Claude Code
-makes a job, and stops the Monitors of the session. The job can have its own
-id J, and continue to write the transcript of S (main spec, "Background
-jobs"). Then the job's state has `sessionId` J and can have `resumeSessionId`
-S, and S's transcript has a `continued-in` record with J. Some jobs have the
-same id as their session. It is not confirmed which ids Claude Code puts in
-the live-session registry, in the hook payloads, and in
-`CLAUDE_CODE_SESSION_ID` of such a job. Thus the client does not guess. The
+When the user sends a foreground session S to the background (`/background`),
+Claude Code makes a job, and stops the Monitors of the session. The job can
+have its own id J (main spec, "Background jobs"). A live check with Claude
+Code 2.1.301 showed this shape: Claude Code copies the conversation of S into
+a new transcript J.jsonl, with J as the `sessionId` of each record, writes a
+`continued-in` record with J into S's transcript, and ends S. The job's state
+has `sessionId` J and `resumeSessionId` J. Its `sessions/<pid>.json` has
+`sessionId` J and a `jobId` that is the name of the job's directory. Its hook
+payloads have `session_id` J and `transcript_path` J.jsonl, and
+`CLAUDE_CODE_SESSION_ID` is J in the hooks and in the shell tool. Just after
+the job starts, J.jsonl holds no conversation; the copy comes some seconds
+later. An older shape also exists: J.jsonl holds only title records or is
+absent, the job continues to write the transcript of S, and the job's state
+can have `resumeSessionId` S. Some jobs have the same id as their session. The
 candidates for the session of a job are:
 
-- J, if J has a local transcript with a conversation;
-- `resumeSessionId`, if the job's state has it and it is not J;
-- each session whose synced metadata says that it continued in J.
+- only J, if J has a local transcript with a conversation and the job's state
+  has no `resumeSessionId` or has J as its `resumeSessionId`. The sessions
+  that continued in J do not count: they are the sources of the copy.
+- Else: J, if J has a local transcript with a conversation; `resumeSessionId`,
+  if the job's state has it and it is not J; and each session whose synced
+  metadata says that it continued in J.
 
 With exactly one candidate, that is the session of the job: the hooks, the
 status and the `inFlight` hint of the job are for it. With no candidate or
@@ -267,6 +276,11 @@ id gives no candidates. The synced metadata keeps only the last `continued-in`
 link of a session, so a missing link does not show that the job writes J. A
 new job whose transcript has no conversation yet has no candidate, so its
 hooks write no status until the first prompt is in the transcript.
+
+Before the copy, a job that `/background` made looks like a job of the older
+shape. If the `continued-in` link of S is already synced then, the session of
+the job is S until the copy comes. Usually the link is not synced yet, so the
+job's first hooks write no status.
 
 Only the job that runs a process changes the id of that process: its
 `CLAUDE_JOB_DIR` names the job, the job's state names the id, and a
@@ -405,19 +419,19 @@ synced metadata again, just before they run `claude rm`. They act only on
 in each heartbeat, until the job goes away or its state file changes.
 
 Only a job whose session is beyond doubt closes automatically. That is a job
-with its own id J (`sessionId` in its state) for which all of these are true:
+with its own id J (`sessionId` in its state) for which both of these are true:
 
 - J has a local transcript with a conversation;
-- the job's state has no `resumeSessionId`, or its `resumeSessionId` is J;
-- the synced metadata of no other session says that it continued in J.
+- the job's state has no `resumeSessionId`, or its `resumeSessionId` is J.
 
-Then J is the one candidate (see "Transitions"), and the triggers decide on
-the status of J. Every other job is never closed automatically: a job under
-its own id that writes another session, a job whose session is not known, and
-a job whose own id has a conversation while another session is also a
-candidate (for example after a foreground `claude --resume J`). While such a
-job does not run, the sweep records it on J and on each candidate, with one of
-these reasons:
+Then J is the one candidate (see "Transitions"), also if the synced metadata
+of another session says that it continued in J, and the triggers decide on the
+status of J. This includes a job that `/background` made. Every other job is
+never closed automatically: a job under its own id that writes another
+session, a job whose session is not known, and a job whose own id has a
+conversation while its state resumes another session. While such a job does
+not run, the sweep records it on J and on each candidate, with one of these
+reasons:
 
 - `job <short> writes another session; close it yourself` (one candidate,
   which is not J);
@@ -431,10 +445,9 @@ the earlier candidates. The user closes such a job with `claude rm`.
 
 This is a limit of the current client: a `done` job that writes another
 session must be closed by hand, also when its session is clear from the job's
-state, for example a session that the user sent to the background, or a job
-that `claude --bg --resume <sid>` started under a new id. When live checks
-confirm which ids Claude Code gives such a job (see "Resolved questions"), the
-client can close it automatically.
+state, for example a job of the older shape that writes the session that the
+user sent to the background, or a job that `claude --bg --resume <sid>`
+started under a new id.
 
 ## Launcher
 
@@ -693,12 +706,14 @@ A heartbeat applies only to the credential's own host.
 
 - `CLAUDE_CODE_SESSION_ID` is set in the shell tool's environment of every
   Claude Code session, foreground and background.
-- Open: in a background job under its own id J that writes a session S, it is
-  not known whether `CLAUDE_CODE_SESSION_ID`, the hook payloads and the
-  live-session registry hold J or S. The client acts on S only when S is the
-  one candidate (see "Transitions"). It never closes such a job automatically
-  (see "Closing a done session"), so until live checks confirm the ids, the
-  user closes a `done` job that writes another session by hand.
+- In a job that `/background` makes with Claude Code 2.1.301,
+  `CLAUDE_CODE_SESSION_ID`, the hook payloads and the live-session registry
+  hold the job's own id J, and the job writes J.jsonl, which has a copy of the
+  conversation (see "Transitions"). Such a job closes automatically. For a job
+  of the older shape, which writes the transcript of a session S, the ids are
+  not confirmed. The client acts on S only when S is the one candidate, and it
+  never closes such a job automatically (see "Closing a done session"): the
+  user closes it by hand.
 - A launcher resumes a session as a background job with
   `claude --bg --resume <sid>`, in the session's workspace. Claude Code then
   continues the session under the same id. If the session already runs, Claude

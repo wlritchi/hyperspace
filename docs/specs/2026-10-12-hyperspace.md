@@ -115,12 +115,16 @@ They control the design.
   in `~/.claude/jobs/<job id>/state.json`, with `sessionId` and
   `resumeSessionId`.
 - **Background jobs.** When Claude Code 2.1.301 sends a session S to the
-  background, it can give the job a new id J. It writes a `continued-in`
-  record with J into S's transcript, and a transcript `J.jsonl` that holds
-  only title records (`ai-title`, `agent-name`). The job then continues to
-  write its conversation into S's transcript. Thus a live process can register
-  under J while it writes S, and `claude --resume J` finds no conversation.
-  Some jobs use the same id as their session; the client must handle both.
+  background (`/background`), it can give the job a new id J, and it writes a
+  `continued-in` record with J into S's transcript. Two shapes exist. In the
+  shape that a live check confirmed, Claude Code copies S's conversation into
+  a new transcript `J.jsonl`, with J as the `sessionId` of each record, and
+  ends S; the job continues in `J.jsonl`, which has no conversation for the
+  first seconds. In an older shape, `J.jsonl` holds only title records
+  (`ai-title`, `agent-name`) or is absent, and the job continues to write its
+  conversation into S's transcript. Thus a live process can register under J
+  while it writes S, and `claude --resume J` finds no conversation. Some jobs
+  use the same id as their session; the client must handle each shape.
 - **Hook output is part of the transcript.** Claude Code writes the output of
   a SessionStart hook into the transcript as an `attachment` record of type
   `hook_success`, and gives it to the model. A synchronous SessionStart hook
@@ -210,8 +214,8 @@ than one session, and a session can leave its first workspace.
   Claude Code makes a new id for `--fork-session`, `/branch` and `/clear`, and
   for some background jobs; the adapter records these links (`forkedFrom`,
   `continued-in`) as metadata. A `continued-in` link does not always mean that
-  the old transcript stopped: a background job continues to write it (see
-  "Background jobs").
+  the old transcript stopped: a background job of the older shape continues to
+  write it (see "Background jobs").
 - **Stub.** A transcript of at most 64 KiB whose records only name the session
   (`ai-title`, `agent-name`, `custom-title`). The client does not start the
   backup of a stub: its backup starts when it gets any other record. A restore

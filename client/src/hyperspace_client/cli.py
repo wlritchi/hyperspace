@@ -135,9 +135,11 @@ def _sync_one(
     if ctx.state.cursor(
         session.transcript, ctx.api.cache_identity
     ) is None and ctx.adapter.is_stub(session):
-        # For example, the id of a background job, whose conversation is in
-        # the transcript of the session that it continues. The backup
-        # starts when the transcript gets a conversation record.
+        # For example, the id of a background job. Its transcript has no
+        # conversation until Claude Code copies one into it. In an older job
+        # shape, the conversation stays in the transcript of the session
+        # that the job continues. The backup starts when the transcript gets
+        # a conversation record.
         log.info("%s: no conversation; not backed up", session.session_id)
         return
     result = Syncer(ctx, session, workspace).run()

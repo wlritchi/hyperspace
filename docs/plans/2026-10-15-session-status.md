@@ -497,32 +497,47 @@ script with no directory listing. For the cases that the script misses, see
 ### Facts to confirm with Claude Code
 
 Unit tests use recorded payloads. These facts need one live check each,
-recorded in the test module docstring, before the step is done:
+recorded in the test module docstring, before the step is done. The user
+confirmed all eleven live with Claude Code 2.1.301 on 2026-10-22; the result
+of each check follows the fact.
 
 1. A turn that a cron (CronCreate or `/loop`) starts fires `UserPromptSubmit`.
    If not, such a turn sets no `working` status, and a `done` session does not
    reopen on a cron (U5 then needs a different trigger; note it in the spec).
+   Confirmed: a cron turn fires `UserPromptSubmit` with the cron prompt.
 2. The `Notification` payload for a permission prompt has
-   `notification_type: "permission_prompt"`.
+   `notification_type: "permission_prompt"`. Confirmed: a permission prompt
+   and AskUserQuestion fire `Notification` with `permission_prompt`, and an
+   idle session fires it with `idle_prompt`.
 3. `PreToolUse` and `PostToolUse` fire for `AskUserQuestion`, and
-   `PostToolUse` fires after the user answers.
-4. A hook process has `CLAUDE_JOB_DIR` in a background job.
+   `PostToolUse` fires after the user answers. Confirmed.
+4. A hook process has `CLAUDE_JOB_DIR` in a background job. Confirmed.
 5. A synchronous `PostToolUse` hook's `additionalContext` reaches the model.
+   Confirmed.
 6. A hook process has `CLAUDE_CODE_SESSION_ID`. `notice.sh` uses it for its
-   fast path.
+   fast path. Confirmed.
 7. Claude Code lists the plugin's `/done` command and both skills. Prettier
    wraps their `description` over several lines, which is valid YAML.
+   Confirmed.
 8. In a background job with its own id J that writes the transcript of S (send
    a foreground session to the background), the `sessionId` in the job's
-   `sessions/<pid>.json` is J or S.
+   `sessions/<pid>.json` is J or S. Confirmed for a job that `/background`
+   makes, with a different shape: it is J, and the job does not write S.
+   Claude Code copies the conversation of S into a new transcript J.jsonl,
+   with J as the `sessionId` of each record, writes a `continued-in` record
+   with J into S's transcript, and ends S (SessionEnd). The job's state has
+   `sessionId` J and `resumeSessionId` J. J.jsonl has no conversation for the
+   first seconds of the job, so the sync of the job's first hooks logged "no
+   conversation; not backed up".
 9. In such a job, the hook payloads have `session_id` J or S, and
-   `transcript_path` J.jsonl or S.jsonl.
+   `transcript_path` J.jsonl or S.jsonl. Confirmed: `session_id` J and
+   `transcript_path` J.jsonl.
 10. In such a job, `CLAUDE_CODE_SESSION_ID` in the hook and shell tool
     environments is J or S, and `CLAUDE_JOB_DIR` is set in the shell tool
-    environment.
+    environment. Confirmed: J in both.
 11. The `sessions/<pid>.json` of a background job has `jobId` with the name of
     the job's directory, and its `pid` is the hook's or the shell tool's
-    parent process, or a parent of that process.
+    parent process, or a parent of that process. Confirmed.
 
 Live checks use the real `~/.claude`, because the Claude Code credentials are
 there. Follow the memory note on the live test hazard: use a throwaway server,
@@ -544,15 +559,14 @@ assumptions 1 to 3 are in `status.transition`:
   with wake `local`.
 - Fact 6: without `CLAUDE_CODE_SESSION_ID`, `notice.sh` runs the CLI when any
   session has a flag, and the CLI reads the session from the hook's JSON.
-- Facts 8 to 10: the client handles both answers (see "Jobs under their own
-  id" below).
+- Facts 8 to 10: the client handles the shape that the live check found and
+  the older shape (see "Jobs under their own id" below).
 - Fact 11: if it is false, or if the record has no `procStart`,
   `ClaudeCode.current_job` finds no job. Then the CLI and the hooks of a job
   under its own id act on J. No job closes on the wrong session, because only
   a job whose session is J closes.
 
-These eleven checks are open. The user does them, because they need live
-Claude Code sessions.
+The user did these eleven checks, because they need live Claude Code sessions.
 
 ### Step 2 as built
 
@@ -1161,19 +1175,36 @@ without it.
 ### Jobs under their own id
 
 Claude Code 2.1.301 can give a job its own id J when the user sends a session
-S to the background, while the job writes S's transcript (main spec,
-"Background jobs"). The job's state has `sessionId` J and can have
-`resumeSessionId` S; S's transcript has a `continued-in` record with J. Facts
-8 to 10 are open, so the client does not guess which id a job writes.
+S to the background (main spec, "Background jobs"); S's transcript then has a
+`continued-in` record with J. The live checks of facts 8 to 11 found the shape
+of `/background`: the job writes J.jsonl, which gets a copy of S's
+conversation some seconds after the job starts, and the registry, the hook
+payloads and `CLAUDE_CODE_SESSION_ID` hold J. Its state has `sessionId` and
+`resumeSessionId` J. In an older shape, J.jsonl is a stub or absent and the
+job writes S's transcript; its state can have `resumeSessionId` S. The ids of
+the older shape are not confirmed, so the client does not guess there.
 
-`ClaudeCode.writes` gives the candidates: J if it has a local transcript with
-a conversation, `resumeSessionId` if it is not J, and the sessions that
-continued in J (from `State.continued_from`). A `resumeSessionId` that is not
-a session id gives no candidates. With exactly one candidate, that is the
-session of the job. With none or more than one, the session is not known: the
-metadata keeps only the last `continued-in` link of each session, so a stale
-or missing link cannot show which session the job writes. The client then acts
-on nothing that it would have to guess.
+`ClaudeCode.writes` gives the candidates. If J has a local transcript with a
+conversation and `resumeSessionId` is absent or J, the only candidate is J:
+the sessions that continued in J are the sources of the copy. Else the
+candidates are J if it has a conversation, `resumeSessionId` if it is not J,
+and the sessions that continued in J (from `State.continued_from`). A
+`resumeSessionId` that is not a session id gives no candidates. With exactly
+one candidate, that is the session of the job. With none or more than one, the
+session is not known: the metadata keeps only the last `continued-in` link of
+each session, so a stale or missing link cannot show which session the job
+writes. The client then acts on nothing that it would have to guess.
+
+Before the copy, a job of the `/background` shape looks like a job of the
+older shape. If S's link is already synced then, the session of the job is S
+until the copy comes. Live, the first hooks of the job ran before S's link was
+synced, so they wrote no status. Before this rule, a job with a copy had two
+candidates (J and S) as soon as S's link was synced, so its hooks wrote no
+status and the job never closed (`close_blocked` said
+`the session of job <short> is not known`, or that it can write more than one
+session). Tests: `test_a_job_that_copied_its_session_acts_on_its_own_id`,
+`test_a_done_job_that_copied_its_session_closes`,
+`test_a_job_before_the_copy_of_its_session_acts_on_none`.
 
 - **Liveness**: `ClaudeCode.live_processes` gives each live process the ids
   that `is_running` accepts: the registry id, the ids in its job's state, and
@@ -1188,13 +1219,15 @@ on nothing that it would have to guess.
   `test_the_runner_does_not_resume_a_session_that_a_job_writes`.
 - **Close**: only a job whose session is beyond doubt closes automatically.
   `Job.candidates` holds the candidates, and `Job.session_id` is J only when
-  the candidates are exactly J: J has a conversation, `resumeSessionId` is
-  absent or J, and no synced metadata of another session has `continued_in` J.
-  Every other job is never removed automatically: a job that writes another
-  session, a job whose session is not known, and a job whose own id has a
-  conversation while another session is also a candidate (a foreground
-  `claude --resume J` while the job wrote S). While such a job is not live,
-  the sweep records it in the `unclosed` list on J and on each candidate, with
+  the candidates are exactly J: J has a conversation, and `resumeSessionId` is
+  absent or J. A job that `/background` made is such a job. Every other job is
+  never removed automatically: a job that writes another session, a job whose
+  session is not known, and a job whose own id has a conversation while its
+  state resumes another session (a foreground `claude --resume J` while the
+  job wrote S). A synced `continued_in` link to J no longer stops the close of
+  a job whose own id has a conversation, because the job of a copy has such a
+  link. While such a job is not live, the sweep records it in the `unclosed`
+  list on J and on each candidate, with
   `job <short> writes another session; close it yourself`,
   `job <short> can write more than one session; close it yourself`, or
   `the session of job <short> is not known; close it yourself`. These entries
@@ -1209,18 +1242,17 @@ on nothing that it would have to guess.
   a job no longer closes. Tests:
   `test_only_a_job_that_writes_its_own_id_closes`,
   `test_a_job_whose_own_id_has_a_competing_conversation_is_not_closed`,
-  `test_a_link_to_the_job_during_the_close_keeps_the_job`,
+  `test_a_change_of_the_job_state_during_the_close_keeps_the_job`,
+  `test_a_done_job_that_copied_its_session_closes`,
   `test_a_job_that_more_than_one_session_continued_in_is_not_closed`,
   `test_a_job_with_no_mapping_to_its_session_is_not_closed`,
   `test_a_job_with_a_stale_mapping_to_its_session_is_not_closed`,
   `test_a_failed_close_replaces_the_old_reason`, and in
   `test_unit_client_hooks.py`, `test_session_end_closes_a_done_job`.
 - **Limit**: a `done` job that writes another session must be closed by hand
-  (`claude rm <short>`), also when its state names that session, until the
-  live checks of facts 8 to 10 confirm the id shapes. This includes a session
-  that the user sent to the background, and a runner job that
-  `claude --bg --resume <sid>` started under a new id. `docs/deploy.md` says
-  so.
+  (`claude rm <short>`), also when its state names that session. This includes
+  a job of the older shape, and a runner job that `claude --bg --resume <sid>`
+  started under a new id. `docs/deploy.md` says so.
 - **Backfill**: `select` skips a stub (`no conversation`), and each id that a
   live process covers. Test:
   `test_backfill_skips_stubs_and_the_sessions_of_live_jobs`.
@@ -1246,8 +1278,8 @@ on nothing that it would have to guess.
   status at its first prompt. The CLI and the hooks use this one rule.
   `status`, `done`, `reopen` and `tail` with no session id, `set_status`, and
   the backfill turn's self-only check use it. In a job, the hooks use it too,
-  so the sync, the status and the `inFlight` hint are for S also if the
-  payload names J. Tests:
+  so in a job of the older shape, the sync, the status and the `inFlight` hint
+  are for S also if the payload names J. Tests:
   `test_the_cli_acts_on_the_session_that_a_job_writes`,
   `test_the_hooks_of_a_job_under_its_own_id_act_on_its_session`,
   `test_a_foreground_resume_of_a_stub_is_its_own_session`,

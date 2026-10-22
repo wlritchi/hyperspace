@@ -1,8 +1,9 @@
 # vim: filetype=python
 """Session status on the client: transitions, the write queue, and the
 adapter's status helpers. These use recorded hook payloads. The facts about
-Claude Code that need a live check are in "Facts to confirm with Claude
-Code" in the plan (docs/plans/2026-10-15-session-status.md)."""
+Claude Code that these depend on are in "Facts to confirm with Claude Code"
+in the plan (docs/plans/2026-10-15-session-status.md). The user confirmed
+each of them live with Claude Code 2.1.301 on 2026-10-22."""
 
 from __future__ import annotations
 
