@@ -336,16 +336,18 @@ review's `cwd`. These reviews get `automation: "security-review"`.
 
 The parent of a review is the session on this host that changed the files of
 the review with an edit tool (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`,
-also in a subagent) in the 12 hours before the review started. Of these
-sessions, the parent changed the most of the review's files, and of those, it
-changed one of them last. If two sessions are equal (for example a session and
-its fork, which has a copy of the same records), or no session matches (for
-example, a change made with shell commands, or the changes of a commit made
-earlier), the review has no parent. It still has `automation`, so lists of
-top-level sessions do not show it. The second pass gets its parent the same
-way, from the paths of its diff: both passes review the same change, so both
-are children of the same session, and no record ties the second pass to the
-first pass.
+also in a subagent) in the 12 hours before the review started. Only a call
+whose tool result is not an error counts: a failed edit, an edit that the user
+rejected, and an edit that a permission check or a hook refused do not. Of
+these sessions, the parent changed the most of the review's files, and of
+those, it changed one of them last. If two sessions are equal (for example a
+session and its fork, which has a copy of the same records), or no session
+matches (for example, a change made with shell commands, or the changes of a
+commit made earlier), the review has no parent. It still has `automation`, so
+lists of top-level sessions do not show it. The second pass gets its parent
+the same way, from the paths of its diff: both passes review the same change,
+so both are children of the same session, and no record ties the second pass
+to the first pass.
 
 The client finds child sessions in the sweep, before it syncs the sessions. It
 reads the first prompt of each session once. For the new reviews, it reads the

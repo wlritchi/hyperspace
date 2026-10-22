@@ -15,7 +15,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -380,6 +380,44 @@ def _lines_since(path: Path, since: float) -> Iterator[bytes]:
                 yield line
 
 
+def _edits_in(
+    lines: Iterable[bytes], since: float, until: float, session_id: str
+) -> list[Edit]:
+    """The file changes in the lines of one transcript: the edit tool calls
+    from `since` to `until` whose tool result comes later in the lines and
+    is not an error. A failed edit, an edit that the user rejected, and an
+    edit that a permission check or a hook refused all have `is_error`. A
+    call with no result (interrupted) does not count."""
+    calls: dict[str, tuple[str, float]] = {}
+    out: list[Edit] = []
+    for line in lines:
+        if b'"tool_use"' not in line and b'"tool_result"' not in line:
+            continue
+        record = _parse(line)
+        if record is None:
+            continue
+        when = _time(record.get("timestamp"))
+        for block in _blocks(record):
+            kind = block.get("type")
+            if kind == "tool_result":
+                call = calls.pop(str(block.get("tool_use_id")), None)
+                if call is not None and block.get("is_error") is not True:
+                    out.append(Edit(call[0], call[1], session_id))
+                continue
+            field = _EDIT_TOOLS.get(str(block.get("name")))
+            raw: Any = block.get("input")
+            if kind != "tool_use" or field is None or not isinstance(raw, dict):
+                continue
+            if record.get("type") != "assistant":
+                continue
+            if when is None or not since <= when <= until:
+                continue
+            target: Any = raw.get(field)  # pyright: ignore[reportUnknownMemberType]
+            if isinstance(target, str) and os.path.isabs(target):
+                calls[str(block.get("id"))] = (os.path.normpath(target), when)
+    return out
+
+
 def is_prompt(record: dict[str, Any]) -> bool:
     """True for a user record that is a prompt: not a tool result, not a
     meta record, not a compaction summary."""
@@ -655,8 +693,9 @@ class ClaudeCode:
     def edits(self, since: float, until: float) -> list[Edit]:
         """The file changes with an edit tool, from the time `since` to
         `until`, in the transcripts on this host: of the main agents and of
-        their subagents. A transcript that did not change after `since` is
-        not read, and of the others only the end (see `_lines_since`)."""
+        their subagents (see `_edits_in`). A transcript that did not change
+        after `since` is not read, and of the others only the end (see
+        `_lines_since`)."""
         out: list[Edit] = []
         for session in self.discover():
             paths = [session.transcript]
@@ -670,27 +709,7 @@ class ClaudeCode:
                     lines = list(_lines_since(path, since))
                 except OSError:
                     continue
-                for line in lines:
-                    if b'"tool_use"' not in line:
-                        continue
-                    record = _parse(line)
-                    if record is None or record.get("type") != "assistant":
-                        continue
-                    when = _time(record.get("timestamp"))
-                    if when is None or not since <= when <= until:
-                        continue
-                    for block in _blocks(record):
-                        field = _EDIT_TOOLS.get(str(block.get("name")))
-                        raw: Any = block.get("input")
-                        if block.get("type") != "tool_use" or field is None:
-                            continue
-                        if not isinstance(raw, dict):
-                            continue
-                        target: Any = raw.get(field)  # pyright: ignore[reportUnknownMemberType]
-                        if isinstance(target, str) and os.path.isabs(target):
-                            out.append(
-                                Edit(os.path.normpath(target), when, session.session_id)
-                            )
+                out += _edits_in(lines, since, until, session.session_id)
         return out
 
     def is_stub(self, session: LocalSession) -> bool:

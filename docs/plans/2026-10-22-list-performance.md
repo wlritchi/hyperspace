@@ -211,9 +211,11 @@ Done. As built:
   `=== DIFF: <path> ===` headers, relative to the review's `cwd`).
   `ClaudeCode.edits` gives the `Edit`, `MultiEdit`, `Write` and `NotebookEdit`
   calls of the main transcripts and of their subagent transcripts in a time
-  window. It reads only transcripts that changed in the window, and of each
-  only the end: it goes back from the end in steps of 1 MiB that double until
-  a record is older than the window.
+  window, each with a later tool result that is not an error (`is_error`):
+  failed, rejected, refused and interrupted calls do not count. It reads only
+  transcripts that changed in the window, and of each only the end: it goes
+  back from the end in steps of 1 MiB that double until a record is older than
+  the window.
 - `children.link_children` runs in the sweep before the syncs. It reads the
   first prompt of each session once (`_classified` in the client metadata),
   searches for the parent of each new review once (`_parent_checked`), with
