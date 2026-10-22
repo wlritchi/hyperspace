@@ -201,6 +201,15 @@ session works. The next automatic write from the session (`working` or
 `ready`) fails with `409`. The client reads the `done` event and its source,
 and tells the agent (A3). The work does not overwrite the mark (U4).
 
+A new write from the client replaces a queued write that is not sent yet (see
+"Transitions"). A sync can send the queued write while a hook decides the new
+write on top of it, so the new write can have the base from before the queued
+write. Thus the new write also tries again once on the event of a write that
+it replaced, and only on that event: an event after its base, from this host,
+with the same status, reason, wake kind, note, source kind and `explicit`. An
+automatic write still does not overwrite a `done` or an explicit status from a
+different writer.
+
 ### Transitions
 
 The adapter maps harness events to status writes. For Claude Code:

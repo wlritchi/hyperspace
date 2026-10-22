@@ -14,7 +14,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -50,6 +50,23 @@ STATUS_EVENTS = frozenset(
 # A queued write with this key gets the excerpt of the agent's last message
 # when the sync sends it, so that the excerpt includes the whole message.
 WITH_EXCERPT = "_excerpt"
+# A queued write has this key when it replaced earlier queued writes. The
+# value lists the request fields of those writes, newest first. A sync can
+# send a replaced write while a hook queues the new one. The new write then
+# retries on the event of the replaced write (see `write`).
+REPLACED = "_replaced"
+_MAX_REPLACED = 4
+_REQUEST_FIELDS = (
+    "status",
+    "reason",
+    "wake",
+    "note",
+    "explicit",
+    "source_kind",
+    "source_session",
+)
+# The keys of a queued write that the request does not include.
+_QUEUE_KEYS = (WITH_EXCERPT, "base_seq", REPLACED)
 _ASK_TOOL = "AskUserQuestion"
 _PERMISSION_PROMPT = "permission_prompt"
 _NO_CAPABILITY_LOG = 86_400
@@ -69,7 +86,10 @@ class Known:
 
 
 def known(state: State, record: SessionRecord) -> Known:
-    queued = state.wanted_status(record.harness, record.session_id)
+    return _known(record, state.wanted_status(record.harness, record.session_id))
+
+
+def _known(record: SessionRecord, queued: tuple[dict[str, Any], float] | None) -> Known:
     latest: dict[str, Any] | None = queued[0] if queued else record.status
     if latest is None:
         return Known(None, None, record.declared)
@@ -170,9 +190,13 @@ def on_hook(
     payload: dict[str, Any],
 ) -> None:
     """Queue the status write that a hook event causes."""
+    # Read the queue before the record. A sync saves the event of a queued
+    # write before it removes the write from the queue, so a write that is
+    # not in the queue is in the record.
+    queued = state.wanted_status(harness, session_id)
     record = state.session(harness, session_id)
     in_flight = adapter.in_flight() if event == "Stop" else 0
-    want = transition(event, payload, known(state, record), in_flight)
+    want = transition(event, payload, _known(record, queued), in_flight)
     # An explicit declaration applies to one turn.
     if event in ("Stop", "UserPromptSubmit") and record.declared is not None:
         state.set_declared(harness, session_id, None)
@@ -180,11 +204,31 @@ def on_hook(
         # The write is based on what the hook saw, not on what the sync sees
         # when it sends the write later.
         want["base_seq"] = seq(record.status)
-        state.want_status(harness, session_id, want)
+        queue(state, harness, session_id, want, queued)
         if event == "UserPromptSubmit" and want["explicit"]:
             # The prompt reopens a done session. A done notice that the agent
             # did not get is not true now.
             state.drop_notices(harness, session_id, "status")
+
+
+def queue(
+    state: State,
+    harness: str,
+    session_id: str,
+    want: dict[str, Any],
+    queued: tuple[dict[str, Any], float] | None,
+) -> None:
+    """Queue `want` in place of `queued`, the queued write that the caller
+    read before it read the record for the base of `want`. `want` keeps the
+    request fields of `queued` (see `REPLACED`)."""
+    if queued is not None:
+        old = queued[0]
+        replaced: list[Any] = [{k: old[k] for k in _REQUEST_FIELDS if k in old}]
+        earlier = old.get(REPLACED)
+        if isinstance(earlier, list):
+            replaced += cast(list[Any], earlier)
+        want[REPLACED] = replaced[:_MAX_REPLACED]
+    state.want_status(harness, session_id, want)
 
 
 # --- Status events from the server ---------------------------------------------------
@@ -269,6 +313,35 @@ def same(event: Mapping[str, object], request: Mapping[str, object]) -> bool:
     return all(event.get(k) == request.get(k) for k in ("status", "reason", "wake"))
 
 
+def _became(event: StatusEvent, replaced: object, host: str) -> bool:
+    """True if `event` can be the event of the replaced queued write
+    `replaced`: the same request fields, from this host."""
+    if not isinstance(replaced, Mapping):
+        return False
+    fields = cast(Mapping[str, object], replaced)
+    source = event["source"]
+    return (
+        same(event, fields)
+        and event.get("note") == fields.get("note")
+        and event["explicit"] == fields.get("explicit")
+        and source["kind"] == fields.get("source_kind")
+        and source["host"] == host
+        and source.get("session_id") == fields.get("source_session")
+    )
+
+
+def _of_replaced(
+    current: StatusEvent | None, base: int, replaced: Sequence[object], host: str
+) -> bool:
+    """True if `current` is newer than `base` and is the event of one of the
+    queued writes that the write replaced."""
+    return (
+        current is not None
+        and seq(current) > base
+        and any(_became(current, r, host) for r in replaced)
+    )
+
+
 def _may_retry(request: dict[str, Any], current: StatusEvent | None, host: str) -> bool:
     """Whether a write tries again on the new base `current`. An automatic
     write tries again only over an automatic write of this host, which a
@@ -296,12 +369,15 @@ def write(
     base: int,
     record: SessionRecord | None = None,
     notify: bool = False,
+    replaced: Sequence[object] = (),
 ) -> StatusEvent | None:
     """Send a status write with the base `base`. Return the new event, the
     current event if it already has the wanted status, or None if the write
     was dropped. With `record`, save the events that the client learns.
     With `notify`, the new event can give the session a notice: the write
-    comes from outside the session."""
+    comes from outside the session. `replaced` holds the queued writes that
+    this write replaced. The write also tries again on an event after `base`
+    that is one of them, because the write was decided on top of it."""
     for attempt in range(2):
         body = cast(StatusRequest, {**request, "base_seq": base})
         try:
@@ -312,7 +388,10 @@ def write(
                 observe(ctx.state, record, current, ctx.host)
             if current is not None and same(current, request):
                 return current
-            if attempt or not _may_retry(request, current, ctx.host):
+            if attempt or not (
+                _may_retry(request, current, ctx.host)
+                or _of_replaced(current, base, replaced, ctx.host)
+            ):
                 log.info(
                     "%s: status %s not written: %s",
                     session_id,
@@ -351,7 +430,7 @@ def send_wanted(ctx: Context, session: LocalSession) -> None:
     try:
         if not supported(ctx):
             return
-        request = {k: v for k, v in body.items() if k not in (WITH_EXCERPT, "base_seq")}
+        request = {k: v for k, v in body.items() if k not in _QUEUE_KEYS}
         if body.get(WITH_EXCERPT) and isinstance(ctx.adapter, ClaudeCode):
             excerpt = ctx.adapter.excerpt(session.transcript)
             if excerpt:
@@ -360,7 +439,16 @@ def send_wanted(ctx: Context, session: LocalSession) -> None:
         base = body.get("base_seq")
         if not isinstance(base, int):
             base = seq(record.status)
-        write(ctx, h, sid, request, base, record)
+        replaced = body.get(REPLACED)
+        write(
+            ctx,
+            h,
+            sid,
+            request,
+            base,
+            record,
+            replaced=cast(list[object], replaced) if isinstance(replaced, list) else (),
+        )
     except NotFound:
         # The server does not have the session yet: keep the write.
         return
