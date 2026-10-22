@@ -41,6 +41,13 @@ server:
   bytesPerDay: ""  # bytes per credential; empty for the default
   failedAuthPerMinute: ""
   globalFailedAuthPerMinute: ""
+  # SQLite connections for reads, and the page cache of each, in bytes. The
+  # page caches use at most 128 MiB (the writer) plus readConnections *
+  # readCacheBytes. Empty for the defaults (8 connections of 16 MiB).
+  readConnections: ""
+  readCacheBytes: ""
+  # Requests that take longer are logged at INFO. Empty for the default (1).
+  slowRequestSeconds: ""
 
 # Secrets with read-only accounts files, for credentials that another system
 # makes (for example, a provisioner). Each key that ends in .toml is an

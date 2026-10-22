@@ -41,7 +41,11 @@ def main() -> None:
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     settings = Settings.from_env()
-    store = Store(settings.data_dir)
+    store = Store(
+        settings.data_dir,
+        read_connections=settings.read_connections,
+        read_cache_bytes=settings.read_cache_bytes,
+    )
     cut = store.recover()
     if cut:
         logging.getLogger("hyperspace").warning(

@@ -5,8 +5,11 @@ The store implements the model in the spec: sessions, log files as trees of
 generations, blob versions, placements, leases, conflicts, recovery forks,
 grants, metadata events, and the read audit. It never parses file content.
 
-All public methods are safe to call from more than one thread. Writes take
-one lock, so there is one writer at a time.
+All public methods are safe to call from more than one thread. Writes use
+one connection behind one lock, so there is one writer at a time. Reads that
+do not write use a pool of read connections and do not take that lock: in WAL
+mode, each read transaction sees the last committed snapshot of the index
+while the writer writes.
 """
 
 from __future__ import annotations
@@ -17,8 +20,11 @@ import json
 import secrets
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -256,6 +262,54 @@ _MIGRATIONS: list[str] = [
 # A heartbeat expires after this many of its intervals.
 HEARTBEAT_EXPIRY = 3
 
+# The page cache of the writer connection.
+WRITE_CACHE_BYTES = 128 * 1024**2
+# The defaults for the pool of read connections. The server gets its values
+# from its settings. Each read connection has its own page cache, so the
+# caches of the pool use at most READ_CONNECTIONS * READ_CACHE_BYTES.
+READ_CONNECTIONS = 8
+READ_CACHE_BYTES = 16 * 1024**2
+# The admin scripts open the same index while the server runs, so a
+# connection waits for their locks.
+_BUSY_TIMEOUT_MS = 10000
+
+
+@dataclass
+class Waits:
+    """The time in seconds that the store calls of one context waited for
+    the writer connection and for a read connection."""
+
+    writer: float = 0.0
+    reader: float = 0.0
+
+
+_waits: ContextVar[Waits | None] = ContextVar("hyperspace_store_waits", default=None)
+
+
+@contextmanager
+def track_waits() -> Iterator[Waits]:
+    """Add the waits of the store calls in this context to one `Waits`.
+
+    A worker thread of `run_in_threadpool` runs in a copy of the context. The
+    copy refers to the same `Waits`, so the waits in that thread count too.
+    """
+    waits = Waits()
+    token = _waits.set(waits)
+    try:
+        yield waits
+    finally:
+        _waits.reset(token)
+
+
+def _add_wait(writer: bool, seconds: float) -> None:
+    waits = _waits.get()
+    if waits is None:
+        return
+    if writer:
+        waits.writer += seconds
+    else:
+        waits.reader += seconds
+
 
 class StoreError(Exception):
     """A request that the store refuses. `code` is a short machine name."""
@@ -356,18 +410,92 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_urlsafe(12)}"
 
 
-def _locked[**P, R](
+def _reading[**P, R](
     method: Callable[Concatenate[Store, P], R],
 ) -> Callable[Concatenate[Store, P], R]:
-    """Run a read method under the store lock. All threads share one SQLite
-    connection, so a read must not run in the middle of a write."""
+    """Run a read method in one read transaction (see `Store._read`)."""
 
     @functools.wraps(method)
     def wrapper(self: Store, *args: P.args, **kwargs: P.kwargs) -> R:
-        with self._lock:
+        with self._read():
             return method(self, *args, **kwargs)
 
     return wrapper
+
+
+class _ReadPool:
+    """Read-only connections to the index, for reads that do not write.
+
+    The pool opens a connection when a read needs one, and keeps at most
+    `size` connections. When all of them are in use, a read waits for one.
+    Thus the page caches of the pool use at most `size` * `cache_bytes`.
+    """
+
+    def __init__(self, path: Path, size: int, cache_bytes: int) -> None:
+        if size < 1:
+            raise ValueError("the read pool needs at least one connection")
+        if cache_bytes < 0:
+            raise ValueError("the read cache size must not be negative")
+        self._path = path
+        self._size = size
+        self._cache_kib = cache_bytes // 1024
+        self._idle: list[sqlite3.Connection] = []
+        self._open = 0
+        self._closed = False
+        self._cond = threading.Condition()
+
+    def _connect(self) -> sqlite3.Connection:
+        db = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            # A negative size is in KiB.
+            db.execute(f"PRAGMA cache_size = {-self._cache_kib}")
+            # A read path must never write. With this setting, a write fails.
+            db.execute("PRAGMA query_only = ON")
+        except BaseException:
+            db.close()
+            raise
+        return db
+
+    def acquire(self) -> sqlite3.Connection:
+        with self._cond:
+            while True:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("the store is closed")
+                if self._idle:
+                    # The connection that was used last has the warmest cache.
+                    return self._idle.pop()
+                if self._open < self._size:
+                    self._open += 1
+                    break
+                self._cond.wait()
+        try:
+            return self._connect()
+        except BaseException:
+            with self._cond:
+                self._open -= 1
+                self._cond.notify()
+            raise
+
+    def release(self, db: sqlite3.Connection, reuse: bool) -> None:
+        with self._cond:
+            if reuse and not self._closed:
+                self._idle.append(db)
+                self._cond.notify()
+                return
+            self._open -= 1
+            self._cond.notify()
+        db.close()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            idle, self._idle = self._idle, []
+            self._open -= len(idle)
+            self._cond.notify_all()
+        for db in idle:
+            db.close()
 
 
 class Store:
@@ -375,33 +503,46 @@ class Store:
         self,
         data_dir: Path,
         clock: Callable[[], datetime] | None = None,
+        read_connections: int = READ_CONNECTIONS,
+        read_cache_bytes: int = READ_CACHE_BYTES,
     ) -> None:
         self.data_dir = data_dir
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
+        # `db` is the connection of the current transaction of the thread.
+        self._local = threading.local()
         data_dir.mkdir(parents=True, exist_ok=True)
         self.logs_dir = data_dir / "logs"
         self.objects = ObjectStore(data_dir / "objects")
-        self._db = sqlite3.connect(
-            data_dir / "index.sqlite3",
-            check_same_thread=False,
-            isolation_level=None,
+        path = data_dir / "index.sqlite3"
+        self._writer = sqlite3.connect(
+            path, check_same_thread=False, isolation_level=None
         )
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode = WAL")
-        self._db.execute("PRAGMA foreign_keys = ON")
-        self._db.execute("PRAGMA synchronous = FULL")
-        # The admin scripts open the same index while the server runs.
-        self._db.execute("PRAGMA busy_timeout = 10000")
+        self._writer.row_factory = sqlite3.Row
+        self._writer.execute("PRAGMA journal_mode = WAL")
+        self._writer.execute("PRAGMA foreign_keys = ON")
+        self._writer.execute("PRAGMA synchronous = FULL")
+        self._writer.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        # A negative size is in KiB.
+        self._writer.execute(f"PRAGMA cache_size = {-(WRITE_CACHE_BYTES // 1024)}")
         self._migrate()
+        self._readers = _ReadPool(path, read_connections, read_cache_bytes)
         # Recovery (see `recover`) is not done here: only the server calls it,
         # at startup. An admin script that runs beside the server must not cut
         # a frame that the server is writing.
 
     # --- Infrastructure -------------------------------------------------
 
+    @property
+    def _db(self) -> sqlite3.Connection:
+        """The connection of the current transaction of this thread: a read
+        connection in `_read`, else the writer connection."""
+        db: sqlite3.Connection | None = getattr(self._local, "db", None)
+        return self._writer if db is None else db
+
     def close(self) -> None:
-        self._db.close()
+        self._readers.close()
+        self._writer.close()
 
     def now(self) -> str:
         return _iso(self._clock())
@@ -431,6 +572,36 @@ class Store:
 
     def _tx(self) -> _Transaction:
         return _Transaction(self)
+
+    @contextmanager
+    def _read(self) -> Iterator[None]:
+        """Run the body in one deferred read transaction on a read
+        connection, without the store lock. The body sees one committed
+        snapshot of the index, and a write in another thread or process does
+        not wait for it.
+
+        In a transaction of this thread, the body uses that transaction, so
+        that it sees the uncommitted writes of that transaction.
+        """
+        if getattr(self._local, "db", None) is not None:
+            yield
+            return
+        start = time.monotonic()
+        db = self._readers.acquire()
+        _add_wait(False, time.monotonic() - start)
+        self._local.db = db
+        try:
+            db.execute("BEGIN")
+            yield
+        finally:
+            self._local.db = None
+            reuse = True
+            try:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+            except sqlite3.Error:
+                reuse = False
+            self._readers.release(db, reuse)
 
     def recover(self) -> list[str]:
         """Cut generation files to the end of their last committed frame.
@@ -470,11 +641,11 @@ class Store:
                 """,
                 (account, name, json.dumps(info), now, now),
             )
-        record = self.get_host(account, name)
+            record = self.get_host(account, name)
         assert record is not None
         return record
 
-    @_locked
+    @_reading
     def get_host(self, account: str, name: str) -> HostRecord | None:
         row = self._db.execute(
             "SELECT * FROM hosts WHERE account = ? AND name = ?", (account, name)
@@ -483,7 +654,7 @@ class Store:
             return None
         return self._host_record(row)
 
-    @_locked
+    @_reading
     def list_hosts(self, account: str) -> list[HostRecord]:
         rows = self._db.execute(
             "SELECT * FROM hosts WHERE account = ? ORDER BY name", (account,)
@@ -528,7 +699,7 @@ class Store:
         assert row is not None
         return row
 
-    @_locked
+    @_reading
     def session_exists(self, key: SessionKey) -> bool:
         return self._session_row(key) is not None
 
@@ -552,8 +723,10 @@ class Store:
     ) -> T:
         """Authorize and use an existing session without a purge/recreate gap.
 
-        The database write lock also excludes admin processes. The process
-        RLock alone cannot protect the identity of a session row.
+        This runs in a write transaction. Use it for a write, and for a read
+        that writes an audit row. The database write lock also excludes admin
+        processes. The process RLock alone cannot protect the identity of a
+        session row.
         """
         with self._tx():
             session = self._require_session(key)
@@ -569,9 +742,32 @@ class Store:
                 self.audit_read(key, host, audit)
             return result
 
+    def read_authorized[T](
+        self,
+        key: SessionKey,
+        host: str,
+        scope: ReadScope,
+        operation: Callable[[], T],
+    ) -> T:
+        """Authorize and read an existing session in one read transaction.
+
+        `operation` must not write. The authorization and the read see the
+        same snapshot, so a purge and a new session with the same key cannot
+        come between them.
+        """
+        with self._read():
+            session = self._require_session(key)
+            if not self._can_read_row(session, host, scope):
+                raise NotFound("session")
+            return operation()
+
     def snapshot[T](self, operation: Callable[[], T]) -> T:
-        """Keep filtered collection reads in one cross-process snapshot."""
-        with self._tx():
+        """Keep filtered collection reads in one cross-process snapshot.
+
+        `operation` must not write. It runs in a read transaction, so it does
+        not stop writes.
+        """
+        with self._read():
             return operation()
 
     # --- Files ----------------------------------------------------------
@@ -620,6 +816,7 @@ class Store:
             raise NotFound("generation")
         return gen
 
+    @_reading
     def generation_path(self, key: SessionKey, generation: str) -> str:
         gen = self._gen_in_session(key, generation)
         row = self._db.execute(
@@ -792,7 +989,7 @@ class Store:
             state = self._session_state(session["id"])
         return self._gen_info(gen), state
 
-    @_locked
+    @_reading
     def read_log(
         self, key: SessionKey, generation: str, start: int, end: int | None
     ) -> bytes:
@@ -861,7 +1058,7 @@ class Store:
             ).fetchone()
         return self._blob_version(row)
 
-    @_locked
+    @_reading
     def read_blob(self, key: SessionKey, path: str, version: int | None) -> bytes:
         session = self._require_session(key)
         file = self._file_row(session["id"], path)
@@ -1389,7 +1586,7 @@ class Store:
             body["last_append"] = row["last_activity"]
         return body, latest[1] if latest is not None else None
 
-    @_locked
+    @_reading
     def session_state(self, key: SessionKey) -> SessionStateBody:
         return self._session_state(self._require_session(key)["id"])
 
@@ -1625,7 +1822,7 @@ class Store:
                 liveness["close_blocked"] = item["reason"]
         return liveness
 
-    @_locked
+    @_reading
     def status_counts(self, key: SessionKey) -> dict[str, int]:
         """The numbers of status events and liveness rows of a session."""
         session = self._require_session(key)["id"]
@@ -1700,7 +1897,7 @@ class Store:
                 (session["id"], host, granted_by, self.now()),
             )
 
-    @_locked
+    @_reading
     def can_read(self, key: SessionKey, host: str, scope: ReadScope) -> bool:
         session = self._session_row(key)
         if session is None:
@@ -1752,10 +1949,10 @@ class Store:
         return False
 
     def audit_read(self, key: SessionKey, host: str, what: str) -> None:
-        session = self._session_row(key)
-        if session is None:
-            return
         with self._tx():
+            session = self._session_row(key)
+            if session is None:
+                return
             self._db.execute(
                 "INSERT INTO read_audit "
                 "(ts, account, host, session, harness, session_id, what) "
@@ -1942,7 +2139,7 @@ class Store:
 
     # --- Manifest and lists ---------------------------------------------
 
-    @_locked
+    @_reading
     def manifest(self, key: SessionKey) -> Manifest:
         session = self._require_session(key)
         files: list[LogManifest | BlobManifest] = []
@@ -2026,7 +2223,7 @@ class Store:
         ).hexdigest()
         return manifest
 
-    @_locked
+    @_reading
     def list_sessions(
         self,
         account: str,
@@ -2105,7 +2302,7 @@ class Store:
                 break
         return out
 
-    @_locked
+    @_reading
     def list_workspaces(
         self, account: str, host: str, scope: ReadScope
     ) -> list[dict[str, str | int]]:
@@ -2151,28 +2348,43 @@ class Store:
 
 
 class _Transaction:
-    """`with store._tx():` runs the body in one write transaction."""
+    """`with store._tx():` runs the body in one write transaction on the
+    writer connection, under the store lock."""
 
     def __init__(self, store: Store) -> None:
         self._store = store
         self._depth_owner = False
+        self._outer: sqlite3.Connection | None = None
 
     def __enter__(self) -> None:
-        self._store._lock.acquire()
+        store = self._store
+        writer = store._writer
+        self._outer = getattr(store._local, "db", None)
+        if self._outer is not None and self._outer is not writer:
+            # The write would not be in the snapshot of the read. A read path
+            # that writes must use a write transaction from its start.
+            raise RuntimeError("a write transaction inside a read transaction")
+        start = time.monotonic()
+        store._lock.acquire()
         try:
-            if not self._store._db.in_transaction:
-                self._store._db.execute("BEGIN IMMEDIATE")
+            if not writer.in_transaction:
+                writer.execute("BEGIN IMMEDIATE")
                 self._depth_owner = True
         except BaseException:
-            self._store._lock.release()
+            store._lock.release()
             raise
+        finally:
+            _add_wait(True, time.monotonic() - start)
+        store._local.db = writer
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        store = self._store
         try:
             if self._depth_owner:
                 if exc_type is None:
-                    self._store._db.execute("COMMIT")
+                    store._writer.execute("COMMIT")
                 else:
-                    self._store._db.execute("ROLLBACK")
+                    store._writer.execute("ROLLBACK")
         finally:
-            self._store._lock.release()
+            store._local.db = self._outer
+            store._lock.release()

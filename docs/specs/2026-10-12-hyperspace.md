@@ -849,6 +849,9 @@ All the files have the same format, and the server merges them:
 | `HYPERSPACE_BYTES_PER_DAY`                 | 4 GiB per credential              |
 | `HYPERSPACE_FAILED_AUTH_PER_MINUTE`        | 30 per address (IPv6: /64)        |
 | `HYPERSPACE_GLOBAL_FAILED_AUTH_PER_MINUTE` | 1000 from all addresses           |
+| `HYPERSPACE_READ_CONNECTIONS`              | 8                                 |
+| `HYPERSPACE_READ_CACHE_BYTES`              | 16 MiB per read connection        |
+| `HYPERSPACE_SLOW_REQUEST_SECONDS`          | 1                                 |
 
 `HYPERSPACE_TRUSTED_PROXIES` lists the proxies whose `X-Forwarded-For` the
 server trusts. Behind a proxy that is not in the list, all clients have the
@@ -856,6 +859,26 @@ proxy's address, so they share one failed-auth limit; the server logs a
 warning when it sees this. Over a failed-auth limit, the server checks only
 credentials that authenticated from that address in the last day. The limits
 are in memory and reset when the server restarts.
+
+The server writes the index through one connection, behind one lock, with a
+page cache of 128 MiB. Requests that only read the index (lists, session
+state) use a pool of read connections, with no lock: in WAL mode, a read
+transaction sees the last committed snapshot, and a write does not wait for
+it. A read that writes an audit row (manifest, log and blob content) uses the
+writer connection, so that the read and its audit row are in one transaction.
+`HYPERSPACE_READ_CONNECTIONS` is the size of the pool; a read waits when all
+read connections are in use. Each read connection has a page cache of
+`HYPERSPACE_READ_CACHE_BYTES`. Thus the page caches use at most 128 MiB plus
+the product of the two settings (256 MiB with the defaults). SQLite empties
+the cache of a read connection at the start of a transaction if another
+connection wrote after its last transaction. Thus a read cache helps mostly in
+one request, and the writer's cache stays useful for longer.
+
+The server logs each request with its duration, and the time that it waited
+for the writer connection and for a read connection. A request that takes
+longer than `HYPERSPACE_SLOW_REQUEST_SECONDS` is logged at INFO, the others at
+DEBUG. The log has the method, the path, the status, and the host name of the
+credential, but no query string, header, or body.
 
 ## Security
 

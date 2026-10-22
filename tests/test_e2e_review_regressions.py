@@ -622,13 +622,21 @@ def test_existing_mutations_reauthorize_after_delayed_body(hosts, endpoint, body
 
 
 @pytest.mark.parametrize(
-    "suffix", ["", "/state", "/blobs/tool-results/private", "/generations/g_removed"]
+    "suffix,method",
+    [
+        ("", "existing_authorized"),
+        ("/state", "read_authorized"),
+        ("/blobs/tool-results/private", "existing_authorized"),
+        ("/generations/g_removed", "existing_authorized"),
+    ],
 )
-def test_existing_reads_reauthorize_at_transaction_entry(hosts, monkeypatch, suffix):
+def test_existing_reads_reauthorize_at_transaction_entry(
+    hosts, monkeypatch, suffix, method
+):
     server, _, _, _, b, t = hosts
     admin = Store(server.store.data_dir)
     key = SessionKey("default", H, t.stem)
-    original = server.store.existing_authorized
+    original = getattr(server.store, method)
 
     def interleave(*args, **kwargs):
         admin.purge_session(key, "test replacement")
@@ -641,7 +649,7 @@ def test_existing_reads_reauthorize_at_transaction_entry(hosts, monkeypatch, suf
         )
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(server.store, "existing_authorized", interleave)
+    monkeypatch.setattr(server.store, method, interleave)
     try:
         response = b.api._client.get(f"/sessions/{H}/{t.stem}" + suffix)
         assert response.status_code == 404
