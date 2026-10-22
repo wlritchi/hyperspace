@@ -25,11 +25,14 @@ CAP_WORKSPACE_UTF8 = "workspace-utf8"
 CAP_RESTORE_PRECONDITION = "restore-precondition"
 CAP_SESSION_STATUS = "session-status"
 CAP_LIVENESS = "liveness"
+# `GET /sessions` takes `cursor=` and returns `next` (see `SessionList`).
+CAP_LIST_CURSOR = "list-cursor"
 CAPABILITIES = [
     CAP_WORKSPACE_UTF8,
     CAP_RESTORE_PRECONDITION,
     CAP_SESSION_STATUS,
     CAP_LIVENESS,
+    CAP_LIST_CURSOR,
 ]
 
 # One request carries at most this much uncompressed file data. The client
@@ -530,6 +533,10 @@ class SessionSummary(TypedDict):
 
 class SessionList(TypedDict):
     sessions: list[SessionSummary]
+    # An opaque cursor for the next page: send it back as `cursor=`, with the
+    # same filters. Absent at the end of the list. Servers without the
+    # `list-cursor` capability never send it.
+    next: NotRequired[str]
 
 
 class SurrenderRequest(TypedDict):

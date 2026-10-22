@@ -1,7 +1,9 @@
 # vim: filetype=python
 """The HTTP API, in-process through the Starlette test client."""
 
+import base64
 import hashlib
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -133,6 +135,7 @@ def test_auth(env: Env) -> None:
             "restore-precondition",
             "session-status",
             "liveness",
+            "list-cursor",
         ],
     }
 
@@ -461,6 +464,65 @@ def test_list_status_takes_comma_separated_values(env: Env) -> None:
     for query in ("status=working,busy", "status=working,", "status="):
         r = env.client.get(f"/v1/sessions?{query}", headers=env.h("laptop"))
         assert r.status_code == 400, query
+
+
+def test_list_pages_with_a_cursor(env: Env) -> None:
+    capabilities = env.client.get("/v1/whoami", headers=env.h("laptop")).json()
+    assert "list-cursor" in capabilities["capabilities"]
+    sids = [f"s{n}" for n in range(5)]
+    for sid in sids:
+        r = env.client.post(
+            f"/v1/sessions/claude-code/{sid}/meta",
+            headers=env.h("laptop", WS_LAPTOP),
+            json={"title": sid},
+        )
+        assert r.status_code == 200, r.text
+    seen: list[str] = []
+    query = "/v1/sessions?limit=2&harness=claude-code"
+    for _ in range(10):
+        body = env.client.get(query, headers=env.h("laptop")).json()
+        seen += [s["session_id"] for s in body["sessions"]]
+        if "next" not in body:
+            break
+        assert set(body["next"]) <= set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        )
+        query = f"/v1/sessions?limit=2&harness=claude-code&cursor={body['next']}"
+    assert seen == sids[::-1]
+    # A page that ends the list exactly has no cursor.
+    body = env.client.get("/v1/sessions?limit=5", headers=env.h("laptop")).json()
+    assert len(body["sessions"]) == 5 and "next" not in body
+
+
+def _cursor(value: object) -> str:
+    raw = json.dumps(value).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "!!!",
+        "abc",
+        "A" * 2000,
+        base64.urlsafe_b64encode(b"\xff\xfe").decode(),
+        _cursor({}),
+        _cursor([2, "2026-10-13T00:00:00.000000Z", "claude-code", "s1"]),
+        _cursor([True, "2026-10-13T00:00:00.000000Z", "claude-code", "s1"]),
+        _cursor([1, "2026-10-13T00:00:00.000000Z", "claude-code"]),
+        _cursor([1, 5, "claude-code", "s1"]),
+        _cursor([1, "", "claude-code", "s1"]),
+        _cursor([1, "x" * 65, "claude-code", "s1"]),
+        _cursor([1, "2026-10-13T00:00:00.000000Z", "bad harness", "s1"]),
+        _cursor([1, "2026-10-13T00:00:00.000000Z", "claude-code", "../s1"]),
+    ],
+)
+def test_a_bad_cursor_is_a_bad_request(env: Env, cursor: str) -> None:
+    r = env.client.get(
+        "/v1/sessions", params={"cursor": cursor}, headers=env.h("laptop")
+    )
+    assert r.status_code == 400
+    assert r.json() == {"error": "bad_request", "detail": "invalid cursor"}
 
 
 def test_status_409_body(env: Env) -> None:

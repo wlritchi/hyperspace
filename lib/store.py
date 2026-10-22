@@ -311,12 +311,25 @@ _READABLE = """(
     ))
 )"""
 
-# The sort order of the session list. The index `sessions_recent` starts
-# with the same expression, so SQLite reads the rows in this order and sorts
-# only the rows that have the same time. The other columns of the index let
-# SQLite refuse a row for the status, lease, and harness filters, and for
-# read access, without a read of the table row.
-_RECENT = "COALESCE(s.last_activity, s.created) DESC, s.id DESC"
+# The sort key of the session list, and its order. The public key of the
+# session breaks ties, so that the order is total and a cursor does not show
+# row ids. The index `sessions_recent` starts with the same expression, so
+# SQLite reads the rows in this order and sorts only the rows that have the
+# same time. The other columns of the index let SQLite refuse a row for the
+# status, lease, and harness filters, and for read access, without a read of
+# the table row.
+_SORT_KEY = "COALESCE(s.last_activity, s.created)"
+_RECENT = f"{_SORT_KEY} DESC, s.harness DESC, s.session_id DESC"
+
+
+@dataclass(frozen=True)
+class ListPosition:
+    """The position of a session in the session list."""
+
+    sort_key: str
+    harness: str
+    session_id: str
+
 
 # A heartbeat expires after this many of its intervals.
 HEARTBEAT_EXPIRY = 3
@@ -2289,8 +2302,50 @@ class Store:
         lease_host: str | None = None,
         liveness: set[str] | None = None,
         limit: int = 200,
+        before: ListPosition | None = None,
     ) -> list[SessionSummary]:
-        """List readable sessions, newest first.
+        """List readable sessions, newest first. See `list_sessions_page`."""
+        return self.list_sessions_page(
+            account,
+            host,
+            scope,
+            harness=harness,
+            on_host=on_host,
+            workspace=workspace,
+            since=since,
+            title=title,
+            statuses=statuses,
+            open_only=open_only,
+            lease_host=lease_host,
+            liveness=liveness,
+            limit=limit,
+            before=before,
+        )[0]
+
+    @_reading
+    def list_sessions_page(
+        self,
+        account: str,
+        host: str,
+        scope: ReadScope,
+        harness: str | None = None,
+        on_host: str | None = None,
+        workspace: str | None = None,
+        since: str | None = None,
+        title: str | None = None,
+        statuses: set[str] | None = None,
+        open_only: bool = False,
+        lease_host: str | None = None,
+        liveness: set[str] | None = None,
+        limit: int = 200,
+        before: ListPosition | None = None,
+    ) -> tuple[list[SessionSummary], ListPosition | None]:
+        """List readable sessions, newest first, after the position `before`.
+
+        Return the sessions and the position of the last one, or None for the
+        position if the list has no more sessions. Without the `title` and
+        `liveness` filters, the position is None exactly at the end of the
+        list. With them, the next page can be empty.
 
         `statuses` and `liveness` can contain `none`, which matches a session
         with no status event or with no liveness. `open_only` keeps the
@@ -2304,11 +2359,20 @@ class Store:
         """
         where = ["s.account = :account"]
         params: dict[str, Any] = {"account": account, "host": host}
+        if before is not None:
+            # The first term lets SQLite start the index scan at the position.
+            where.append(
+                f"{_SORT_KEY} <= :before_key AND ({_SORT_KEY}, s.harness, "
+                "s.session_id) < (:before_key, :before_harness, :before_session)"
+            )
+            params["before_key"] = before.sort_key
+            params["before_harness"] = before.harness
+            params["before_session"] = before.session_id
         if harness is not None:
             where.append("s.harness = :harness")
             params["harness"] = harness
         if since is not None:
-            where.append("COALESCE(s.last_activity, s.created) >= :since")
+            where.append(f"{_SORT_KEY} >= :since")
             params["since"] = since
         if lease_host is not None:
             where.append("s.lease_state = 'held' AND s.lease_host = :lease_host")
@@ -2342,46 +2406,59 @@ class Store:
             # Last, so that the simple filters skip its subqueries.
             where.append(_READABLE)
             params["granted"] = int(scope == "granted")
-        sql = f"SELECT * FROM sessions s WHERE {' AND '.join(where)} ORDER BY {_RECENT}"
+        sql = (
+            f"SELECT s.*, {_SORT_KEY} AS sort_key FROM sessions s "
+            f"WHERE {' AND '.join(where)} ORDER BY {_RECENT}"
+        )
         in_python = title is not None or liveness is not None
         if not in_python:
-            sql += " LIMIT :limit"
+            # One more row than the limit tells if the list has more rows.
+            sql += " LIMIT :limit + 1"
             params["limit"] = limit
         cursor = self._db.execute(sql, params)
+
+        def candidates() -> Iterator[sqlite3.Row]:
+            while rows := cursor.fetchmany(max(limit, 50)):
+                yield from rows
+
         out: list[SessionSummary] = []
+        last: sqlite3.Row | None = None
         try:
-            while len(out) < limit:
-                rows = cursor.fetchmany(max(limit, 50))
-                if not rows:
+            rows = candidates()
+            for row in rows:
+                if len(out) >= limit:
                     break
-                for row in rows:
-                    metadata = self._clean_metadata(row["metadata"])
-                    if title is not None and (
-                        title.lower() not in (metadata.get("title") or "").lower()
-                    ):
-                        continue
-                    state, excerpt = self._session_state_and_excerpt(row)
-                    live = state.get("liveness")
-                    live_name = live["state"] if live is not None else "none"
-                    if liveness is not None and live_name not in liveness:
-                        continue
-                    summary: SessionSummary = {
-                        "harness": row["harness"],
-                        "session_id": row["session_id"],
-                        "metadata": metadata,
-                        "state": state,
-                    }
-                    placement = self._last_placement(row["id"])
-                    if placement is not None:
-                        summary["last_placement"] = placement
-                    if excerpt is not None:
-                        summary["excerpt"] = excerpt
-                    out.append(summary)
-                    if len(out) >= limit:
-                        break
+                metadata = self._clean_metadata(row["metadata"])
+                if title is not None and (
+                    title.lower() not in (metadata.get("title") or "").lower()
+                ):
+                    continue
+                state, excerpt = self._session_state_and_excerpt(row)
+                live = state.get("liveness")
+                live_name = live["state"] if live is not None else "none"
+                if liveness is not None and live_name not in liveness:
+                    continue
+                summary: SessionSummary = {
+                    "harness": row["harness"],
+                    "session_id": row["session_id"],
+                    "metadata": metadata,
+                    "state": state,
+                }
+                placement = self._last_placement(row["id"])
+                if placement is not None:
+                    summary["last_placement"] = placement
+                if excerpt is not None:
+                    summary["excerpt"] = excerpt
+                out.append(summary)
+                last = row
+            else:
+                # The rows ended before the list was full.
+                last = None
         finally:
             cursor.close()
-        return out
+        if last is None:
+            return out, None
+        return out, ListPosition(last["sort_key"], last["harness"], last["session_id"])
 
     @_reading
     def list_workspaces(

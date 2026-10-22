@@ -37,7 +37,7 @@ def test_a_slow_list_does_not_stop_writes(
 ) -> None:
     server = make_server(tmp_path / "data")
     listing, release = threading.Event(), threading.Event()
-    original = Store.list_sessions
+    original = Store.list_sessions_page
 
     def slow_list(self: Store, *args: Any, **kwargs: Any) -> Any:
         result = original(self, *args, **kwargs)
@@ -45,7 +45,7 @@ def test_a_slow_list_does_not_stop_writes(
         release.wait(HOLD)
         return result
 
-    monkeypatch.setattr(Store, "list_sessions", slow_list)
+    monkeypatch.setattr(Store, "list_sessions_page", slow_list)
 
     async def exercise() -> None:
         async with httpx.AsyncClient(

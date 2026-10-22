@@ -8,6 +8,8 @@ run it in-process.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import json
 import logging
@@ -45,6 +47,7 @@ from hyperspace_protocol import (
     LIVENESS_STATES,
     MAX_BODY,
     STATUSES,
+    SessionList,
     StatusResponse,
     ValidationError,
     decode_workspace,
@@ -62,6 +65,7 @@ from store import (
     READ_CACHE_BYTES,
     READ_CONNECTIONS,
     Conflict,
+    ListPosition,
     SessionKey,
     StaleStatus,
     Store,
@@ -366,6 +370,55 @@ def blob_path(request: Request) -> str:
 
 Handler = Callable[[Request, Principal], Awaitable[Response]]
 
+# The version of the cursor format, and the longest cursor that the server
+# accepts. A cursor that the server makes is much shorter.
+_CURSOR_VERSION = 1
+_MAX_CURSOR = 1024
+_MAX_SORT_KEY = 64
+
+
+def encode_cursor(position: ListPosition) -> str:
+    """The opaque cursor of a position in the session list: URL-safe base64,
+    with no padding, of a JSON array. It has only the sort key and the public
+    key of the session, so it shows nothing that the page does not show."""
+    raw = json.dumps(
+        [_CURSOR_VERSION, position.sort_key, position.harness, position.session_id],
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(raw.encode()).rstrip(b"=").decode()
+
+
+def decode_cursor(cursor: str) -> ListPosition:
+    """The position in a cursor from `encode_cursor`. Raise `ApiError` with
+    `bad_request` if the cursor is not valid."""
+    invalid = ApiError("bad_request", "invalid cursor")
+    if len(cursor) > _MAX_CURSOR:
+        raise invalid
+    try:
+        raw = base64.b64decode(
+            cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True
+        )
+        value = json.loads(raw)
+    except (binascii.Error, ValueError):
+        raise invalid from None
+    if (
+        not isinstance(value, list)
+        or len(value) != 4  # type: ignore[arg-type]
+        or type(value[0]) is not int
+        or value[0] != _CURSOR_VERSION
+        or not all(isinstance(v, str) for v in value[1:])  # type: ignore[index]
+    ):
+        raise invalid
+    sort_key, harness, session_id = value[1:]  # type: ignore[misc]
+    if not 0 < len(sort_key) <= _MAX_SORT_KEY:
+        raise invalid
+    try:
+        validate_harness(harness)
+        validate_session_id(session_id)
+    except ValidationError:
+        raise invalid from None
+    return ListPosition(sort_key, harness, session_id)
+
 
 @dataclass
 class _RequestRecord:
@@ -654,9 +707,11 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         liveness = choices(
             q.getlist("liveness"), (*LIVENESS_STATES, "none"), "liveness"
         )
-        sessions = await run_in_threadpool(
+        cursor = q.get("cursor")
+        before = decode_cursor(cursor) if cursor is not None else None
+        sessions, position = await run_in_threadpool(
             store.snapshot,
-            lambda: store.list_sessions(
+            lambda: store.list_sessions_page(
                 principal.account,
                 principal.host,
                 principal.read,  # type: ignore[arg-type]
@@ -670,9 +725,13 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
                 lease_host=lease_host,
                 liveness=liveness,
                 limit=min(limit, 1000),
+                before=before,
             ),
         )
-        return JSONResponse({"sessions": sessions})
+        body: SessionList = {"sessions": sessions}
+        if position is not None:
+            body["next"] = encode_cursor(position)
+        return JSONResponse(body)
 
     @authed("read")
     async def get_manifest(request: Request, principal: Principal) -> Response:
