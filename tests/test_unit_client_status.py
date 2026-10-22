@@ -797,6 +797,52 @@ def test_a_stop_during_the_send_of_a_reopen_is_written(
     assert ctx.state.session(H, SID).status == server.latest
 
 
+def test_a_write_after_many_writes_during_the_send_of_a_reopen_is_written(
+    ctx: Context, server: StatusServer
+) -> None:
+    # While the sync sends the reopen, the hooks replace the queued write
+    # more times than the list of replaced writes holds.
+    session = _done_session(ctx, server)
+    _hook(ctx, "UserPromptSubmit")()
+    adapter = ctx.adapter
+    assert isinstance(adapter, ClaudeCode)
+
+    def turn() -> None:
+        for _ in range(3):
+            for event in ("PreToolUse", "PostToolUse"):
+                on_hook(ctx.state, adapter, H, SID, event, ASK)
+        on_hook(ctx.state, adapter, H, SID, "Stop", {})
+
+    server.during_add = turn
+    send_wanted(ctx, session)
+    assert _latest(server) == (14, "working", None, True, "user")
+    queued = ctx.state.wanted_status(H, SID)
+    assert queued is not None
+    assert (queued[0]["status"], queued[0]["base_seq"]) == ("ready", 13)
+    assert all(r.get("note") is None for r in queued[0][REPLACED])
+    send_wanted(ctx, session)
+    assert _latest(server) == (15, "ready", "idle", False, "hook")
+    assert ctx.state.wanted_status(H, SID) is None
+
+
+def test_a_write_does_not_retry_on_a_sent_write_that_it_did_not_replace(
+    ctx: Context, server: StatusServer
+) -> None:
+    # The sync sent the reopen and removed it from the queue. A later write
+    # is not on top of it, so the same fields from this host again are a
+    # write that it did not replace.
+    session = _done_session(ctx, server)
+    _hook(ctx, "UserPromptSubmit")()
+    send_wanted(ctx, session)
+    assert ctx.state.wanted_status(H, SID) is None
+    _hook(ctx, "Stop")()
+    on_hook(ctx.state, cast(ClaudeCode, ctx.adapter), H, SID, "PreToolUse", ASK)
+    server.mark("working", "laptop", **REOPEN)
+    before = server.latest
+    send_wanted(ctx, session)
+    assert server.latest == before
+
+
 OTHER_SESSION = "22222222-2222-2222-2222-222222222222"
 
 

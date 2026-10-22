@@ -32,6 +32,7 @@ from hyperspace_client.notices import after_sync, refresh_states
 from hyperspace_client.state import State
 from hyperspace_client.status import (
     clean_note,
+    drop_queue,
     end_continued,
     printable,
     queue,
@@ -654,7 +655,7 @@ def set_status(ctx: Context, sid: str, request: dict[str, Any]) -> StatusEvent |
             queue(state, harness, sid, want, queued)
             state.set_declared(harness, sid, request)
             return None
-        state.drop_wanted_status(harness, sid)
+        drop_queue(state, harness, sid)
         try:
             event = write(ctx, harness, sid, request, seq(record.status), record)
         except NotFound:

@@ -67,6 +67,10 @@ _REQUEST_FIELDS = (
 )
 # The keys of a queued write that the request does not include.
 _QUEUE_KEYS = (WITH_EXCERPT, "base_seq", REPLACED)
+# The state key that holds the request fields of the queued write that a
+# sync sent last, until a sync removes a queued write that no newer write
+# replaced (see `send_wanted`).
+_SENT_KEY = "status_sent:{}:{}"
 _ASK_TOOL = "AskUserQuestion"
 _PERMISSION_PROMPT = "permission_prompt"
 _NO_CAPABILITY_LOG = 86_400
@@ -209,6 +213,14 @@ def on_hook(
             # The prompt reopens a done session. A done notice that the agent
             # did not get is not true now.
             state.drop_notices(harness, session_id, "status")
+
+
+def drop_queue(state: State, harness: str, session_id: str) -> None:
+    """Remove the queued write of a session whose sync lock the caller
+    holds. No write is in flight then, so no later write is on top of the
+    write that the last sync sent."""
+    state.drop_wanted_status(harness, session_id)
+    state.put(_SENT_KEY.format(harness, session_id), "")
 
 
 def queue(
@@ -426,6 +438,7 @@ def send_wanted(ctx: Context, session: LocalSession) -> None:
     queued = ctx.state.wanted_status(h, sid)
     if queued is None:
         return
+    key = _SENT_KEY.format(h, sid)
     body, created = queued
     try:
         if not supported(ctx):
@@ -440,15 +453,18 @@ def send_wanted(ctx: Context, session: LocalSession) -> None:
         if not isinstance(base, int):
             base = seq(record.status)
         replaced = body.get(REPLACED)
-        write(
-            ctx,
-            h,
-            sid,
-            request,
-            base,
-            record,
-            replaced=cast(list[object], replaced) if isinstance(replaced, list) else (),
+        earlier = cast(list[object], replaced) if isinstance(replaced, list) else []
+        # A hook can replace the queued write many times while this sync
+        # sends it, so that the list of replaced writes no longer holds it.
+        # Only the write that the last sync sent can be in flight, so keep
+        # it here, outside the queue, while a newer write replaces it.
+        sent = ctx.state.get(key)
+        if sent:
+            earlier.append(json.loads(sent))
+        ctx.state.put(
+            key, json.dumps({k: request[k] for k in _REQUEST_FIELDS if k in request})
         )
+        write(ctx, h, sid, request, base, record, replaced=earlier)
     except NotFound:
         # The server does not have the session yet: keep the write.
         return
@@ -456,6 +472,10 @@ def send_wanted(ctx: Context, session: LocalSession) -> None:
         log.info("%s: status not sent: %s", sid, exc)
         return
     ctx.state.drop_wanted_status(h, sid, created)
+    if ctx.state.wanted_status(h, sid) is None:
+        # No write replaced this one, so no queued write is on top of it.
+        # The record has its event.
+        ctx.state.put(key, "")
 
 
 # --- Sessions that continued in a background job ------------------------------------
