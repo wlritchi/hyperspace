@@ -347,10 +347,6 @@ way, from the paths of its diff: both passes review the same change, so both
 are children of the same session, and no record ties the second pass to the
 first pass.
 
-On a local sample of about 1,000 reviews, 70% got a parent, 2% were equal
-matches, and most of the others reviewed files that no session changed with an
-edit tool.
-
 The client finds child sessions in the sweep, before it syncs the sessions. It
 reads the first prompt of each session once. For the new reviews, it reads the
 edits of the transcripts that changed in the window, and of each of these only
@@ -361,8 +357,8 @@ sweep. Thus the reviews on a host get their links at the first sweeps after
 the host gets the new client.
 
 If subagents and child sessions are ever made into one model, subagents will
-change toward the model of the parent link, and not the reverse. This release
-does not change subagents.
+change toward the model of the parent link, and not the reverse. Subagents are
+not child sessions in this model.
 
 ## Teleport
 
@@ -833,7 +829,7 @@ The client reads the next page with `cursor=<next>` and the same filters. The
 cursor is opaque to the client, and a cursor that the server cannot read gives
 `400 bad_request`. Without the `title` and `liveness` filters, a response has
 `next` only if more sessions follow; with them, the last page can be empty.
-The response was already a JSON object, so an old client ignores `next`.
+The response is a JSON object, so an old client ignores `next`.
 
 The server also advertises `child-sessions`. `GET /sessions` then takes
 `top_level=1`, which keeps only the sessions with no `links.parent` and no
