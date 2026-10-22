@@ -206,9 +206,11 @@ A new write from the client replaces a queued write that is not sent yet (see
 write on top of it, so the new write can have the base from before the queued
 write. Thus the new write also tries again once on the event of a write that
 it replaced, and only on that event: an event after its base, from this host,
-with the same status, reason, wake kind, note, source kind and `explicit`. An
-automatic write still does not overwrite a `done` or an explicit status from a
-different writer.
+with the same status, reason, wake kind, note, source kind and `explicit`. The
+client keeps the write that the last sync sent apart from the other replaced
+writes, so that many new writes during one send do not lose it. An automatic
+write still does not overwrite a `done` or an explicit status from a different
+writer.
 
 ### Transitions
 
