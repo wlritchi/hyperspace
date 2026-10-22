@@ -763,12 +763,15 @@ $HYPERSPACE_DATA_DIR/
   parent link and the top-level state (see "Child sessions").
 - A server before these copies writes events and does not update them, for
   example after a rollback. Thus the server keeps a mark of the newest status
-  event and the newest metadata event, which each write of an event sets in
-  the same transaction. At start, the server fills the copies again for the
-  sessions with events above the mark. If the event of the mark is gone or is
-  a different event (SQLite can give the id of a deleted row again), it fills
-  the copies of all sessions. A purge sets the marks to the newest remaining
-  events.
+  event and the newest metadata event whose copies are current. At start, and
+  in each write of an event and each purge, the server first fills the copies
+  again for the sessions with events above the mark, then moves the mark, in
+  one transaction. Thus a new admin script beside an older server does not
+  move a mark past the events of the older server. If the event of the mark is
+  gone or is a different event (SQLite can give the id of a deleted row
+  again), the server fills the copies of all sessions. The first start after
+  the upgrade fills the copies of all sessions once: the migration cannot know
+  if an older server wrote events after the copies were filled.
 - Write order: append the frame, `fsync`, then commit the index row. At
   startup, the server truncates each generation file to the end of its last
   committed frame. This removes only bytes that no index row refers to.
