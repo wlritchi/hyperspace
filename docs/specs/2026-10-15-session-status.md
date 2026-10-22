@@ -647,6 +647,10 @@ The CLI gives the overview stories their commands:
   or `none` for sessions with no status. The option takes a comma-separated
   list and is repeatable. The client sends each status as its own `status=`
   parameter, which also an older server accepts.
+- With a server that has `child-sessions`, `ls` shows only top-level sessions:
+  not the child sessions that tools start for the work of another session, for
+  example security reviews (main spec, "Child sessions"). `ls --all` shows
+  every session.
 - `hyperspace tail [<sid>] [-n N]`: the last N turns of the active branch. The
   adapter formats the records on the client (O2).
 - `hyperspace status [STATUS] [--session SID] [--reason R] [--wake W] [--note TEXT] [--by-user]`,

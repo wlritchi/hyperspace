@@ -25,6 +25,7 @@ from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import MAX_PAGE, Api, ApiError, NotFound
 from hyperspace_client.checkpoint import checkpoint
+from hyperspace_client.children import link_children
 from hyperspace_client.config import Config, ConfigError
 from hyperspace_client.credentials import CredentialError
 from hyperspace_client.hooks import handle, notices
@@ -48,6 +49,7 @@ from hyperspace_client.teleport import (
     send,
 )
 from hyperspace_protocol import (
+    CAP_CHILD_SESSIONS,
     CAP_LIST_CURSOR,
     CAP_LIVENESS,
     CAP_SESSION_STATUS,
@@ -252,6 +254,21 @@ def _sweep(cfg: Config, ctx: Context, if_stale: float | None) -> int:
         if last is not None and time.time() - float(last) < if_stale:
             return 0
     state.put("last_sweep", str(time.time()))
+    if isinstance(ctx.adapter, ClaudeCode):
+        # Before the syncs, so that the first sync of a new child session
+        # sends its links.
+        try:
+            linked = link_children(ctx, ctx.adapter)
+            log.info(
+                "sweep: children: %d classified, %d linked, %d with no parent, %d sent",
+                linked.classified,
+                linked.linked,
+                linked.unlinked,
+                linked.sent,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # The links must not stop the backup.
+            log.warning("sweep: children: %s: %s", type(exc).__name__, exc)
     count = 0
     for session in ctx.adapter.discover():
         with state.try_lock(session.harness, session.session_id) as locked:
@@ -465,6 +482,8 @@ def cmd_ls(args: argparse.Namespace, cfg: Config) -> int:
     with Api(url, token) as api:
         if with_status:
             api.require_capability(CAP_SESSION_STATUS)
+        if not args.all and api.has_capability(CAP_CHILD_SESSIONS):
+            filters["top_level"] = "1"
         if args.all_pages:
             sessions = list(api.all_sessions(args.limit, **filters))
             if len(sessions) >= MAX_PAGE and not api.has_capability(CAP_LIST_CURSOR):
@@ -503,6 +522,11 @@ def cmd_show(args: argparse.Namespace, cfg: Config) -> int:
     url, token = cfg.require_server()
     with Api(url, token) as api:
         manifest = api.manifest(ClaudeCode.harness, args.session)
+        children = (
+            list(api.all_sessions(harness=ClaudeCode.harness, parent=args.session))
+            if not args.json and api.has_capability(CAP_CHILD_SESSIONS)
+            else []
+        )
     if args.json:
         print(json.dumps(manifest, indent=2))
         return 0
@@ -511,6 +535,12 @@ def cmd_show(args: argparse.Namespace, cfg: Config) -> int:
     lease = state["lease"]
     print(f"session   {manifest['session_id']}")
     print(f"title     {printable(meta.get('title', '-'))}")
+    parent = meta.get("links", {}).get("parent")
+    if parent:
+        print(f"parent    {printable(parent)}")
+    automation = meta.get("automation")
+    if automation:
+        print(f"automation {printable(automation)}")
     print(f"state     {state['state']}")
     print(f"lease     {lease['state']} {lease.get('host', '')} since {lease['since']}")
     print("placements:")
@@ -535,6 +565,16 @@ def cmd_show(args: argparse.Namespace, cfg: Config) -> int:
         print("conflicting branches:")
         for b in branches:
             print(f"  {b['generation']}  {b['host']}  activity {b['activity']}")
+    if children:
+        print("child sessions:")
+        for child in children:
+            meta = child["metadata"]
+            line = (
+                f"  {child['session_id']}  {meta.get('automation', '-')}  "
+                f"{(meta.get('first_timestamp') or '-')[:16]}  "
+                f"{(meta.get('title') or '')[:50]}"
+            )
+            print(printable(line.rstrip()))
     return 0
 
 
@@ -1110,6 +1150,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help=f"the most sessions to show (default {LS_LIMIT}); "
         "with --all-pages, the size of each page",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="also show child sessions and automation, for example the "
+        "sessions of security reviews",
     )
     p.add_argument(
         "--all-pages",

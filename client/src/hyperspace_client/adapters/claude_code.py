@@ -15,10 +15,11 @@ import json
 import os
 import re
 import sys
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from hyperspace_client.adapters import (
     LocalFile,
@@ -72,6 +73,7 @@ _SERVER_KEYS = (
     "harness_version",
     "record_count",
     "links",
+    "automation",
 )
 
 
@@ -95,6 +97,43 @@ _JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Session id to the sessions whose transcripts have a `continued-in` record
 # with that id (from `State.continued_from`).
 ContinuedFrom = Mapping[str, Collection[str]]
+
+# The security-guidance plugin reviews the change of a session in other
+# sessions, which it starts with the Agent SDK and with no settings. Thus no
+# Hyperspace hook runs in them, and nothing in their transcripts names the
+# session that made the change. The first prompt of the first pass and of the
+# second pass starts with one of these texts.
+_REVIEW_PROMPTS = (
+    "Review this change for security vulnerabilities.",
+    "You previously flagged these candidate vulnerabilities",
+)
+# The `automation` metadata of these sessions.
+SECURITY_REVIEW = "security-review"
+# A changed file in a review prompt: an item of the "Changed files" list of
+# the first pass, and the header of its diff in both passes.
+_CHANGED_FILE = re.compile(r"^  - (.+)$")
+_DIFF_HEADER = re.compile(r"^=== DIFF: (.+) ===$")
+# The tools that change a file, with the input field that names the file.
+_EDIT_TOOLS = {
+    "Edit": "file_path",
+    "MultiEdit": "file_path",
+    "Write": "file_path",
+    "NotebookEdit": "notebook_path",
+}
+# The search for the first prompt reads at most this much of a transcript.
+_HEAD_MAX = 4 * 1024 * 1024
+# The search for the start of a time window in a transcript goes back from
+# the end in steps that start at this size and double.
+_TAIL_STEP = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class Edit:
+    """A change to a file with an edit tool, by a session or its subagent."""
+
+    path: str
+    time: float
+    session_id: str
 
 
 def _session_id(value: object) -> str | None:
@@ -251,6 +290,94 @@ def _ancestors() -> set[int]:
         except (OSError, ValueError, IndexError):
             break
     return out
+
+
+def _time(value: object) -> float | None:
+    """The POSIX time of a record timestamp, or None."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+def review_paths(text: str, cwd: str) -> list[str]:
+    """The absolute paths of the files that a review prompt names. The prompt
+    gives them relative to the review's working directory."""
+    found: dict[str, None] = {}
+    in_list = False
+    for line in text.splitlines():
+        if line.startswith("Changed files"):
+            in_list = True
+            continue
+        item = _CHANGED_FILE.match(line) if in_list else None
+        in_list = item is not None
+        header = item or _DIFF_HEADER.match(line)
+        if header is not None:
+            found[os.path.normpath(os.path.join(cwd, header.group(1).strip()))] = None
+    return list(found)
+
+
+def child_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    """The metadata that the first prompt of a session gives: for a review of
+    the security-guidance plugin, `automation`, and for the search of its
+    parent, `_review_start` (a POSIX time) and `_review_paths`. Empty for
+    other sessions."""
+    entry = record.get("entrypoint")
+    if not isinstance(entry, str) or not entry.startswith("sdk-"):
+        return {}
+    text = _text(record)
+    if not text.startswith(_REVIEW_PROMPTS):
+        return {}
+    meta: dict[str, Any] = {"automation": SECURITY_REVIEW}
+    cwd, start = record.get("cwd"), _time(record.get("timestamp"))
+    if isinstance(cwd, str) and os.path.isabs(cwd) and start is not None:
+        meta["_review_start"] = start
+        meta["_review_paths"] = review_paths(text, cwd)
+    return meta
+
+
+def _first_time(f: IO[bytes], offset: int, limit: int) -> float | None:
+    """The time of the first record with a timestamp after `offset` (from the
+    start of the next line), in at most `limit` bytes, or None."""
+    f.seek(offset)
+    if offset:
+        f.readline()
+    read = 0
+    while read < limit:
+        line = f.readline()
+        if not line:
+            return None
+        read += len(line)
+        record = _parse(line)
+        found = _time(record.get("timestamp")) if record is not None else None
+        if found is not None:
+            return found
+    return None
+
+
+def _lines_since(path: Path, since: float) -> Iterator[bytes]:
+    """The complete lines of a transcript from a point before the time
+    `since`. Records are in time order, so the search goes back from the end
+    until it finds a record older than `since`, and does not read the start
+    of a long transcript."""
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        step = _TAIL_STEP
+        start = max(0, size - step)
+        while start > 0:
+            found = _first_time(f, start, step)
+            if found is not None and found < since:
+                break
+            step *= 2
+            start = max(0, size - step)
+        f.seek(start)
+        if start:
+            f.readline()
+        for line in f:
+            if line.endswith(b"\n"):
+                yield line
 
 
 def is_prompt(record: dict[str, Any]) -> bool:
@@ -504,6 +631,67 @@ class ClaudeCode:
         except OSError:
             return None
         return None
+
+    def classify(self, session: LocalSession) -> dict[str, Any] | None:
+        """The metadata from the first prompt of a session (see
+        `child_metadata`), or None if the transcript has no prompt yet. A
+        transcript with no prompt in its first `_HEAD_MAX` bytes is not a
+        review, so the search stops there."""
+        read = 0
+        try:
+            with open(session.transcript, "rb") as f:
+                while read < _HEAD_MAX:
+                    line = f.readline()
+                    if not line.endswith(b"\n"):
+                        return None
+                    read += len(line)
+                    record = _parse(line)
+                    if record is not None and is_prompt(record):
+                        return child_metadata(record)
+        except OSError:
+            return None
+        return {}
+
+    def edits(self, since: float, until: float) -> list[Edit]:
+        """The file changes with an edit tool, from the time `since` to
+        `until`, in the transcripts on this host: of the main agents and of
+        their subagents. A transcript that did not change after `since` is
+        not read, and of the others only the end (see `_lines_since`)."""
+        out: list[Edit] = []
+        for session in self.discover():
+            paths = [session.transcript]
+            subagents = session.transcript.with_suffix("") / "subagents"
+            if subagents.is_dir() and not subagents.is_symlink():
+                paths += [p for p in _walk(subagents) if p.suffix == ".jsonl"]
+            for path in paths:
+                try:
+                    if path.stat().st_mtime < since:
+                        continue
+                    lines = list(_lines_since(path, since))
+                except OSError:
+                    continue
+                for line in lines:
+                    if b'"tool_use"' not in line:
+                        continue
+                    record = _parse(line)
+                    if record is None or record.get("type") != "assistant":
+                        continue
+                    when = _time(record.get("timestamp"))
+                    if when is None or not since <= when <= until:
+                        continue
+                    for block in _blocks(record):
+                        field = _EDIT_TOOLS.get(str(block.get("name")))
+                        raw: Any = block.get("input")
+                        if block.get("type") != "tool_use" or field is None:
+                            continue
+                        if not isinstance(raw, dict):
+                            continue
+                        target: Any = raw.get(field)  # pyright: ignore[reportUnknownMemberType]
+                        if isinstance(target, str) and os.path.isabs(target):
+                            out.append(
+                                Edit(os.path.normpath(target), when, session.session_id)
+                            )
+        return out
 
     def is_stub(self, session: LocalSession) -> bool:
         """True if the transcript only names the session (see `is_stub`).

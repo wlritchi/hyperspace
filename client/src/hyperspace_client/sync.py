@@ -536,7 +536,7 @@ class Syncer:
                 continue
             if self._as_log(f) or not self.sync_blob(f):
                 metadata = self.sync_log(LocalFile(f.rel_path, "log", f.path), metadata)
-        server_meta = {"workspace": self.workspace, **_server_metadata(metadata)}
+        server_meta = server_metadata(self.workspace, metadata)
         if server_meta != record.sent_metadata and self.result.files:
             self.ctx.api.add_metadata(
                 self._h, self._sid, self.workspace, cast(SessionMetadata, server_meta)
@@ -557,8 +557,13 @@ class Syncer:
         return self.result
 
 
-def _server_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in metadata.items() if not k.startswith("_")}
+def server_metadata(workspace: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    """The metadata of a session for the server: the keys that do not start
+    with `_`, and the workspace."""
+    return {
+        "workspace": workspace,
+        **{k: v for k, v in metadata.items() if not k.startswith("_")},
+    }
 
 
 def _note_session_state(

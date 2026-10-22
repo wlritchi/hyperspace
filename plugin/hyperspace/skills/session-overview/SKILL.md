@@ -20,7 +20,9 @@ description:
    `metadata` (title, workspace) and `excerpt` (the start of the agent's last
    message). The list does not include sessions that have no status, usually
    old sessions from before session status. If the user asks for them, use
-   `--status none`.
+   `--status none`. The list also does not include child sessions, for example
+   the sessions of security reviews, which tools start for the work of another
+   session.
 
 2. For sessions where the note and the excerpt do not say enough, read the
    last turns:

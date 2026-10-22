@@ -38,9 +38,9 @@ statements and about 1,590 page reads; `status=done` runs 18,129 statements.
 ## Changes
 
 Each step is one or more commits. Steps 1 and 2 change only the server, step 3
-the protocol and the server, step 4 the client and the plugin. A new client
-must work with an old server (use a capability, as for session status), and an
-old client must work with a new server.
+the protocol and the server, step 4 the client and the plugin, and step 5 all
+of them. A new client must work with an old server (use a capability, as for
+session status), and an old client must work with a new server.
 
 ### Step 1: reads do not stop writes
 
@@ -177,6 +177,72 @@ Done. As built:
   `400`. Thus a stale cache after a server rollback gives a wrong list with no
   error, and the client cannot see it. `/whoami` does not read the session
   index, so it is fast also on slow storage.
+
+### Step 5: child sessions with a parent link
+
+About 1,400 sessions on the server are the reviews of the `security-guidance`
+plugin: headless Agent SDK sessions that its hooks start for the change of a
+session. They fill the lists of open work. This step hides them, and links
+each to the session whose change it reviews.
+
+- The Claude Code adapter knows a review by its first prompt
+  (`entrypoint: "sdk-py"`, and the texts of the first and second passes), and
+  finds its parent: the session on this host that changed the files of the
+  review with edit tools in a window before the review started. Exactly one
+  best match gives `links.parent`. Each review gets `automation`, also with no
+  parent, so that it is still hidden.
+- The scan is cheap: an index of the edits once in each sweep, a bound window,
+  and no new read of large transcripts at each checkpoint.
+- The server: `top_level=1` and `parent=<sid>` on `GET /sessions`, with a new
+  capability, in SQL with an index. Without them, the list has every session.
+- The client: `ls` sends `top_level=1` by default, `ls --all` shows every
+  session, and `show` lists the children. The internal lists do not hide
+  children.
+- The reviews that the server already has get their links from the next sweeps
+  of the new client.
+- The spec records the guidance of the user: if subagents and child sessions
+  are ever made into one model, subagents change toward the parent link.
+
+Done. As built:
+
+- `ClaudeCode.classify` reads a transcript up to its first prompt (at most 4
+  MiB) and gives `automation: "security-review"`, with the start time and the
+  absolute paths of the changed files (the "Changed files" list and the
+  `=== DIFF: <path> ===` headers, relative to the review's `cwd`).
+  `ClaudeCode.edits` gives the `Edit`, `MultiEdit`, `Write` and `NotebookEdit`
+  calls of the main transcripts and of their subagent transcripts in a time
+  window. It reads only transcripts that changed in the window, and of each
+  only the end: it goes back from the end in steps of 1 MiB that double until
+  a record is older than the window.
+- `children.link_children` runs in the sweep before the syncs. It reads the
+  first prompt of each session once (`_classified` in the client metadata),
+  searches for the parent of each new review once (`_parent_checked`), with
+  one edit scan for all new reviews, and sends the changed metadata of the
+  reviews that the server already has, at most 200 in each sweep. A new review
+  gets its links with its first sync.
+- The parent: the most of the review's files edited in the 12 hours before the
+  review started, then the last such edit. Equal matches give no parent. On
+  the local sample (about 1,000 reviews), a window of 6 h gave 702 unique
+  matches, 12 h gave 706 and 24 h gave 714. Most reviews with no match
+  reviewed files that no session changed with an edit tool (changes with shell
+  commands, or commits of earlier work). Of 20 equal matches, 12 were copies
+  of the same records (a fork), and the last edit resolves the other 8. The
+  scan of all local transcripts for the first sweep took about 9 s.
+- The second pass is linked to the same parent, with the paths of its own
+  diff, not to the first pass: both passes review one change of one session,
+  and no record ties the two passes.
+- The server: capability `child-sessions`, metadata field `automation`
+  (string), and migration 5. It adds the columns `parent` (a copy of
+  `links.parent`) and `top_level`, which `add_metadata` updates with
+  `metadata`, adds `top_level` as the last column of `sessions_recent`, and
+  adds the partial index `sessions_parent (account, parent, sort key)`. The
+  columns are copies, not expressions in the index, so that the filters do not
+  depend on the SQLite version: the server image is on Debian 12, with SQLite
+  3.40, and older versions do not always use the value of an indexed
+  expression in place of the expression.
+- The client: `ls` sends `top_level=1` to a server with the capability,
+  `ls --all` does not. `show` shows `parent` and `automation`, and lists the
+  children. `all_sessions` never sends `top_level`.
 
 ## Checks
 
