@@ -600,15 +600,18 @@ The code follows this step, with these changes and additions:
   `test_a_write_does_not_retry_on_an_event_after_the_replaced_write`,
   `test_an_automatic_write_with_no_replaced_write_does_not_retry`.
 - The list of four can lose the write that is in flight: hooks can replace the
-  queue more than four times while one sync sends a write. Only the write that
-  the last sync sent can be in flight, because a sync holds the sync lock.
-  Thus `send_wanted` also keeps the request fields of each write that it sends
-  in the state key `status_sent:<harness>:<sid>`, and the next send counts
-  that write as a replaced write. The key becomes empty when a sync removes a
-  write that no newer write replaced (then no queued write is on top of it),
-  and when `set_status` removes the queue under the lock
+  queue more than four times while one sync sends a write. Thus `send_wanted`
+  also keeps the request fields of each write that it sends in the state key
+  `status_sent:<harness>:<sid>` (a list, at most 16, with the same fields
+  once), and each send counts these writes as replaced writes. It adds a write
+  before the send, and keeps it after a send that failed, because such a send
+  can still have reached the server; a later send of the newest write must
+  still retry on its event. The key becomes empty when a sync removes a write
+  that no newer write replaced (then no queued write is on top of the sent
+  writes), and when `set_status` removes the queue under the lock
   (`status.drop_queue`). Tests:
   `test_a_write_after_many_writes_during_the_send_of_a_reopen_is_written`,
+  `test_a_write_whose_send_fails_still_retries_on_the_earlier_sent_write`,
   `test_a_write_does_not_retry_on_a_sent_write_that_it_did_not_replace`.
 - If the current status is `done`, only `UserPromptSubmit` writes. This
   explicit reopen also drops the pending `done` notices, so that the hook does

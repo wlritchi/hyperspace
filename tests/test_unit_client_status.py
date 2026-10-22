@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
 
 from _hs import FakeClaude, prompt, text_reply, tool_call
@@ -820,6 +821,44 @@ def test_a_write_after_many_writes_during_the_send_of_a_reopen_is_written(
     assert queued is not None
     assert (queued[0]["status"], queued[0]["base_seq"]) == ("ready", 13)
     assert all(r.get("note") is None for r in queued[0][REPLACED])
+    send_wanted(ctx, session)
+    assert _latest(server) == (15, "ready", "idle", False, "hook")
+    assert ctx.state.wanted_status(H, SID) is None
+
+
+def _down() -> None:
+    raise httpx.ConnectError("the server cannot be reached")
+
+
+@pytest.mark.parametrize("retry", [False, True])
+def test_a_write_whose_send_fails_still_retries_on_the_earlier_sent_write(
+    ctx: Context, server: StatusServer, retry: bool
+) -> None:
+    # As above, but the first send of the last write does not complete: the
+    # connection fails, at once or in the retry after the 409 on the reopen.
+    # The next send must still know the reopen.
+    session = _done_session(ctx, server)
+    _hook(ctx, "UserPromptSubmit")()
+    adapter = ctx.adapter
+    assert isinstance(adapter, ClaudeCode)
+
+    def turn() -> None:
+        for _ in range(3):
+            for event in ("PreToolUse", "PostToolUse"):
+                on_hook(ctx.state, adapter, H, SID, event, ASK)
+        on_hook(ctx.state, adapter, H, SID, "Stop", {})
+
+    server.during_add = turn
+    send_wanted(ctx, session)
+    assert _latest(server) == (14, "working", None, True, "user")
+    if retry:
+        server.during_add = lambda: setattr(server, "during_add", _down)
+    else:
+        server.during_add = _down
+    send_wanted(ctx, session)
+    assert _latest(server) == (14, "working", None, True, "user")
+    queued = ctx.state.wanted_status(H, SID)
+    assert queued is not None and queued[0]["base_seq"] == 13
     send_wanted(ctx, session)
     assert _latest(server) == (15, "ready", "idle", False, "hook")
     assert ctx.state.wanted_status(H, SID) is None
