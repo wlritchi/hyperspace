@@ -440,6 +440,29 @@ def test_status_route_scopes(env: Env) -> None:
     assert r.status_code == 400
 
 
+def test_list_status_takes_comma_separated_values(env: Env) -> None:
+    g = new_gen(env, "laptop", WS_LAPTOP)
+    append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)
+    r = env.client.post(
+        f"{S}/status",
+        headers=env.h("laptop"),
+        json=status_body(status="working", reason=None),
+    )
+    assert r.status_code == 200, r.text
+
+    def listed(query: str) -> list[str]:
+        r = env.client.get(f"/v1/sessions?{query}", headers=env.h("laptop"))
+        assert r.status_code == 200, r.text
+        return [s["session_id"] for s in r.json()["sessions"]]
+
+    assert listed("status=working,waiting,ready") == [SID]
+    assert listed("status=ready&status=waiting,working") == [SID]
+    assert listed("status=done,none") == []
+    for query in ("status=working,busy", "status=working,", "status="):
+        r = env.client.get(f"/v1/sessions?{query}", headers=env.h("laptop"))
+        assert r.status_code == 400, query
+
+
 def test_status_409_body(env: Env) -> None:
     g = new_gen(env, "laptop", WS_LAPTOP)
     append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)

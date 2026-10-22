@@ -257,7 +257,66 @@ _MIGRATIONS: list[str] = [
         PRIMARY KEY (session, host, source)
     );
     """,
+    # The session list sorts and filters in SQL. `status` is a copy of the
+    # status of the latest status event, and `metadata` is a copy of the body
+    # of the latest metadata event. Each write of such an event updates its
+    # copy in the same transaction. The event tables stay the source of
+    # truth.
+    """
+    ALTER TABLE sessions ADD COLUMN status TEXT;
+    ALTER TABLE sessions ADD COLUMN metadata TEXT;
+    UPDATE sessions SET status = (
+        SELECT e.status FROM status_events e WHERE e.session = sessions.id
+        ORDER BY e.seq DESC LIMIT 1
+    );
+    UPDATE sessions SET metadata = (
+        SELECT m.body FROM metadata_events m WHERE m.session = sessions.id
+        ORDER BY m.id DESC LIMIT 1
+    );
+    CREATE INDEX sessions_recent ON sessions (
+        account, COALESCE(last_activity, created),
+        status, lease_state, lease_host, harness
+    );
+    CREATE INDEX placements_host ON placements (host, session);
+    CREATE INDEX placements_workspace ON placements (workspace, session);
+    CREATE INDEX metadata_events_author ON metadata_events (session, host);
+    """,
 ]
+
+# Read access to the session `s` for the host `:host`, for scopes other than
+# `all`. `:granted` is 1 for the `granted` scope.
+#
+# Only a held lease gives read access. A lease reserved for a host does not:
+# a surrender needs only the append scope, so a reserve must not work as a
+# grant. Metadata and blobs can arrive before the first generation. Their
+# stored authors give access without a placement or an early lease.
+_READABLE = """(
+    (s.lease_state = 'held' AND s.lease_host = :host)
+    OR EXISTS (
+        SELECT 1 FROM placements p WHERE p.session = s.id AND p.host = :host
+    )
+    OR EXISTS (
+        SELECT 1 FROM files f JOIN generations g ON g.file = f.id
+        WHERE f.session = s.id AND g.host = :host
+    )
+    OR EXISTS (
+        SELECT 1 FROM metadata_events m WHERE m.session = s.id AND m.host = :host
+    )
+    OR EXISTS (
+        SELECT 1 FROM files f JOIN blob_versions b ON b.file = f.id
+        WHERE f.session = s.id AND b.host = :host
+    )
+    OR (:granted AND EXISTS (
+        SELECT 1 FROM grants gr WHERE gr.session = s.id AND gr.host = :host
+    ))
+)"""
+
+# The sort order of the session list. The index `sessions_recent` starts
+# with the same expression, so SQLite reads the rows in this order and sorts
+# only the rows that have the same time. The other columns of the index let
+# SQLite refuse a row for the status, lease, and harness filters, and for
+# read access, without a read of the table row.
+_RECENT = "COALESCE(s.last_activity, s.created) DESC, s.id DESC"
 
 # A heartbeat expires after this many of its intervals.
 HEARTBEAT_EXPIRY = 3
@@ -1095,12 +1154,16 @@ class Store:
         self, key: SessionKey, writer: Writer, metadata: SessionMetadata
     ) -> None:
         validate_metadata(dict(metadata))
+        body = json.dumps(metadata)
         with self._tx():
             session = self._ensure_session(key)
             self._db.execute(
                 "INSERT INTO metadata_events (session, host, received, body) "
                 "VALUES (?, ?, ?, ?)",
-                (session["id"], writer.host, self.now(), json.dumps(metadata)),
+                (session["id"], writer.host, self.now(), body),
+            )
+            self._db.execute(
+                "UPDATE sessions SET metadata = ? WHERE id = ?", (body, session["id"])
             )
 
     def _latest_metadata(self, session: int) -> SessionMetadata:
@@ -1109,9 +1172,15 @@ class Store:
             "ORDER BY id DESC LIMIT 1",
             (session,),
         ).fetchone()
-        if row is None:
+        return self._clean_metadata(row["body"] if row is not None else None)
+
+    @staticmethod
+    def _clean_metadata(body: str | None) -> SessionMetadata:
+        """The metadata in the body of a metadata event, with no fields that
+        are not valid."""
+        if body is None:
             return {}
-        metadata: dict[str, Any] = json.loads(row["body"])
+        metadata: dict[str, Any] = json.loads(body)
         # Old servers accepted malformed fields. Keep their events, but do
         # not let them break readers or new placements after an upgrade.
         clean: dict[str, Any] = {}
@@ -1169,19 +1238,27 @@ class Store:
         rows = self._db.execute(
             "SELECT * FROM placements WHERE session = ? ORDER BY id", (session,)
         ).fetchall()
-        out: list[Placement] = []
-        for r in rows:
-            p: Placement = {
-                "host": r["host"],
-                "workspace": r["workspace"],
-                "cause": r["cause"],
-                "first_seen": r["first_seen"],
-                "last_seen": r["last_seen"],
-            }
-            if r["cwd"] is not None:
-                p["cwd"] = r["cwd"]
-            out.append(p)
-        return out
+        return [self._placement(r) for r in rows]
+
+    def _last_placement(self, session: int) -> Placement | None:
+        row = self._db.execute(
+            "SELECT * FROM placements WHERE session = ? ORDER BY id DESC LIMIT 1",
+            (session,),
+        ).fetchone()
+        return self._placement(row) if row is not None else None
+
+    @staticmethod
+    def _placement(row: sqlite3.Row) -> Placement:
+        p: Placement = {
+            "host": row["host"],
+            "workspace": row["workspace"],
+            "cause": row["cause"],
+            "first_seen": row["first_seen"],
+            "last_seen": row["last_seen"],
+        }
+        if row["cwd"] is not None:
+            p["cwd"] = row["cwd"]
+        return p
 
     # --- Leases ---------------------------------------------------------
 
@@ -1559,15 +1636,17 @@ class Store:
             )
 
     def _session_state(self, session: int) -> SessionStateBody:
-        return self._session_state_and_excerpt(session)[0]
-
-    def _session_state_and_excerpt(
-        self, session: int
-    ) -> tuple[SessionStateBody, str | None]:
-        """The state body, and the excerpt of the latest status event."""
         row = self._db.execute(
             "SELECT * FROM sessions WHERE id = ?", (session,)
         ).fetchone()
+        return self._session_state_and_excerpt(row)[0]
+
+    def _session_state_and_excerpt(
+        self, row: sqlite3.Row
+    ) -> tuple[SessionStateBody, str | None]:
+        """The state body of the session `row`, and the excerpt of its latest
+        status event."""
+        session = int(row["id"])
         body: SessionStateBody = {"state": row["state"], "lease": self._lease(row)}
         if row["state"] == "conflicted":
             branches: list[Branch] = []
@@ -1653,6 +1732,10 @@ class Store:
                     int(request["explicit"]),
                     self.now(),
                 ),
+            )
+            self._db.execute(
+                "UPDATE sessions SET status = ? WHERE id = ?",
+                (request["status"], session),
             )
             added = self._latest_status(session)
             assert added is not None
@@ -1905,48 +1988,15 @@ class Store:
         return self._can_read_row(session, host, scope)
 
     def _can_read_row(self, session: sqlite3.Row, host: str, scope: ReadScope) -> bool:
+        """See "Scopes" in the spec. `_READABLE` has the rules, so that the
+        session list applies the same rules in SQL."""
         if scope == "all":
             return True
-        # Only a held lease gives read access. A lease reserved for a host
-        # does not: a surrender needs only the append scope, so a reserve
-        # must not work as a grant.
-        if session["lease_state"] == "held" and session["lease_host"] == host:
-            return True
-        placed = self._db.execute(
-            "SELECT 1 FROM placements WHERE session = ? AND host = ? LIMIT 1",
-            (session["id"], host),
+        row = self._db.execute(
+            f"SELECT EXISTS (SELECT 1 FROM sessions s WHERE s.id = :id AND {_READABLE})",
+            {"id": session["id"], "host": host, "granted": int(scope == "granted")},
         ).fetchone()
-        if placed is not None:
-            return True
-        wrote = self._db.execute(
-            "SELECT 1 FROM generations g JOIN files f ON f.id = g.file "
-            "WHERE f.session = ? AND g.host = ? LIMIT 1",
-            (session["id"], host),
-        ).fetchone()
-        if wrote is not None:
-            return True
-        # Metadata and blobs can arrive before the first generation. Their
-        # stored authors give access without a placement or an early lease.
-        metadata = self._db.execute(
-            "SELECT 1 FROM metadata_events WHERE session = ? AND host = ? LIMIT 1",
-            (session["id"], host),
-        ).fetchone()
-        if metadata is not None:
-            return True
-        blob = self._db.execute(
-            "SELECT 1 FROM blob_versions b JOIN files f ON f.id = b.file "
-            "WHERE f.session = ? AND b.host = ? LIMIT 1",
-            (session["id"], host),
-        ).fetchone()
-        if blob is not None:
-            return True
-        if scope == "granted":
-            granted = self._db.execute(
-                "SELECT 1 FROM grants WHERE session = ? AND host = ?",
-                (session["id"], host),
-            ).fetchone()
-            return granted is not None
-        return False
+        return bool(row[0])
 
     def audit_read(self, key: SessionKey, host: str, what: str) -> None:
         with self._tx():
@@ -2245,90 +2295,124 @@ class Store:
         `statuses` and `liveness` can contain `none`, which matches a session
         with no status event or with no liveness. `open_only` keeps the
         sessions whose latest status is not `done`.
+
+        SQL applies all filters except `title` and `liveness`, and sorts with
+        the index `sessions_recent`. Without these two filters, SQL also
+        applies the limit. With them, the store reads the rows in batches
+        until it has `limit` sessions. Only the sessions that the list
+        returns get the queries for their state, metadata, and placement.
         """
-        rows = self._db.execute(
-            "SELECT * FROM sessions WHERE account = ? "
-            "AND (? IS NULL OR harness = ?) "
-            "AND (? IS NULL OR COALESCE(last_activity, created) >= ?) "
-            "ORDER BY COALESCE(last_activity, created) DESC",
-            (account, harness, harness, since, since),
-        ).fetchall()
+        where = ["s.account = :account"]
+        params: dict[str, Any] = {"account": account, "host": host}
+        if harness is not None:
+            where.append("s.harness = :harness")
+            params["harness"] = harness
+        if since is not None:
+            where.append("COALESCE(s.last_activity, s.created) >= :since")
+            params["since"] = since
+        if lease_host is not None:
+            where.append("s.lease_state = 'held' AND s.lease_host = :lease_host")
+            params["lease_host"] = lease_host
+        if on_host is not None:
+            where.append(
+                "EXISTS (SELECT 1 FROM placements p "
+                "WHERE p.session = s.id AND p.host = :on_host)"
+            )
+            params["on_host"] = on_host
+        if workspace is not None:
+            where.append(
+                "EXISTS (SELECT 1 FROM placements p "
+                "WHERE p.session = s.id AND p.workspace = :workspace)"
+            )
+            params["workspace"] = workspace
+        if statuses is not None:
+            names = sorted(statuses - {"none"})
+            matches = ["0"]
+            for i, name in enumerate(names):
+                params[f"status{i}"] = name
+            if names:
+                listed = ", ".join(f":status{i}" for i in range(len(names)))
+                matches.append(f"s.status IN ({listed})")
+            if "none" in statuses:
+                matches.append("s.status IS NULL")
+            where.append(f"({' OR '.join(matches)})")
+        if open_only:
+            where.append("(s.status IS NULL OR s.status != 'done')")
+        if scope != "all":
+            # Last, so that the simple filters skip its subqueries.
+            where.append(_READABLE)
+            params["granted"] = int(scope == "granted")
+        sql = f"SELECT * FROM sessions s WHERE {' AND '.join(where)} ORDER BY {_RECENT}"
+        in_python = title is not None or liveness is not None
+        if not in_python:
+            sql += " LIMIT :limit"
+            params["limit"] = limit
+        cursor = self._db.execute(sql, params)
         out: list[SessionSummary] = []
-        for row in rows:
-            if not self._can_read_row(row, host, scope):
-                continue
-            if lease_host is not None and (
-                row["lease_state"] != "held" or row["lease_host"] != lease_host
-            ):
-                continue
-            state, excerpt = self._session_state_and_excerpt(row["id"])
-            status = state.get("status")
-            status_name = status["status"] if status is not None else "none"
-            if statuses is not None and status_name not in statuses:
-                continue
-            if open_only and status_name == "done":
-                continue
-            live = state.get("liveness")
-            live_name = live["state"] if live is not None else "none"
-            if liveness is not None and live_name not in liveness:
-                continue
-            placements = self._placements(row["id"])
-            if on_host is not None and not any(
-                p["host"] == on_host for p in placements
-            ):
-                continue
-            if workspace is not None and not any(
-                p["workspace"] == workspace for p in placements
-            ):
-                continue
-            metadata = self._latest_metadata(row["id"])
-            if (
-                title is not None
-                and title.lower() not in (metadata.get("title") or "").lower()
-            ):
-                continue
-            summary: SessionSummary = {
-                "harness": row["harness"],
-                "session_id": row["session_id"],
-                "metadata": metadata,
-                "state": state,
-            }
-            if placements:
-                summary["last_placement"] = placements[-1]
-            if excerpt is not None:
-                summary["excerpt"] = excerpt
-            out.append(summary)
-            if len(out) >= limit:
-                break
+        try:
+            while len(out) < limit:
+                rows = cursor.fetchmany(max(limit, 50))
+                if not rows:
+                    break
+                for row in rows:
+                    metadata = self._clean_metadata(row["metadata"])
+                    if title is not None and (
+                        title.lower() not in (metadata.get("title") or "").lower()
+                    ):
+                        continue
+                    state, excerpt = self._session_state_and_excerpt(row)
+                    live = state.get("liveness")
+                    live_name = live["state"] if live is not None else "none"
+                    if liveness is not None and live_name not in liveness:
+                        continue
+                    summary: SessionSummary = {
+                        "harness": row["harness"],
+                        "session_id": row["session_id"],
+                        "metadata": metadata,
+                        "state": state,
+                    }
+                    placement = self._last_placement(row["id"])
+                    if placement is not None:
+                        summary["last_placement"] = placement
+                    if excerpt is not None:
+                        summary["excerpt"] = excerpt
+                    out.append(summary)
+                    if len(out) >= limit:
+                        break
+        finally:
+            cursor.close()
         return out
 
     @_reading
     def list_workspaces(
         self, account: str, host: str, scope: ReadScope
     ) -> list[dict[str, str | int]]:
-        """Workspaces of the sessions that `host` can read."""
-        readable = [
-            row["id"]
-            for row in self._db.execute(
-                "SELECT * FROM sessions WHERE account = ?", (account,)
-            ).fetchall()
-            if self._can_read_row(row, host, scope)
+        """Workspaces of the sessions that `host` can read, latest first.
+
+        `sessions` is the number of placements in the workspace. A session
+        that came back to a workspace has more than one placement there.
+        """
+        readable = "" if scope == "all" else f"AND {_READABLE}"
+        rows = self._db.execute(
+            f"""
+            SELECT p.host AS host, p.workspace AS workspace,
+                   MAX(p.last_seen) AS last_seen, COUNT(*) AS sessions
+            FROM sessions s JOIN placements p ON p.session = s.id
+            WHERE s.account = :account {readable}
+            GROUP BY p.host, p.workspace
+            ORDER BY last_seen DESC, p.host, p.workspace
+            """,
+            {"account": account, "host": host, "granted": int(scope == "granted")},
+        ).fetchall()
+        return [
+            {
+                "host": r["host"],
+                "workspace": r["workspace"],
+                "last_seen": r["last_seen"],
+                "sessions": r["sessions"],
+            }
+            for r in rows
         ]
-        found: dict[tuple[str, str], dict[str, str | int]] = {}
-        for session in readable:
-            for p in self._placements(session):
-                entry = found.setdefault(
-                    (p["host"], p["workspace"]),
-                    {
-                        "host": p["host"],
-                        "workspace": p["workspace"],
-                        "last_seen": p["last_seen"],
-                        "sessions": 0,
-                    },
-                )
-                entry["sessions"] = int(entry["sessions"]) + 1
-                entry["last_seen"] = max(str(entry["last_seen"]), p["last_seen"])
-        return sorted(found.values(), key=lambda e: str(e["last_seen"]), reverse=True)
 
     @staticmethod
     def _gen_info(gen: _Gen) -> GenerationInfo:

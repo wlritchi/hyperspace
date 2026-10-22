@@ -574,13 +574,15 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
     def choices(
         values: list[str], allowed: tuple[str, ...], name: str
     ) -> set[str] | None:
-        """A repeatable query parameter. `None` means no filter."""
+        """A repeatable query parameter. Each value can also be a
+        comma-separated list. `None` means no filter."""
         if not values:
             return None
-        for value in values:
+        split = [part for value in values for part in value.split(",")]
+        for value in split:
             if value not in allowed:
                 raise ApiError("bad_request", f"{name} must be one of {list(allowed)}")
-        return set(values)
+        return set(split)
 
     # --- Endpoints --------------------------------------------------------
 

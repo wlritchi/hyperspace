@@ -1078,7 +1078,7 @@ def test_migration_3_on_a_version_2_index(tmp_path: Path) -> None:
     db.close()
     with closing(Store(data)) as migrated:
         version = migrated._db.execute("SELECT version FROM schema_version").fetchone()
-        assert version["version"] == len(_MIGRATIONS) == 3
+        assert version["version"] == len(_MIGRATIONS)
         assert "status" not in migrated.session_state(KEY)
         assert set_status(migrated)["seq"] == 1
         assert beat(migrated, "laptop", KEY) == 1
