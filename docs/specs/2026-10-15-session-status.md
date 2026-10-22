@@ -207,10 +207,10 @@ write on top of it, so the new write can have the base from before the queued
 write. Thus the new write also tries again once on the event of a write that
 it replaced, and only on that event: an event after its base, from this host,
 with the same status, reason, wake kind, note, source kind and `explicit`. The
-client keeps the write that the last sync sent apart from the other replaced
-writes, so that many new writes during one send do not lose it. An automatic
-write still does not overwrite a `done` or an explicit status from a different
-writer.
+client also keeps each write that a sync sent, also after a send that failed,
+until the queue is empty. Thus many new writes during one send, and a failed
+send of the newest write, do not lose it. An automatic write still does not
+overwrite a `done` or an explicit status from a different writer.
 
 ### Transitions
 
