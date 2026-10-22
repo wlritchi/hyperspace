@@ -709,6 +709,9 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         )
         cursor = q.get("cursor")
         before = decode_cursor(cursor) if cursor is not None else None
+        parent = q.get("parent")
+        if parent is not None:
+            validate_session_id(parent)
         sessions, position = await run_in_threadpool(
             store.snapshot,
             lambda: store.list_sessions_page(
@@ -726,6 +729,8 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
                 liveness=liveness,
                 limit=min(limit, 1000),
                 before=before,
+                top_level=q.get("top_level") == "1",
+                parent=parent,
             ),
         )
         body: SessionList = {"sessions": sessions}

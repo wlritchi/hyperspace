@@ -136,6 +136,7 @@ def test_auth(env: Env) -> None:
             "session-status",
             "liveness",
             "list-cursor",
+            "child-sessions",
         ],
     }
 
@@ -492,6 +493,40 @@ def test_list_pages_with_a_cursor(env: Env) -> None:
     # A page that ends the list exactly has no cursor.
     body = env.client.get("/v1/sessions?limit=5", headers=env.h("laptop")).json()
     assert len(body["sessions"]) == 5 and "next" not in body
+
+
+def test_list_hides_children_only_when_asked(env: Env) -> None:
+    capabilities = env.client.get("/v1/whoami", headers=env.h("laptop")).json()
+    assert "child-sessions" in capabilities["capabilities"]
+    bodies = {
+        "parent": {"title": "work"},
+        "review": {"automation": "security-review", "links": {"parent": "parent"}},
+        "orphan": {"automation": "security-review"},
+    }
+    for sid, body in bodies.items():
+        r = env.client.post(
+            f"/v1/sessions/claude-code/{sid}/meta",
+            headers=env.h("laptop", WS_LAPTOP),
+            json=body,
+        )
+        assert r.status_code == 200, r.text
+
+    def listed(query: str) -> list[str]:
+        r = env.client.get(f"/v1/sessions?{query}", headers=env.h("laptop"))
+        assert r.status_code == 200, r.text
+        return [s["session_id"] for s in r.json()["sessions"]]
+
+    assert listed("harness=claude-code") == ["orphan", "review", "parent"]
+    assert listed("top_level=1") == ["parent"]
+    assert listed("parent=parent") == ["review"]
+    r = env.client.get("/v1/sessions?parent=../x", headers=env.h("laptop"))
+    assert r.status_code == 400
+    r = env.client.post(
+        "/v1/sessions/claude-code/bad/meta",
+        headers=env.h("laptop", WS_LAPTOP),
+        json={"automation": 7},
+    )
+    assert r.status_code == 400
 
 
 def _cursor(value: object) -> str:
