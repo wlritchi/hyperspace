@@ -609,10 +609,19 @@ The code follows this step, with these changes and additions:
   still retry on its event. The key becomes empty when a sync removes a write
   that no newer write replaced (then no queued write is on top of the sent
   writes), and when `set_status` removes the queue under the lock
-  (`status.drop_queue`). Tests:
+  (`status.drop_queue`). When a send has an outcome, its entry gets the `seq`
+  of its event, or goes away if the server did not accept it. A retry on a
+  replaced or sent write needs the exact event that it became
+  (`status._of_replaced`): the `seq` of the entry, or else the event just
+  after the base of the new write. A later event with the same fields (for
+  example a new prompt that reopens the session again) does not count. If a
+  send with no known outcome tried again after a 409 and landed later, the
+  queued automatic write is dropped; the status stays until the next status
+  write. Tests:
   `test_a_write_after_many_writes_during_the_send_of_a_reopen_is_written`,
   `test_a_write_whose_send_fails_still_retries_on_the_earlier_sent_write`,
-  `test_a_write_does_not_retry_on_a_sent_write_that_it_did_not_replace`.
+  `test_a_write_does_not_retry_on_a_sent_write_that_it_did_not_replace`,
+  `test_a_write_does_not_retry_on_a_later_event_with_the_fields_of_a_sent_write`.
 - If the current status is `done`, only `UserPromptSubmit` writes. This
   explicit reopen also drops the pending `done` notices, so that the hook does
   not print "Finish the current step and stop" for the prompt that reopens the

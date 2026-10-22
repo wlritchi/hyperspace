@@ -864,6 +864,28 @@ def test_a_write_whose_send_fails_still_retries_on_the_earlier_sent_write(
     assert ctx.state.wanted_status(H, SID) is None
 
 
+def test_a_write_does_not_retry_on_a_later_event_with_the_fields_of_a_sent_write(
+    ctx: Context, server: StatusServer
+) -> None:
+    # The reopen became event 14, and the Stop of its turn is queued on base
+    # 13. While the server cannot be reached, another writer on this host
+    # marks the session done (15), and a new prompt reopens it (16) with the
+    # fields of the first reopen. The Stop of the old turn is not on top of
+    # event 16.
+    session = _done_session(ctx, server)
+    _hook(ctx, "UserPromptSubmit")()
+    server.during_add = _hook(ctx, "Stop")
+    send_wanted(ctx, session)
+    assert _latest(server) == (14, "working", None, True, "user")
+    server.during_add = _down
+    send_wanted(ctx, session)
+    server.mark("done", "laptop", note="merged")
+    server.mark("working", "laptop", **REOPEN)
+    send_wanted(ctx, session)
+    assert _latest(server) == (16, "working", None, True, "user")
+    assert ctx.state.wanted_status(H, SID) is None
+
+
 def test_a_write_does_not_retry_on_a_sent_write_that_it_did_not_replace(
     ctx: Context, server: StatusServer
 ) -> None:

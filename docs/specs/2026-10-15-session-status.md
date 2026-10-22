@@ -205,12 +205,24 @@ A new write from the client replaces a queued write that is not sent yet (see
 "Transitions"). A sync can send the queued write while a hook decides the new
 write on top of it, so the new write can have the base from before the queued
 write. Thus the new write also tries again once on the event of a write that
-it replaced, and only on that event: an event after its base, from this host,
-with the same status, reason, wake kind, note, source kind and `explicit`. The
-client also keeps each write that a sync sent, also after a send that failed,
-until the queue is empty. Thus many new writes during one send, and a failed
-send of the newest write, do not lose it. An automatic write still does not
-overwrite a `done` or an explicit status from a different writer.
+it replaced, and only on that event. The event must be from this host, with
+the same status, reason, wake kind, note, source kind and `explicit`. A field
+match alone is not sufficient, because a later write can have the same fields.
+Thus the event must also be the event that the replaced write became:
+
+- If the client knows the outcome of the send of the replaced write, the event
+  must have the `seq` of that outcome.
+- Else (a send that failed, or a write that a hook replaced), the event must
+  be the event just after the base of the new write.
+
+The client also keeps each write that a sync sent, also after a send that
+failed, until the queue is empty. Thus many new writes during one send, and a
+failed send of the newest write, do not lose it. A rare case stays: a send
+whose outcome is not known can try again after a 409 and land later than the
+event just after the base. The new automatic write then gets a 409 on it and
+is dropped, and the status stays as it is until the next status write. An
+automatic write still does not overwrite a `done` or an explicit status from a
+different writer.
 
 ### Transitions
 
