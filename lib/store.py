@@ -17,6 +17,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import logging
 import secrets
 import sqlite3
 import threading
@@ -307,7 +308,70 @@ _MIGRATIONS: list[str] = [
         account, parent, COALESCE(last_activity, created)
     ) WHERE parent IS NOT NULL;
     """,
+    # The newest event of each event table that has a copy in the session
+    # row (see `_repair_copies`). A mark of 0 makes the next start fill the
+    # copies of every session.
+    """
+    CREATE TABLE copy_marks (
+        events TEXT PRIMARY KEY,
+        last_id INTEGER NOT NULL,
+        last_key TEXT NOT NULL
+    );
+    INSERT INTO copy_marks VALUES ('status_events', 0, ''), ('metadata_events', 0, '');
+    """,
 ]
+
+# The event tables whose latest event has a copy in the session row, with an
+# expression that identifies an event. A server before migration 4 writes
+# events and does not update the copies. Each write of this server sets the
+# mark to its event in the same transaction. Thus an event above the mark,
+# or a mark whose event is gone or is a different event (a deleted row whose
+# id SQLite gave again), shows a write that did not update the copies.
+_COPY_MARKS = {
+    "status_events": "session || ':' || seq || ':' || received",
+    "metadata_events": "session || ':' || received",
+}
+# The statements that fill the copies of the sessions that `{where}` selects,
+# from their events. The same rules as migrations 4 and 5.
+_FILL_COPIES = {
+    "status_events": [
+        """
+        UPDATE sessions SET status = (
+            SELECT e.status FROM status_events e WHERE e.session = sessions.id
+            ORDER BY e.seq DESC LIMIT 1
+        ) WHERE {where}
+        """
+    ],
+    "metadata_events": [
+        """
+        UPDATE sessions SET metadata = (
+            SELECT m.body FROM metadata_events m WHERE m.session = sessions.id
+            ORDER BY m.id DESC LIMIT 1
+        ) WHERE {where}
+        """,
+        """
+        UPDATE sessions SET parent = CASE
+            WHEN json_valid(metadata)
+                AND json_type(metadata, '$.links.parent') = 'text'
+                AND NOT EXISTS (
+                    SELECT 1 FROM json_each(metadata, '$.links')
+                    WHERE type != 'text'
+                )
+            THEN json_extract(metadata, '$.links.parent')
+        END WHERE {where}
+        """,
+        """
+        UPDATE sessions SET top_level = CASE
+            WHEN parent IS NOT NULL
+                OR (json_valid(metadata)
+                    AND json_type(metadata, '$.automation') = 'text')
+            THEN 0 ELSE 1
+        END WHERE {where}
+        """,
+    ],
+}
+
+log = logging.getLogger("hyperspace.store")
 
 # Read access to the session `s` for the host `:host`, for scopes other than
 # `all`. `:granted` is 1 for the `granted` scope.
@@ -624,6 +688,7 @@ class Store:
         # A negative size is in KiB.
         self._writer.execute(f"PRAGMA cache_size = {-(WRITE_CACHE_BYTES // 1024)}")
         self._migrate()
+        self._repair_copies()
         self._readers = _ReadPool(path, read_connections, read_cache_bytes)
         # Recovery (see `recover`) is not done here: only the server calls it,
         # at startup. An admin script that runs beside the server must not cut
@@ -667,6 +732,53 @@ class Store:
                 except BaseException:
                     self._db.execute("ROLLBACK")
                     raise
+
+    def _repair_copies(self) -> None:
+        """Fill the copies of the latest status and metadata in the session
+        rows again where a server that does not keep them wrote events, for
+        example after a rollback to an older server and a new upgrade. Only
+        the sessions with events above the mark get new copies, unless the
+        mark cannot be trusted; then all sessions do."""
+        with self._tx():
+            for table, key in _COPY_MARKS.items():
+                mark = self._db.execute(
+                    "SELECT last_id, last_key FROM copy_marks WHERE events = ?",
+                    (table,),
+                ).fetchone()
+                last_id = mark["last_id"] if mark is not None else 0
+                trusted = mark is not None
+                if trusted and last_id:
+                    row = self._db.execute(
+                        f"SELECT {key} AS k FROM {table} WHERE rowid = ?", (last_id,)
+                    ).fetchone()
+                    trusted = row is not None and row["k"] == mark["last_key"]
+                if trusted:
+                    newer = self._db.execute(
+                        f"SELECT COUNT(DISTINCT session) AS n FROM {table} "
+                        "WHERE rowid > ?",
+                        (last_id,),
+                    ).fetchone()["n"]
+                    if not newer:
+                        continue
+                    where = f"id IN (SELECT session FROM {table} WHERE rowid > :mark)"
+                    log.info("%s: new copies for %d sessions", table, newer)
+                else:
+                    where = "1"
+                    log.warning("%s: the mark is not valid; new copies for all", table)
+                for statement in _FILL_COPIES[table]:
+                    self._db.execute(statement.format(where=where), {"mark": last_id})
+                self._mark_copy(table)
+
+    def _mark_copy(self, table: str) -> None:
+        """Set the mark of an event table to its newest event, in the
+        transaction that wrote or deleted events (see `_COPY_MARKS`)."""
+        self._db.execute(
+            "INSERT OR REPLACE INTO copy_marks (events, last_id, last_key) "
+            f"SELECT ?, m.id, COALESCE((SELECT {_COPY_MARKS[table]} FROM {table} "
+            f"WHERE rowid = m.id), '') "
+            f"FROM (SELECT COALESCE(MAX(rowid), 0) AS id FROM {table}) m",
+            (table,),
+        )
 
     def _tx(self) -> _Transaction:
         return _Transaction(self)
@@ -1208,6 +1320,7 @@ class Store:
                 "WHERE id = ?",
                 (body, parent, int(top_level), session["id"]),
             )
+            self._mark_copy("metadata_events")
 
     def _latest_metadata(self, session: int) -> SessionMetadata:
         row = self._db.execute(
@@ -1780,6 +1893,7 @@ class Store:
                 "UPDATE sessions SET status = ? WHERE id = ?",
                 (request["status"], session),
             )
+            self._mark_copy("status_events")
             added = self._latest_status(session)
             assert added is not None
             return added[0]
@@ -2155,6 +2269,8 @@ class Store:
             ).rowcount
             self._db.execute("DELETE FROM files WHERE session = ?", (sid,))
             self._db.execute("DELETE FROM sessions WHERE id = ?", (sid,))
+            for table in _COPY_MARKS:
+                self._mark_copy(table)
             orphans = self._unreferenced(digests)
             self._record_purge(
                 f"session {key.account}/{key.harness}/{key.session_id}", reason

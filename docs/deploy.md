@@ -250,6 +250,16 @@ client requires restore preconditions before it changes local files or takes a
 lease. Unicode workspace uploads require encoded-header support. A subsequent
 release will remove the legacy request forms.
 
+### Rollback
+
+The server's index migrations only add to the schema, and an older server
+ignores the migrations that it does not know. Thus a rollback to an older
+server image works with the same data directory. An older server does not
+update the copies of the latest status and metadata in the session rows, which
+the session list uses. When the newer server starts again, it finds the events
+that the older server wrote, fills the copies of these sessions again, and
+logs `new copies for N sessions`. No admin step is necessary.
+
 ## 4. Teleport a session
 
 On the host that has the session (the lease holder), stop the session, then:
