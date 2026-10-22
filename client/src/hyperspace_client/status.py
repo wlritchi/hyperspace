@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 import httpx
 
-from hyperspace_client.adapters.claude_code import ClaudeCode
+from hyperspace_client.adapters import LocalSession
+from hyperspace_client.adapters.claude_code import ClaudeCode, Job
 from hyperspace_client.api import ApiError, NotFound, StatusConflict
 from hyperspace_client.state import SessionRecord, State
 from hyperspace_protocol import (
@@ -31,7 +32,6 @@ from hyperspace_protocol import (
 )
 
 if TYPE_CHECKING:
-    from hyperspace_client.adapters import LocalSession
     from hyperspace_client.sync import Context
 
 log = logging.getLogger("hyperspace")
@@ -456,6 +456,96 @@ def send_wanted(ctx: Context, session: LocalSession) -> None:
         log.info("%s: status not sent: %s", sid, exc)
         return
     ctx.state.drop_wanted_status(h, sid, created)
+
+
+# --- Sessions that continued in a background job ------------------------------------
+
+# The state key that records, for a session S, the job id J for which the
+# client already decided whether to mark S done (see `end_continued`).
+_CONTINUED_KEY = "continued_done:{}:{}"
+
+
+def end_continued(
+    ctx: Context,
+    adapter: ClaudeCode,
+    synced: str | None = None,
+    jobs: Sequence[Job] | None = None,
+) -> None:
+    """Mark `done` each session S that continued in a background job J,
+    when J copied the conversation of S into its own transcript (see
+    "Transitions" in the session status spec). The work then continues in
+    J, and S gets no more records, so S must not stay open next to J.
+
+    With `synced`, only the sessions where `synced` is S or J. The caller
+    holds the sync lock of `synced`. With no `synced` (the launcher), each
+    such session. `jobs` is `adapter.jobs()`, if the caller has it. If
+    another process holds the sync lock of S, a later call decides."""
+    h = adapter.harness
+    state = ctx.state
+    continued = state.continued_from(h)
+    pairs = [
+        (source, target)
+        for target, sources in continued.items()
+        for source in sources
+        if synced in (None, source, target)
+        and state.get(_CONTINUED_KEY.format(h, source)) != target
+    ]
+    if not pairs:
+        return
+    by_own: dict[str, list[Job]] = {}
+    for job in adapter.jobs(continued) if jobs is None else jobs:
+        by_own.setdefault(job.own_id, []).append(job)
+    for source, target in pairs:
+        found = by_own.get(target, [])
+        # The session of the job is its own id only if the job copied a
+        # conversation into the transcript of its own id and resumes no
+        # other session (see `Job`). Before the copy, and in the older job
+        # shape, the job can write the transcript of S.
+        if len(found) != 1 or found[0].session_id != target:
+            continue
+        if source == synced:
+            _end_continued(ctx, adapter, source, target)
+            continue
+        with state.try_lock(h, source) as locked:
+            if locked:
+                _end_continued(ctx, adapter, source, target)
+
+
+def _end_continued(ctx: Context, adapter: ClaudeCode, source: str, target: str) -> None:
+    """`end_continued` for one session `source` that continued in the job
+    `target`. The caller holds the sync lock of `source`."""
+    h = adapter.harness
+    state = ctx.state
+    key = _CONTINUED_KEY.format(h, source)
+    if state.get(key) == target:
+        return
+    # `is_running` counts the process of the job as a process of S, because
+    # S continued in it. Only a process under the id of S, or a job whose
+    # state names S, can write S now.
+    if adapter.own_process_runs(source):
+        return
+    transcripts = adapter.find_transcripts(source)
+    if not transcripts or target not in adapter.continued_in(source):
+        return
+    # Read the queue before the record, as `on_hook` does.
+    queued = state.wanted_status(h, source)
+    record = state.session(h, source)
+    write = _known(record, queued).status != "done"
+    if write:
+        # Not explicit: the client infers this, as a hook does. A prompt or
+        # `hyperspace reopen` reopens S as usual. An explicit done from
+        # outside the session gives a notice, but no agent runs in S.
+        want = _want("done", note=f"continued in {target}")
+        want["base_seq"] = seq(record.status)
+        # This replaces a queued write of a hook of J from before the copy,
+        # when the hooks of J acted on S.
+        queue(state, h, source, want, queued)
+    # Decide only once for each job. Thus a later `hyperspace reopen` of S,
+    # or a resume of S, stays open.
+    state.put(key, target)
+    if write:
+        log.info("%s: done; continued in %s", source, target)
+        send_wanted(ctx, LocalSession(h, source, transcripts[0]))
 
 
 _CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")

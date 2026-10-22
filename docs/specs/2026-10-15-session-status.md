@@ -141,12 +141,12 @@ _note_: one line from the agent or the user, for example "waiting for CI on PR
 #41" or "need a decision on the state backend". For `done`, the note is the
 outcome.
 
-| Status    | Meaning                                     | What wakes it                                                                                                      |
-| --------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `working` | A turn is in progress.                      | (It is awake.)                                                                                                     |
-| `waiting` | The turn ended. The agent expects an event. | `wake: local`: a cron, Monitor or background task in the process. `wake: message`: a message or an external event. |
-| `ready`   | The turn ended. The agent needs the user.   | Any user interaction, including a resume.                                                                          |
-| `done`    | The user or the agent closed the work.      | A user prompt, a cron that fires, or an explicit reopen. Not a plain message.                                      |
+| Status    | Meaning                                            | What wakes it                                                                                                      |
+| --------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `working` | A turn is in progress.                             | (It is awake.)                                                                                                     |
+| `waiting` | The turn ended. The agent expects an event.        | `wake: local`: a cron, Monitor or background task in the process. `wake: message`: a message or an external event. |
+| `ready`   | The turn ended. The agent needs the user.          | Any user interaction, including a resume.                                                                          |
+| `done`    | The user, the agent or the client closed the work. | A user prompt, a cron that fires, or an explicit reopen. Not a plain message.                                      |
 
 `ready` has a _reason_:
 
@@ -180,7 +180,7 @@ each session. Each event has:
 - the _source_: the kind (`user`, `agent` or `hook`), the host, and the
   session id when an agent in a different session wrote the event;
 - `explicit`: true for an intent of the user or an agent (a mark, a reopen, a
-  declaration), false for a transition that a hook infers;
+  declaration), false for a transition that a hook or the client infers;
 - the receive time.
 
 The latest event is the session's current status.
@@ -281,6 +281,42 @@ Before the copy, a job that `/background` made looks like a job of the older
 shape. If the `continued-in` link of S is already synced then, the session of
 the job is S until the copy comes. Usually the link is not synced yet, so the
 job's first hooks write no status.
+
+After the copy, the work of S continues in J, and S gets no more records. Thus
+the client marks S `done`, with the note `continued in <J>`, so that the list
+of open sessions (U1) does not show the work twice. It writes the `done` only
+if all of these are true:
+
+- S's local transcript has a `continued-in` record with J, and J is the last
+  `continued-in` link in the synced metadata of S.
+- The state of exactly one job on this host has J as its `sessionId`, and J is
+  the only candidate of that job: J has a local transcript with a
+  conversation, and the job's state has no `resumeSessionId` or has J. A job
+  of the older shape, a job that resumes a different session, and a job with
+  no state on this host do not mark S. With no job state, the client cannot
+  tell a copy from a `claude --resume J` that gave the stub of an older job a
+  conversation of its own.
+- No process runs under the id of S, and the state of no live job names S. The
+  process of J does not count here, but it still makes S live (see
+  "Liveness").
+- The status of S (the queued write, else the latest event that the client
+  saw) is not `done`.
+
+The client does this check after each sync of S or of J, and at each tick of
+the launcher. The copy can come before or after the sync of S's link, and the
+job can be idle after the copy, so that no sync of J comes soon. Before the
+copy, J has no conversation, so the check does not mark S. Thus the `done`
+comes after the hooks of J stop to act on S, and a prompt in the job before
+the copy cannot reopen it.
+
+The write is a transition that the client infers: its source kind is `hook`,
+and it is not explicit. It replaces a queued write for S, for example a write
+of a hook of J from before the copy. Its base is the latest event of S that
+the client saw, so it does not replace an explicit status that a different
+writer set after that event (see "Conditional writes"). It gives no notice,
+because no agent runs in S. A prompt in S or `hyperspace reopen` reopens S as
+usual. The client decides only once for each S and J, so it does not mark S
+`done` again after a reopen.
 
 Only the job that runs a process changes the id of that process: its
 `CLAUDE_JOB_DIR` names the job, the job's state names the id, and a

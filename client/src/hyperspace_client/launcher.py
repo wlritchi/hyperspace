@@ -32,7 +32,7 @@ from hyperspace_client.adapters.claude_code import ClaudeCode, Job
 from hyperspace_client.api import ApiError, NotFound
 from hyperspace_client.backfill import Runner, RunResult, child_env
 from hyperspace_client.state import State
-from hyperspace_client.status import clean_note, printable
+from hyperspace_client.status import clean_note, end_continued, printable
 from hyperspace_client.sync import Context, register_host
 from hyperspace_client.teleport import TeleportError, back_up, restore_held
 from hyperspace_protocol import (
@@ -512,10 +512,14 @@ class Launcher:
 
     def sweep(self, live: list[str]) -> None:
         """Close the stopped jobs of `done` sessions. A job whose session is
-        not beyond doubt is never closed; the heartbeat says why."""
+        not beyond doubt is never closed; the heartbeat says why. Also mark
+        `done` the sessions that continued in a job that copied them (see
+        `end_continued`): the job can be idle after the copy, so that no
+        sync of it comes soon."""
         state, adapter = self.ctx.state, self.adapter
         now = self.clock()
         jobs = adapter.jobs(state.continued_from(adapter.harness))
+        end_continued(self.ctx, adapter, jobs=jobs)
         by_name = {j.short: j for j in jobs}
         entries = load_unclosed(state, adapter)
         # A refusal of `claude rm` holds until the job goes away or its state

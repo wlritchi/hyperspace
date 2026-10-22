@@ -587,6 +587,16 @@ class ClaudeCode:
         session that it continues. Thus a process also counts if its job's
         state names the session, or if the session's transcript records
         that it continued in the process's session id."""
+        return self._runs(session_id, links=True)
+
+    def own_process_runs(self, session_id: str) -> bool:
+        """As `is_running`, but a process under an id that the session
+        continued in does not count. Thus a job that copied the conversation
+        of the session into the transcript of its own id does not make the
+        session run."""
+        return self._runs(session_id, links=False)
+
+    def _runs(self, session_id: str, links: bool) -> bool:
         sessions = self.config_dir / "sessions"
         if not sessions.is_dir():
             return False
@@ -602,8 +612,10 @@ class ClaudeCode:
                 return True
             if session_id in self._job_sessions(record.get("jobId")):
                 return True
+            if not links:
+                continue
             if continued is None:
-                continued = self._continued_in(session_id)
+                continued = self.continued_in(session_id)
             if record.get("sessionId") in continued:
                 return True
         return False
@@ -628,7 +640,7 @@ class ClaudeCode:
             if isinstance(v := fields.get(k), str)
         }
 
-    def _continued_in(self, session_id: str) -> set[str]:
+    def continued_in(self, session_id: str) -> set[str]:
         """The ids in the `continued-in` records of the session's local
         transcripts."""
         found: set[str] = set()
