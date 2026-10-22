@@ -165,7 +165,7 @@ def handle(
             except ConfigError as exc:
                 log.info("%s: no resume check: %s", session.session_id, exc)
             else:
-                api = Api(url, token, timeout=2.0)
+                api = Api(url, token, timeout=2.0, list_timeout=2.0)
                 try:
                     ctx = Context(api=api, state=state, adapter=adapter, host=cfg.host)
                     decision = check_resume(ctx, session)

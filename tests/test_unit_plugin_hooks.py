@@ -221,3 +221,11 @@ def test_plugin_commands_and_skills_only_call_the_cli() -> None:
         assert text.startswith("---\n")
         assert "hyperspace " in text
     assert "hyperspace done --by-user" in texts[0]
+
+
+def test_overview_skill_lists_sessions_by_status() -> None:
+    # `--open` also lists the sessions with no status, usually old sessions
+    # from before session status.
+    text = (PLUGIN / "skills" / "session-overview" / "SKILL.md").read_text()
+    assert "hyperspace ls --status working,waiting,ready --json" in text
+    assert "--open" not in text

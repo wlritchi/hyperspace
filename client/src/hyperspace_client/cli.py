@@ -23,7 +23,7 @@ from hyperspace_client import backfill, credentials, launcher
 from hyperspace_client import config as config_mod
 from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
-from hyperspace_client.api import Api, ApiError, NotFound
+from hyperspace_client.api import MAX_PAGE, Api, ApiError, NotFound
 from hyperspace_client.checkpoint import checkpoint
 from hyperspace_client.config import Config, ConfigError
 from hyperspace_client.credentials import CredentialError
@@ -48,8 +48,10 @@ from hyperspace_client.teleport import (
     send,
 )
 from hyperspace_protocol import (
+    CAP_LIST_CURSOR,
     CAP_LIVENESS,
     CAP_SESSION_STATUS,
+    STATUSES,
     SessionStateBody,
     SessionSummary,
     StatusEvent,
@@ -78,6 +80,14 @@ STATUS_LOCK_WAIT = 10.0
 TAIL_WINDOW = 512 * 1024
 # The order of `ls --open`: sessions that need the user first.
 _RANK = {"ready": 0, "interrupted": 1, "stalled": 1, "working": 2, "waiting": 3}
+# The values of `ls --status`.
+_LS_STATUSES = (*STATUSES, "none")
+# The page size of `ls` with no `--limit`.
+LS_LIMIT = 50
+# The CLI's message for a timeout of a request.
+TIMEOUT_MESSAGE = (
+    "the server did not answer in time; it may be busy or its storage slow"
+)
 
 
 class Exit(Exception):
@@ -442,18 +452,29 @@ def _print_status_table(sessions: list[SessionSummary], stalled_after: float) ->
 def cmd_ls(args: argparse.Namespace, cfg: Config) -> int:
     url, token = cfg.require_server()
     with_status = args.open or bool(args.status)
+    filters: dict[str, str | list[str]] = {
+        "harness": args.harness or "",
+        "host": args.host or "",
+        "workspace": args.workspace or "",
+        "title": args.title or "",
+        "open": "1" if args.open else "",
+        # Repeated parameters: a server before comma-separated values also
+        # accepts them.
+        "status": list(dict.fromkeys(args.status or [])),
+    }
     with Api(url, token) as api:
         if with_status:
             api.require_capability(CAP_SESSION_STATUS)
-        sessions = api.sessions(
-            harness=args.harness or "",
-            host=args.host or "",
-            workspace=args.workspace or "",
-            title=args.title or "",
-            limit=str(args.limit),
-            open="1" if args.open else "",
-            status=args.status or [],
-        )
+        if args.all_pages:
+            sessions = list(api.all_sessions(args.limit, **filters))
+            if len(sessions) >= MAX_PAGE and not api.has_capability(CAP_LIST_CURSOR):
+                print(
+                    "hyperspace: the server cannot page the list; "
+                    f"only the newest {MAX_PAGE} sessions are shown",
+                    file=sys.stderr,
+                )
+        else:
+            sessions = api.sessions(**filters, limit=str(args.limit or LS_LIMIT))
     if args.json:
         print(json.dumps(sessions, indent=2))
         return 0
@@ -892,6 +913,7 @@ def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
                     raise Exit(1, "a launcher already runs for this host")
                 return 0
             ctx = _context(cfg, state)
+            ctx.api.list_timeout = launcher.LIST_TIMEOUT
             try:
                 # A runner's main process must not stop when the server is
                 # not available for a short time at its start.
@@ -939,8 +961,9 @@ def _refresh_token(cfg: Config, ctx: Context) -> None:
         log.warning("launcher: %s", exc)
         return
     cfg.token = found[0]
+    list_timeout = ctx.api.list_timeout
     ctx.api.close()
-    ctx.api = Api(cfg.url, found[0])
+    ctx.api = Api(cfg.url, found[0], list_timeout=list_timeout)
 
 
 def _with_context(cfg: Config, fn: Callable[[Context, ClaudeCode], int]) -> int:
@@ -1018,6 +1041,17 @@ def cmd_fork(args: argparse.Namespace, cfg: Config) -> int:
     return _with_context(cfg, run)
 
 
+def _status_values(value: str) -> list[str]:
+    """The statuses in one `ls --status` value: a comma-separated list."""
+    values = [v.strip() for v in value.split(",") if v.strip()]
+    invalid = [v for v in values if v not in _LS_STATUSES]
+    if invalid or not values:
+        raise argparse.ArgumentTypeError(
+            f"invalid status {value!r}; use one or more of {', '.join(_LS_STATUSES)}"
+        )
+    return values
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="hyperspace", description=__doc__)
     parser.add_argument(
@@ -1071,16 +1105,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", help="sessions with a placement on this host")
     p.add_argument("--workspace")
     p.add_argument("--title", help="text in the title")
-    p.add_argument("--limit", type=int, default=50)
+    p.add_argument(
+        "--limit",
+        type=int,
+        help=f"the most sessions to show (default {LS_LIMIT}); "
+        "with --all-pages, the size of each page",
+    )
+    p.add_argument(
+        "--all-pages",
+        action="store_true",
+        help="show every matching session: read the list page by page",
+    )
     p.add_argument("--json", action="store_true")
     p.add_argument(
         "--open", action="store_true", help="only sessions that are not done"
     )
     p.add_argument(
         "--status",
-        action="append",
-        choices=["working", "waiting", "ready", "done", "none"],
-        help="only sessions with this status (repeatable)",
+        action="extend",
+        type=_status_values,
+        metavar="STATUS[,STATUS...]",
+        help=f"only sessions with one of these statuses ({', '.join(_LS_STATUSES)}); "
+        "comma-separated or repeatable",
     )
     p.add_argument(
         "--stalled-after",
@@ -1270,11 +1316,22 @@ def main(argv: list[str] | None = None) -> int:
             print(f"hyperspace: {exc.message}", file=sys.stderr)
         return exc.code
     except (ConfigError, CredentialError, ApiError, httpx.HTTPError, OSError) as exc:
+        message = _error_message(exc)
         if quiet:
-            log.warning("%s: %s", type(exc).__name__, exc)
+            log.warning("%s: %s", type(exc).__name__, message)
             return 0
-        print(f"hyperspace: {exc}", file=sys.stderr)
+        print(f"hyperspace: {message}", file=sys.stderr)
         return 2 if isinstance(exc, ConfigError) else 1
+
+
+def _error_message(exc: Exception) -> str:
+    """The text of an error for the user. The text of an httpx timeout does
+    not say which wait ended."""
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "no connection to the server in time"
+    if isinstance(exc, httpx.TimeoutException):
+        return TIMEOUT_MESSAGE
+    return str(exc)
 
 
 if __name__ == "__main__":
