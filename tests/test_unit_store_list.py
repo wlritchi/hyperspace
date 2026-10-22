@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from hyperspace_protocol import ReadScope, SessionSummary, Status, StatusRequest
-from store import _MIGRATIONS, SessionKey, Store, Writer
+from store import _MIGRATIONS, ListPosition, SessionKey, Store, Writer
 
 HARNESS = "claude-code"
 WRITERS = [
@@ -171,7 +171,7 @@ def reference_list(
     with all its data from the event tables, filtered in Python."""
     rows = store._db.execute(
         "SELECT * FROM sessions WHERE account = 'acct' "
-        "ORDER BY COALESCE(last_activity, created) DESC, id DESC"
+        "ORDER BY COALESCE(last_activity, created) DESC, harness DESC, session_id DESC"
     ).fetchall()
     out: list[SessionSummary] = []
     for row in rows:
@@ -318,8 +318,9 @@ def test_status_and_metadata_copies_follow_their_events(store: Store) -> None:
     assert summary["state"]["status"]["status"] == "done"  # type: ignore[typeddict-item]
 
 
-def test_ties_in_activity_list_the_newer_row_first(store: Store) -> None:
-    for n in (1, 2, 3):
+def test_ties_in_activity_list_by_session_key(store: Store) -> None:
+    # The row ids are in a different order than the session ids.
+    for n in (2, 3, 1):
         store.add_metadata(key(n), WRITERS[0], {"title": str(n)})
     with store._tx():
         store._db.execute("UPDATE sessions SET last_activity = 'same'")
@@ -407,3 +408,96 @@ def test_migration_4_copies_the_latest_events(tmp_path: Path) -> None:
             )
         }
         assert {"sessions_recent", "placements_host", "placements_workspace"} <= names
+
+
+def page_all(
+    store: Store, host: str, scope: ReadScope, size: int, **filters: Any
+) -> list[str]:
+    """Read every page of a list. Return the session ids in order."""
+    out: list[str] = []
+    before: ListPosition | None = None
+    for _ in range(1000):
+        page, before = store.list_sessions_page(
+            "acct", host, scope, limit=size, before=before, **filters
+        )
+        out += [s["session_id"] for s in page]
+        if before is None:
+            return out
+    raise AssertionError("the pages did not end")
+
+
+@pytest.mark.parametrize("seed", [1, 2])
+def test_paging_returns_each_session_once(store: Store, seed: int) -> None:
+    build(store, seed)
+    # Many ties in the sort key: three activity times, and sessions with no
+    # activity whose creation time is one of them.
+    with store._tx():
+        store._db.execute(
+            "UPDATE sessions SET "
+            "last_activity = CASE WHEN id % 5 = 0 THEN NULL "
+            "ELSE '2026-10-13T00:00:0' || (id % 3) || '.000000Z' END, "
+            "created = '2026-10-13T00:00:01.000000Z'"
+        )
+    now = store._clock()
+    store._clock = lambda: now
+    for host in ("laptop", "agent-2"):
+        for scope in ("all", "granted"):
+            for filters in FILTERS:
+                filters = {k: v for k, v in filters.items() if k != "limit"}
+                expected = [
+                    s["session_id"]
+                    for s in reference_list(store, host, scope, limit=10_000, **filters)  # type: ignore[arg-type]
+                ]
+                for size in (1, 2, 7):
+                    got = page_all(store, host, scope, size, **filters)
+                    assert got == expected, (host, scope, filters, size)
+
+
+def test_the_last_page_has_no_position(store: Store) -> None:
+    for n in range(1, 5):
+        store.add_metadata(key(n), WRITERS[0], {"title": f"t{n}"})
+    page, position = store.list_sessions_page("acct", "laptop", "all", limit=4)
+    assert (len(page), position) == (4, None)
+    page, position = store.list_sessions_page("acct", "laptop", "all", limit=3)
+    assert len(page) == 3 and position is not None
+    page, position = store.list_sessions_page(
+        "acct", "laptop", "all", limit=3, before=position
+    )
+    assert (len(page), position) == (1, None)
+    # With a filter in Python, the store cannot know that a full page is the
+    # last one, unless no rows follow it.
+    page, position = store.list_sessions_page(
+        "acct", "laptop", "all", limit=1, title="t1"
+    )
+    assert [s["session_id"] for s in page] == ["s001"]
+    assert position is None
+    page, position = store.list_sessions_page(
+        "acct", "laptop", "all", limit=1, title="t4"
+    )
+    assert [s["session_id"] for s in page] == ["s004"]
+    assert position is not None
+    page, position = store.list_sessions_page(
+        "acct", "laptop", "all", limit=1, title="t4", before=position
+    )
+    assert (page, position) == ([], None)
+
+
+def test_activity_during_paging(store: Store) -> None:
+    """A session that gets new activity moves to the start of the list. A
+    pass that already returned it does not return it again, and a pass that
+    did not reach it yet does not return it. The next pass returns it."""
+    for n in range(1, 7):
+        append(store, key(n), WRITERS[0], b"one\n")
+    first, position = store.list_sessions_page("acct", "laptop", "all", limit=2)
+    assert [s["session_id"] for s in first] == ["s006", "s005"]
+    append(store, key(6), WRITERS[0], b"two\n")
+    append(store, key(2), WRITERS[0], b"two\n")
+    rest: list[str] = []
+    while position is not None:
+        page, position = store.list_sessions_page(
+            "acct", "laptop", "all", limit=2, before=position
+        )
+        rest += [s["session_id"] for s in page]
+    assert rest == ["s004", "s003", "s001"]
+    again, _ = store.list_sessions_page("acct", "laptop", "all", limit=2)
+    assert [s["session_id"] for s in again] == ["s002", "s006"]
