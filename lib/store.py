@@ -2389,14 +2389,15 @@ class Store:
     ) -> list[dict[str, str | int]]:
         """Workspaces of the sessions that `host` can read, latest first.
 
-        `sessions` is the number of placements in the workspace. A session
-        that came back to a workspace has more than one placement there.
+        `sessions` is the number of sessions with a placement in the
+        workspace. A session that came back to a workspace counts once.
         """
         readable = "" if scope == "all" else f"AND {_READABLE}"
         rows = self._db.execute(
             f"""
             SELECT p.host AS host, p.workspace AS workspace,
-                   MAX(p.last_seen) AS last_seen, COUNT(*) AS sessions
+                   MAX(p.last_seen) AS last_seen,
+                   COUNT(DISTINCT p.session) AS sessions
             FROM sessions s JOIN placements p ON p.session = s.id
             WHERE s.account = :account {readable}
             GROUP BY p.host, p.workspace

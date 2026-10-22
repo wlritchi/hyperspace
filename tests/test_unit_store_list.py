@@ -231,9 +231,11 @@ def reference_workspaces(
     for row in store._db.execute("SELECT * FROM sessions WHERE account = 'acct'"):
         if not reference_can_read(store, row, host, scope):
             continue
+        seen: set[tuple[str, str]] = set()
         for p in store._placements(row["id"]):
+            place = (p["host"], p["workspace"])
             entry = found.setdefault(
-                (p["host"], p["workspace"]),
+                place,
                 {
                     "host": p["host"],
                     "workspace": p["workspace"],
@@ -241,7 +243,9 @@ def reference_workspaces(
                     "sessions": 0,
                 },
             )
-            entry["sessions"] += 1
+            if place not in seen:
+                seen.add(place)
+                entry["sessions"] += 1
             entry["last_seen"] = max(entry["last_seen"], p["last_seen"])
     return sorted(
         found.values(),
@@ -324,6 +328,20 @@ def test_ties_in_activity_list_the_newer_row_first(store: Store) -> None:
         "s002",
         "s001",
     ]
+
+
+def test_a_session_that_comes_back_to_a_workspace_counts_once(store: Store) -> None:
+    home, away = WRITERS[0], WRITERS[1]
+    append(store, key(1), home, b"one\n")
+    append(store, key(1), away, b"two\n")
+    append(store, key(1), home, b"three\n")
+    append(store, key(2), home, b"one\n")
+    assert len(store._placements(store._session_row(key(1))["id"])) == 3  # type: ignore[index]
+    counts = {
+        e["workspace"]: e["sessions"]
+        for e in store.list_workspaces("acct", "laptop", "all")
+    }
+    assert counts == {home.workspace: 2, away.workspace: 1}
 
 
 def test_an_empty_status_set_matches_nothing(store: Store) -> None:
