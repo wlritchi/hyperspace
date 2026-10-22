@@ -110,20 +110,61 @@ def review_records(
     ]
 
 
-def edit_record(path: str, minutes: float, tool: str = "Edit") -> dict[str, Any]:
+# Tool results with the shapes that Claude Code writes for an edit tool call.
+RESULTS: dict[str, dict[str, Any]] = {
+    "ok": {"content": "The file has been updated successfully."},
+    "failed": {
+        "content": "<tool_use_error>String to replace not found in file.",
+        "is_error": True,
+    },
+    "rejected": {
+        "content": "The user doesn't want to proceed with this tool use.",
+        "is_error": True,
+    },
+    "denied": {
+        "content": "Permission for this action was denied.",
+        "is_error": True,
+    },
+}
+
+
+def edit(
+    path: str, minutes: float, tool: str = "Edit", result: str | None = "ok"
+) -> list[dict[str, Any]]:
+    """An edit tool call, and its tool result unless `result` is None (an
+    interrupted call)."""
     field = "notebook_path" if tool == "NotebookEdit" else "file_path"
-    return {
-        "type": "assistant",
-        "cwd": REPO,
-        "timestamp": stamp(minutes),
-        "message": {
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": "editing"},
-                {"type": "tool_use", "id": "e", "name": tool, "input": {field: path}},
-            ],
-        },
-    }
+    call_id = f"toolu_{uuid.uuid4().hex[:12]}"
+    records: list[dict[str, Any]] = [
+        {
+            "type": "assistant",
+            "cwd": REPO,
+            "timestamp": stamp(minutes),
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "editing"},
+                    {
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": tool,
+                        "input": {field: path},
+                    },
+                ],
+            },
+        }
+    ]
+    if result is not None:
+        block = {"type": "tool_result", "tool_use_id": call_id, **RESULTS[result]}
+        records.append(
+            {
+                "type": "user",
+                "cwd": REPO,
+                "timestamp": stamp(minutes + 0.01),
+                "message": {"role": "user", "content": [block]},
+            }
+        )
+    return records
 
 
 def user_prompt(minutes: float) -> dict[str, Any]:
@@ -210,18 +251,18 @@ def test_edits_of_main_agents_and_subagents(tmp_path: Path) -> None:
     fake = FakeClaude(tmp_path / "claude")
     path = write_parent(
         fake,
-        edit_record(f"{WORKTREE}/a.py", -10),
-        edit_record(f"{WORKTREE}/./b.py", -9, "Write"),
-        edit_record(f"{WORKTREE}/c.py", -8, "MultiEdit"),
-        edit_record(f"{WORKTREE}/d.ipynb", -7, "NotebookEdit"),
-        edit_record("relative.py", -6),
-        edit_record(f"{WORKTREE}/old.py", -2000),
+        *edit(f"{WORKTREE}/a.py", -10),
+        *edit(f"{WORKTREE}/./b.py", -9, "Write"),
+        *edit(f"{WORKTREE}/c.py", -8, "MultiEdit"),
+        *edit(f"{WORKTREE}/d.ipynb", -7, "NotebookEdit"),
+        *edit("relative.py", -6),
+        *edit(f"{WORKTREE}/old.py", -2000),
     )
     subagents = path.with_suffix("") / "subagents"
     subagents.mkdir(parents=True)
     fake.write(
         subagents / "agent-1.jsonl",
-        {**edit_record(f"{WORKTREE}/e.py", -5), "isSidechain": True},
+        *({**r, "isSidechain": True} for r in edit(f"{WORKTREE}/e.py", -5)),
     )
     edits = fake.adapter.edits(epoch(-60), epoch(0))
     assert sorted((e.path, e.session_id) for e in edits) == [
@@ -235,8 +276,8 @@ def test_edits_read_only_the_end_of_a_long_transcript(
 ) -> None:
     monkeypatch.setattr(claude_code, "_TAIL_STEP", 4096)
     fake = FakeClaude(tmp_path / "claude")
-    old = [edit_record(f"{WORKTREE}/old{n}.py", -3000 + n) for n in range(200)]
-    path = write_parent(fake, *old, edit_record(f"{WORKTREE}/new.py", -10))
+    old = [r for n in range(200) for r in edit(f"{WORKTREE}/old{n}.py", -3000 + n)]
+    path = write_parent(fake, *old, *edit(f"{WORKTREE}/new.py", -10))
     edits = fake.adapter.edits(epoch(-60), epoch(0))
     assert [e.path for e in edits] == [f"{WORKTREE}/new.py"]
     assert path.stat().st_size > 8 * 4096
@@ -245,9 +286,44 @@ def test_edits_read_only_the_end_of_a_long_transcript(
     assert len(lines) < 20
 
 
+@pytest.mark.parametrize("result", ["failed", "rejected", "denied", None])
+def test_edits_need_a_successful_result(tmp_path: Path, result: str | None) -> None:
+    fake = FakeClaude(tmp_path / "claude")
+    write_parent(
+        fake,
+        *edit(f"{WORKTREE}/a.py", -10, result=result),
+        *edit(f"{WORKTREE}/b.py", -9),
+    )
+    edits = fake.adapter.edits(epoch(-60), epoch(0))
+    assert [e.path for e in edits] == [f"{WORKTREE}/b.py"]
+
+
+def test_a_result_with_no_call_in_the_lines_does_not_count() -> None:
+    # The tail read can start between a call and its result.
+    call, result = edit(f"{WORKTREE}/a.py", -10)
+    lines = [(json.dumps(r) + "\n").encode() for r in (result,)]
+    assert claude_code._edits_in(lines, epoch(-60), epoch(0), "s") == []  # pyright: ignore[reportPrivateUsage]
+    lines = [(json.dumps(r) + "\n").encode() for r in (call, result)]
+    found = claude_code._edits_in(lines, epoch(-60), epoch(0), "s")  # pyright: ignore[reportPrivateUsage]
+    assert found == [Edit(f"{WORKTREE}/a.py", epoch(-10), "s")]
+
+
+def test_a_failed_later_edit_does_not_take_the_parent(tmp_path: Path) -> None:
+    # Session A changes the file; later, session B tries an edit of the same
+    # file that fails. A review of A's change starts after both.
+    fake = FakeClaude(tmp_path / "claude")
+    a = write_parent(fake, *edit(f"{WORKTREE}/a.py", -30))
+    write_parent(fake, *edit(f"{WORKTREE}/a.py", -5, result="failed"))
+    edits = fake.adapter.edits(epoch(-60), epoch(0))
+    by_path: dict[str, list[Edit]] = {}
+    for e in edits:
+        by_path.setdefault(e.path, []).append(e)
+    assert find_parent("review", epoch(0), [f"{WORKTREE}/a.py"], by_path) == a.stem
+
+
 def test_edits_skip_a_transcript_older_than_the_window(tmp_path: Path) -> None:
     fake = FakeClaude(tmp_path / "claude")
-    path = write_parent(fake, edit_record(f"{WORKTREE}/a.py", -10))
+    path = write_parent(fake, *edit(f"{WORKTREE}/a.py", -10))
     os.utime(path, (epoch(-120), epoch(-120)))
     assert fake.adapter.edits(epoch(-60), epoch(0)) == []
 
@@ -327,8 +403,8 @@ def make_review(fake: FakeClaude, text: str, minutes: float) -> Path:
 def test_link_children_for_new_and_old_reviews(ctx: Context, fake: FakeClaude) -> None:
     parent = write_parent(
         fake,
-        edit_record(f"{WORKTREE}/a.py", -10),
-        edit_record(f"{WORKTREE}/lib/b.py", -9),
+        *edit(f"{WORKTREE}/a.py", -10),
+        *edit(f"{WORKTREE}/lib/b.py", -9),
     )
     sync(ctx, parent, REPO)
     # A review that an older client backed up, with no links.
@@ -377,7 +453,7 @@ def test_link_children_sends_at_most_max_sends(
 def test_sweep_links_children(
     ctx: Context, fake: FakeClaude, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    parent = write_parent(fake, edit_record(f"{WORKTREE}/a.py", -10))
+    parent = write_parent(fake, *edit(f"{WORKTREE}/a.py", -10))
     review = make_review(fake, first_pass(["a.py"]), 0)
     cfg = cli_mod.config_mod.Config(host="laptop", state_dir=tmp_path / "state")
     monkeypatch.setattr(cli_mod, "refresh_states", lambda *_: 0)
@@ -452,7 +528,7 @@ def test_show_lists_children(
     capsys: pytest.CaptureFixture[str],
     tmp_path: Path,
 ) -> None:
-    parent = write_parent(fake, edit_record(f"{WORKTREE}/a.py", -10))
+    parent = write_parent(fake, *edit(f"{WORKTREE}/a.py", -10))
     sync(ctx, parent, REPO)
     review = make_review(fake, first_pass(["a.py"]), 0)
     link_children(ctx, ClaudeCode(fake.root))
