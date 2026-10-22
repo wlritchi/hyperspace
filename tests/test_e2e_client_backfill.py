@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from _hs import FakeClaude, Server, context, make_server, prompt, text_reply
+from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.backfill import (
     RunResult,
     attempt_key,
@@ -20,6 +21,7 @@ from hyperspace_client.backfill import (
     run,
     select,
 )
+from hyperspace_client.children import link_children
 from hyperspace_client.cli import SESSION_ENV, _request, set_status
 from hyperspace_client.sync import Context, Syncer
 
@@ -249,3 +251,37 @@ def test_limit_counts_candidates(ctx: Context, fake: FakeClaude, ws: str) -> Non
         synced_session(ctx, fake, ws)
     selection = select(ctx, fake.adapter, MONTH, time.time(), limit=2)
     assert len(selection.candidates) == 2
+
+
+def review(fake: FakeClaude, ws: str) -> Path:
+    """A session with the shape of a security review (see
+    `test_e2e_client_children`)."""
+    path = fake.transcript(ws)
+    text = (
+        "Review this change for security vulnerabilities.\n\n"
+        "Changed files (you may Read these and any other file in the repo):\n"
+        "  - a.py\n"
+    )
+    fake.write(
+        path,
+        {
+            **prompt(text, cwd=ws),
+            "entrypoint": "sdk-py",
+            "timestamp": "2026-10-20T12:00:00.000Z",
+        },
+        text_reply("No findings."),
+    )
+    return path
+
+
+def test_backfill_skips_automation(ctx: Context, fake: FakeClaude, ws: str) -> None:
+    eligible = synced_session(ctx, fake, ws)
+    # One review that the sweep classified, and one that no sweep saw yet.
+    seen = review(fake, ws)
+    sync(ctx, seen, ws)
+    link_children(ctx, ClaudeCode(fake.root))
+    assert "automation" in ctx.state.session(HARNESS, seen.stem).metadata
+    sync(ctx, review(fake, ws), ws)
+    selection = select(ctx, fake.adapter, MONTH, time.time())
+    assert [c.session.session_id for c in selection.candidates] == [eligible]
+    assert selection.skipped == {"automation": 2}

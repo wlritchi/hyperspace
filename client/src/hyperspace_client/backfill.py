@@ -171,6 +171,13 @@ def _local_reason(
         # in the transcript of the session that it continues.
         return "no conversation", ""
     record = ctx.state.session(adapter.harness, sid)
+    # A session that a tool started, for example a security review, gains
+    # nothing from a status prompt. The sweep saves the classification; a
+    # session that no sweep saw yet is classified here.
+    if "automation" in record.metadata or "automation" in (
+        adapter.classify(session) or {}
+    ):
+        return "automation", ""
     workspace = record.workspace or adapter.first_cwd(session) or ""
     if not workspace or not Path(workspace).is_dir():
         return "no workspace", ""
