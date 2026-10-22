@@ -56,6 +56,20 @@ old client must work with a new server.
 - Log the duration of each request, and the time it waited for the store lock,
   at INFO for slow requests (for example over 1 s).
 
+Done (`201a56f`). As built:
+
+- Requests that only read the index (session and workspace lists, hosts,
+  session state) use a pool of read connections. Each read is one deferred
+  transaction on a `query_only` connection. Writes, and reads that write an
+  audit row (manifest, log and blob content), stay on the writer connection
+  behind the store lock.
+- The writer connection has a page cache of 128 MiB.
+  `HYPERSPACE_READ_CONNECTIONS` (default 8) and `HYPERSPACE_READ_CACHE_BYTES`
+  (default 16 MiB) set the pool.
+- The server logs each request with its duration and its waits for the writer
+  and for a read connection, at INFO when it takes longer than
+  `HYPERSPACE_SLOW_REQUEST_SECONDS` (default 1).
+
 ### Step 2: the list query does work only for the rows it returns
 
 - A migration adds an index for the sort order, with the same expression as
@@ -80,12 +94,46 @@ old client must work with a new server.
 - `open` keeps its meaning (not `done`). `status` accepts more than one value,
   for example `status=working,waiting,ready`.
 
+Done (`96fd4ee`, `f2611da`). As built:
+
+- Migration 4 adds to each session row a copy of its latest status and of the
+  body of its latest metadata event (column `metadata`), and fills them from
+  the events. `add_status` and `add_metadata` update the copies in the same
+  transaction. The last placement is not copied: only the returned rows read
+  it.
+- Indexes: `sessions_recent` (account, `COALESCE(last_activity, created)`,
+  status, lease state, lease host, harness), `placements (host, session)` and
+  `(workspace, session)`, and `metadata_events (session, host)` for the read
+  access check.
+- `list_sessions` applies all filters except `title` and `liveness` in SQL,
+  with the limit in SQL. With `title` or `liveness`, it reads in batches until
+  it has the limit. `list_workspaces` is one aggregate query, and counts each
+  session once in a workspace.
+- `status=` and `liveness=` also take comma-separated values.
+- On a synthetic index of 6,000 sessions, a list of 50 went from 253 to 153
+  statements, a list of 1000 from 5,003 to 3,003, and `host=` from 24,353 to
+  1,053. The workspace list went from 6,003 statements to 3.
+
 ### Step 3: a cursor for the session list
 
 - `GET /sessions` accepts a cursor (for example
   `before=<sort key, session id>`, opaque to the client) and returns the
   cursor of the next page. A new capability tells the client that the server
   has it.
+
+Done (`487ea7b`). As built:
+
+- `cursor=` and `next`, with the capability `list-cursor` (`CAP_LIST_CURSOR`)
+  and the optional `next` field of `SessionList`.
+- The order is `COALESCE(last_activity, created)` DESC, then harness and
+  session id DESC, so it is total. The cursor is URL-safe base64 of
+  `[1, sort key, harness, session id]`, with no row ids. A cursor that the
+  server cannot read gives `400 bad_request` "invalid cursor".
+- Without the `title` and `liveness` filters, `next` is absent exactly at the
+  end of the list. With them, the last page can be empty.
+- A session that gets new activity during a pass moves to the start of the
+  list, and the pass does not return it again (or at all, if it did not reach
+  it yet).
 
 ### Step 4: the client
 
@@ -107,11 +155,12 @@ Done. As built:
 - `Api.all_sessions` reads every page, with pages of 1000 sessions. It sends
   `cursor=` only to a server with `list-cursor`; to an older server it sends
   one request with `limit=1000`. It stops at a page with no `next`, or with a
-  `next` that an earlier page gave. `restore --held`, `refresh_states`, the
-  stub search and the launcher's `resume_held` use it. `restore --held` now
-  also sends `lease_host=<self>`, so that on a new server it reads only the
-  sessions whose lease the host holds; it still checks the lease itself,
-  because a server without session status ignores the filter.
+  `next` that an earlier page gave, and after 10,000 pages with a warning.
+  `restore --held`, `refresh_states`, the stub search and the launcher's
+  `resume_held` use it. `restore --held` now also sends `lease_host=<self>`,
+  so that on a new server it reads only the sessions whose lease the host
+  holds; it still checks the lease itself, because a server without session
+  status ignores the filter.
 - `Api.session_page` sends each list with a read timeout of 120 s
   (`LIST_TIMEOUT`), and other requests keep 30 s. The hook's resume check
   keeps 2 s. The launcher keeps 30 s for its lists, so that a slow list does

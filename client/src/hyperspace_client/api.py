@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections.abc import Iterator
 from typing import Any, Self, cast
 from urllib.parse import quote
@@ -45,6 +46,11 @@ from hyperspace_protocol import (
 LIST_TIMEOUT = 120.0
 # The largest page of the session list that a server gives.
 MAX_PAGE = 1000
+# A pass through the session list stops after this many pages. A server
+# that works correctly never gives so many pages.
+MAX_PAGES = 10_000
+
+log = logging.getLogger("hyperspace")
 
 
 class ApiError(Exception):
@@ -212,7 +218,7 @@ class Api:
         advertises the capability. To a server without it, it sends one
         request for `MAX_PAGE` sessions, the most that such a server gives.
         The pass also stops at a page with no `next`, or with a `next` that
-        an earlier page gave."""
+        an earlier page gave, and after `MAX_PAGES` pages with a warning."""
         if not self.has_capability(CAP_LIST_CURSOR):
             yield from self.sessions(**filters, limit=str(MAX_PAGE))
             return
@@ -221,7 +227,7 @@ class Api:
             "limit": str(page_size or MAX_PAGE),
         }
         seen: set[str] = set()
-        while True:
+        for _ in range(MAX_PAGES):
             page = self.session_page(**params)
             yield from page["sessions"]
             cursor = page.get("next")
@@ -229,6 +235,7 @@ class Api:
                 return
             seen.add(cursor)
             params["cursor"] = cursor
+        log.warning("session list: stopped after %d pages", MAX_PAGES)
 
     def manifest(self, harness: str, sid: str) -> Manifest:
         return cast(Manifest, self._json("GET", self._s(harness, sid)))
