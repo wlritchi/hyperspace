@@ -640,11 +640,13 @@ class ClaudeCode:
             if isinstance(v := fields.get(k), str)
         }
 
-    def continued_in(self, session_id: str) -> set[str]:
+    def continued_in(self, session_id: str, last: bool = False) -> set[str]:
         """The ids in the `continued-in` records of the session's local
-        transcripts."""
+        transcripts. With `last`, only the id of the last such record of
+        each transcript."""
         found: set[str] = set()
         for transcript in self.find_transcripts(session_id):
+            latest: str | None = None
             try:
                 with open(transcript, "rb") as f:
                     for line in f:
@@ -655,9 +657,13 @@ class ClaudeCode:
                             continue
                         target = record.get("continuedInSessionId")
                         if isinstance(target, str):
-                            found.add(target)
+                            latest = target
+                            if not last:
+                                found.add(target)
             except OSError:
                 continue
+            if last and latest is not None:
+                found.add(latest)
         return found
 
     def jobs(self, continued_from: ContinuedFrom | None = None) -> list[Job]:

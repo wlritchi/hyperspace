@@ -289,8 +289,10 @@ the client marks S `done`, with the note `continued in <J>`, so that the list
 of open sessions (U1) does not show the work twice. It writes the `done` only
 if all of these are true:
 
-- S's local transcript has a `continued-in` record with J, and J is the last
-  `continued-in` link in the synced metadata of S.
+- J is the last `continued-in` link of S: in the synced metadata of S, and in
+  each local transcript of S. The client reads both again while it holds the
+  sync lock of S, because S can continue in a later job K, and the transcript
+  of S keeps the record of J.
 - The state of exactly one job on this host has J as its `sessionId`, and J is
   the only candidate of that job: J has a local transcript with a
   conversation, and the job's state has no `resumeSessionId` or has J. A job
