@@ -16,6 +16,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,9 +26,11 @@ from urllib.parse import unquote
 import zstandard
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from accounts import AccountSources, Principal, parse_token
 from hyperspace_protocol import (
@@ -55,7 +58,17 @@ from hyperspace_protocol import (
     validate_status_request,
     validate_workspace,
 )
-from store import Conflict, SessionKey, StaleStatus, Store, StoreError, Writer
+from store import (
+    READ_CACHE_BYTES,
+    READ_CONNECTIONS,
+    Conflict,
+    SessionKey,
+    StaleStatus,
+    Store,
+    StoreError,
+    Writer,
+    track_waits,
+)
 
 log = logging.getLogger("hyperspace")
 
@@ -99,6 +112,11 @@ class Settings:
     bytes_per_day: int = 4 * 1024**3
     failed_auth_per_minute: int = 30
     global_failed_auth_per_minute: int = 1000
+    # Connections for reads that do not write, and the page cache of each.
+    read_connections: int = READ_CONNECTIONS
+    read_cache_bytes: int = READ_CACHE_BYTES
+    # A request that takes longer is logged at INFO, the others at DEBUG.
+    slow_request_seconds: float = 1.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -130,6 +148,13 @@ class Settings:
             global_failed_auth_per_minute=int(
                 env.get("HYPERSPACE_GLOBAL_FAILED_AUTH_PER_MINUTE", "1000")
             ),
+            read_connections=int(
+                env.get("HYPERSPACE_READ_CONNECTIONS", str(READ_CONNECTIONS))
+            ),
+            read_cache_bytes=int(
+                env.get("HYPERSPACE_READ_CACHE_BYTES", str(READ_CACHE_BYTES))
+            ),
+            slow_request_seconds=float(env.get("HYPERSPACE_SLOW_REQUEST_SECONDS", "1")),
         )
 
 
@@ -342,6 +367,68 @@ def blob_path(request: Request) -> str:
 Handler = Callable[[Request, Principal], Awaitable[Response]]
 
 
+@dataclass
+class _RequestRecord:
+    """What the request log needs to know from inside the request."""
+
+    host: str = "-"
+
+
+_request: ContextVar[_RequestRecord | None] = ContextVar(
+    "hyperspace_request", default=None
+)
+
+
+class _RequestLog:
+    """Log each HTTP request with its duration and its waits for the store
+    connections: at INFO if it took longer than `slow_seconds`, else at DEBUG.
+
+    The log has the method, the path, the status, and the host of the
+    credential. It has no query string, no headers, and no body, so it has no
+    tokens and no transcript content.
+    """
+
+    def __init__(self, app: ASGIApp, slow_seconds: float) -> None:
+        self.app = app
+        self.slow_seconds = slow_seconds
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        start = time.monotonic()
+        status = 500
+        record = _RequestRecord()
+
+        async def send_status(message: Message) -> None:
+            nonlocal status
+            if message["type"] == "http.response.start":
+                status = message["status"]
+            await send(message)
+
+        token = _request.set(record)
+        with track_waits() as waits:
+            try:
+                await self.app(scope, receive, send_status)
+            finally:
+                _request.reset(token)
+                elapsed = time.monotonic() - start
+                slow = elapsed > self.slow_seconds
+                log.log(
+                    logging.INFO if slow else logging.DEBUG,
+                    "%s %s %r status=%d time=%.3fs writer_wait=%.3fs "
+                    "reader_wait=%.3fs host=%s",
+                    "slow request" if slow else "request",
+                    scope["method"],
+                    scope["path"],
+                    status,
+                    elapsed,
+                    waits.writer,
+                    waits.reader,
+                    record.host,
+                )
+
+
 def create_app(store: Store, accounts: AccountSources, settings: Settings) -> Starlette:
     limiter = _Limiter(settings)
 
@@ -375,6 +462,9 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
                     limiter.failed_auth(client)
                     return error("unauthorized")
                 limiter.succeeded(client, principal.credential)
+                record = _request.get()
+                if record is not None:
+                    record.host = principal.host
                 if not limiter.request(principal.credential):
                     return error("rate_limited", "too many requests")
                 missing = [s for s in scopes if s not in principal.scopes]
@@ -600,7 +690,7 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         key = session_key(request, principal)
         return JSONResponse(
             await run_in_threadpool(
-                store.existing_authorized,
+                store.read_authorized,
                 key,
                 principal.host,
                 principal.read,
@@ -848,4 +938,9 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         Route(f"{s}/blobs/{{path:path}}", get_blob, methods=["GET"]),
     ]
     # AccountSources logs its errors when it loads the files.
-    return Starlette(routes=routes)
+    return Starlette(
+        routes=routes,
+        middleware=[
+            Middleware(_RequestLog, slow_seconds=settings.slow_request_seconds)
+        ],
+    )

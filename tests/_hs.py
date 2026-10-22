@@ -85,12 +85,13 @@ def make_server(
             Accounts({"default": Account(id="default", credentials=tuple(creds))})
         )
     )
-    store = Store(data)
-    app = create_app(
-        store,
-        AccountSources(path),
-        Settings(**{"data_dir": data, "requests_per_minute": 100_000, **settings}),
+    config = Settings(**{"data_dir": data, "requests_per_minute": 100_000, **settings})
+    store = Store(
+        data,
+        read_connections=config.read_connections,
+        read_cache_bytes=config.read_cache_bytes,
     )
+    app = create_app(store, AccountSources(path), config)
     return Server(store, app, tokens)
 
 

@@ -50,6 +50,13 @@ About 2,000 sessions take about 500 MB on the server. The data directory only
 grows, so file-level backups of the PVC (for example with restic) are
 incremental.
 
+The SQLite page caches of the server use at most 128 MiB for the writer plus
+`server.readConnections` times `server.readCacheBytes` for the reads (256 MiB
+in total with the defaults). Keep this total well under the memory limit of
+the pod, with room for the request bodies. A request that takes longer than
+`server.slowRequestSeconds` (default 1) goes to the log at INFO, with its time
+and its waits for the database connections.
+
 ## 2. Create credentials
 
 Each host gets its own credential, bound to its host name. Create them inside

@@ -67,7 +67,10 @@ spec:
                 "HYPERSPACE_RATE_PER_MINUTE" .Values.server.ratePerMinute
                 "HYPERSPACE_BYTES_PER_DAY" .Values.server.bytesPerDay
                 "HYPERSPACE_FAILED_AUTH_PER_MINUTE" .Values.server.failedAuthPerMinute
-                "HYPERSPACE_GLOBAL_FAILED_AUTH_PER_MINUTE" .Values.server.globalFailedAuthPerMinute }}
+                "HYPERSPACE_GLOBAL_FAILED_AUTH_PER_MINUTE" .Values.server.globalFailedAuthPerMinute
+                "HYPERSPACE_READ_CONNECTIONS" .Values.server.readConnections
+                "HYPERSPACE_READ_CACHE_BYTES" .Values.server.readCacheBytes
+                "HYPERSPACE_SLOW_REQUEST_SECONDS" .Values.server.slowRequestSeconds }}
             {{- if $value }}
             - name: {{ $name }}
               value: {{ $value | quote }}
