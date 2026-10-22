@@ -348,13 +348,22 @@ def _became(event: StatusEvent, replaced: object, host: str) -> bool:
 def _of_replaced(
     current: StatusEvent | None, base: int, replaced: Sequence[object], host: str
 ) -> bool:
-    """True if `current` is newer than `base` and is the event of one of the
-    queued writes that the write replaced."""
-    return (
-        current is not None
-        and seq(current) > base
-        and any(_became(current, r, host) for r in replaced)
-    )
+    """True if `current` is the event of one of the queued writes that the
+    write replaced. A replaced write with a `seq` became that event. For a
+    replaced write with no `seq`, the client does not know the outcome of
+    its send, so only the event just after `base` can be its event: a later
+    event with the same fields can come from a later write. A write that
+    became an event later than that, because it tried again after a 409,
+    does not count, and the automatic write is then dropped."""
+    if current is None or seq(current) <= base:
+        return False
+    for r in replaced:
+        if not _became(current, r, host):
+            continue
+        became = cast(Mapping[str, object], r).get("seq")
+        if seq(current) == (became if isinstance(became, int) else base + 1):
+            return True
+    return False
 
 
 def _may_retry(request: dict[str, Any], current: StatusEvent | None, host: str) -> bool:
@@ -461,13 +470,20 @@ def send_wanted(ctx: Context, session: LocalSession) -> None:
         # it, so that the list of replaced writes no longer holds it. Thus
         # keep each sent write here, outside the queue, until the queue is
         # empty. A send that failed can still have reached the server, so
-        # the write stays also then.
+        # the write stays also then, with no `seq`. When the outcome is
+        # known, the write keeps the `seq` of its event, or goes away if
+        # the server did not accept it.
         sent = _sent(ctx.state, key)
-        fields = {k: request[k] for k in _REQUEST_FIELDS if k in request}
+        fields: dict[str, Any] = {
+            k: request[k] for k in _REQUEST_FIELDS if k in request
+        }
         if fields not in sent:
-            sent = [*sent, fields][-_MAX_SENT:]
-            ctx.state.put(key, json.dumps(sent))
-        write(ctx, h, sid, request, base, record, replaced=[*earlier, *sent])
+            ctx.state.put(key, json.dumps([*sent, fields][-_MAX_SENT:]))
+        event = write(ctx, h, sid, request, base, record, replaced=[*earlier, *sent])
+        sent = [e for e in _sent(ctx.state, key) if e != fields]
+        if event is not None:
+            sent = [*sent, {**fields, "seq": seq(event)}][-_MAX_SENT:]
+        ctx.state.put(key, json.dumps(sent))
     except NotFound:
         # The server does not have the session yet: keep the write.
         return
