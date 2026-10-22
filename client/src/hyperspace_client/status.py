@@ -544,8 +544,16 @@ def _end_continued(ctx: Context, adapter: ClaudeCode, source: str, target: str) 
     # state names S, can write S now.
     if adapter.own_process_runs(source):
         return
+    # The links that the caller read can be out of date: a sync of S can
+    # save a later link before the caller gets the lock. The transcript
+    # keeps the records of the earlier links, so only the last link counts,
+    # in the saved metadata and in each local transcript.
+    record = state.session(h, source)
+    links = record.metadata.get("links")
+    if not isinstance(links, dict) or links.get("continued_in") != target:
+        return
     transcripts = adapter.find_transcripts(source)
-    if not transcripts or target not in adapter.continued_in(source):
+    if not transcripts or adapter.continued_in(source, last=True) != {target}:
         return
     # Read the queue before the record, as `on_hook` does.
     queued = state.wanted_status(h, source)

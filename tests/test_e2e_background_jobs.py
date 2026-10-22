@@ -49,6 +49,7 @@ from hyperspace_client.config import Config
 from hyperspace_client.hooks import handle, notices
 from hyperspace_client.launcher import Launcher
 from hyperspace_client.state import LEASE_FIELDS, SessionRecord, State
+from hyperspace_client.status import end_continued
 from hyperspace_client.sync import REWRITE_SETTLE, Context, Syncer
 from hyperspace_client.teleport import TeleportError, fork, restore, send
 from store import SessionKey
@@ -998,6 +999,50 @@ def test_a_job_that_resumes_another_session_or_has_no_state_leaves_it_open(
     copy(fake, j)
     for t in (j, s):
         sync_one(ctx, t, tmp_path)
+    launcher(ctx, fake).tick()
+    assert status_of(ctx, s.stem) == before
+
+
+def test_a_session_that_continued_in_a_later_job_stays_open(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # S continued in J, which copied it. Then S continued in K, a job that
+    # has no copy yet.
+    s, j = background_before_copy(ctx, fake, tmp_path)
+    copy(fake, j)
+    k = fake.transcript(WS)
+    fake.write(k, *stub_records(k.stem))
+    fake.write(
+        s,
+        {"type": "continued-in", "continuedInSessionId": k.stem, "sessionId": s.stem},
+    )
+    before = status_of(ctx, s.stem)
+    # The launcher read the links before a sync of S saved the link to K.
+    stale = ctx.state.continued_from(H)
+    assert stale == {j.stem: [s.stem]}
+    sync(ctx, s)
+    monkeypatch.setattr(ctx.state, "continued_from", lambda harness: stale)
+    end_continued(ctx, fake.adapter)
+    assert status_of(ctx, s.stem) == before
+
+
+def test_a_link_that_is_not_synced_yet_keeps_the_session_open(
+    server: Server, fake: FakeClaude, ctx: Context, tmp_path: Path
+) -> None:
+    # The transcript of S has a later link to K than the synced metadata.
+    s, j = background_before_copy(ctx, fake, tmp_path)
+    copy(fake, j)
+    sync(ctx, j)
+    k = fake.transcript(WS)
+    fake.write(
+        s,
+        {"type": "continued-in", "continuedInSessionId": k.stem, "sessionId": s.stem},
+    )
+    before = status_of(ctx, s.stem)
     launcher(ctx, fake).tick()
     assert status_of(ctx, s.stem) == before
 
