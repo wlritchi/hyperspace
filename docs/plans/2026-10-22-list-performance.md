@@ -102,6 +102,33 @@ old client must work with a new server.
 - Optional: cache the server's capabilities, so that `ls --open` does not need
   a `/whoami` call first.
 
+Done. As built:
+
+- `Api.all_sessions` reads every page, with pages of 1000 sessions. It sends
+  `cursor=` only to a server with `list-cursor`; to an older server it sends
+  one request with `limit=1000`. It stops at a page with no `next`, or with a
+  `next` that an earlier page gave. `restore --held`, `refresh_states`, the
+  stub search and the launcher's `resume_held` use it. `restore --held` now
+  also sends `lease_host=<self>`, so that on a new server it reads only the
+  sessions whose lease the host holds; it still checks the lease itself,
+  because a server without session status ignores the filter.
+- `Api.session_page` sends each list with a read timeout of 120 s
+  (`LIST_TIMEOUT`), and other requests keep 30 s. The hook's resume check
+  keeps 2 s. The launcher keeps 30 s for its lists, so that a slow list does
+  not delay the next heartbeat past its expiry. No list is sent again after a
+  timeout. The CLI gives
+  `the server did not answer in time; it may be busy or its storage slow` for
+  a timeout of any request.
+- `ls --status` takes comma-separated values and is repeatable. The client
+  sends repeated `status=` parameters. The session-overview skill uses
+  `--status working,waiting,ready`. `ls --all-pages` reads every page, with
+  `--limit` as the page size.
+- The capability cache is not built. An older server ignores the parameters
+  that it does not know (`open=`, `status=`, `cursor=`) and does not give
+  `400`. Thus a stale cache after a server rollback gives a wrong list with no
+  error, and the client cannot see it. `/whoami` does not read the session
+  index, so it is fast also on slow storage.
+
 ## Checks
 
 - Tests for each step, including a test that a slow read does not stop a

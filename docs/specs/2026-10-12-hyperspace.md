@@ -365,7 +365,8 @@ state of agent-initiated teleport (see "Later").
   runner whose harness config directory did not persist across a restart.
   `hyperspace restore <sid>` works for a lease that the host already holds.
   `hyperspace restore --held` restores each session whose lease the host holds
-  and that has no local copy. A runner entrypoint can run it at boot.
+  and that has no local copy. It reads every page of the list (see "Session
+  lists"). A runner entrypoint can run it at boot.
 
 The lease records intent: where the session must continue. The conflict rule
 (see "Branches and conflicts") records what happened. Leases prevent most
@@ -1048,6 +1049,37 @@ dialog.
 - If the server cannot be reached, the client keeps its cursors and exits with
   no error. The local files are the queue, so the next sync uploads the
   difference.
+
+### Session lists
+
+Some client commands need every matching session, not one page:
+
+- `restore --held`: the sessions whose lease the host holds (`lease_host=`);
+- the sweep's refresh of the lease states: the sessions with a placement on
+  the host (`host=`);
+- the launcher in runner mode: the open sessions whose lease the host holds;
+- the search for the session of a stub, after a refused restore.
+
+They read the list page by page, with pages of 1000 sessions and `cursor=`
+(see "Compatible protocol extensions"). The client sends `cursor=` only to a
+server that advertises `list-cursor`, because an older server ignores the
+parameter and gives the first page again. To an older server, the client sends
+one request for 1000 sessions, the most that it gives. The client also stops
+at a page with no `next`, or with a `next` that an earlier page gave. Thus a
+pass cannot loop.
+
+A server with slow storage can need much more time for a list than for other
+requests. Thus a list request has a read timeout of 120 s, and other requests
+keep their timeout of 30 s. The hooks keep their timeout of 2 s. The launcher
+keeps 30 s also for its lists: it sends its heartbeat before its lists, and a
+long list would delay the next heartbeat past its expiry. The client does not
+send a list again after a timeout, because the server can still do the work of
+the first request. The CLI then gives the message
+`the server did not answer in time; it may be busy or its storage slow`. The
+launcher tries again at its next tick.
+
+`hyperspace ls` shows one page (`--limit`, default 50). `ls --all-pages` reads
+every page, with `--limit` as the page size (default 1000).
 
 ### Checkpoint scheduling
 

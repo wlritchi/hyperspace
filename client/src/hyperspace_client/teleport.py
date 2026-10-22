@@ -41,6 +41,7 @@ from hyperspace_protocol import (
     Manifest,
     Placement,
     SessionStateBody,
+    SessionSummary,
     TeleportResponse,
     validate_file_path,
     validate_metadata,
@@ -600,10 +601,12 @@ def _stub_message(ctx: Context, adapter: ClaudeCode, sid: str, data: bytes) -> s
             "conversation is in the session that the job continued."
         )
     ]
+    # A failed list gives only the sessions of the pages before the failure.
+    summaries: list[SessionSummary] = []
     try:
-        summaries = ctx.api.sessions(harness=adapter.harness, limit="1000")
-    except (ApiError, httpx.HTTPError):
-        summaries = []
+        summaries.extend(ctx.api.all_sessions(harness=adapter.harness))
+    except (ApiError, httpx.HTTPError) as exc:
+        log.info("%s: no full search for the conversation: %s", sid, exc)
     for summary in summaries:
         meta = summary["metadata"]
         if summary["session_id"] == sid:
@@ -728,9 +731,10 @@ def restore_held(ctx: Context, adapter: ClaudeCode, workspace: str) -> HeldResto
     this host."""
     result = HeldRestore(0, [])
     # A completed lease transfer can precede the destination's first append,
-    # so placement-based host filtering would hide a pending restore. Ask
-    # for the server's maximum. The list is not filtered by host.
-    for summary in ctx.api.sessions(harness=adapter.harness, limit="1000"):
+    # so placement-based host filtering would hide a pending restore. Thus
+    # filter by the lease. A server without the `lease_host` filter gives
+    # all sessions, so the loop also checks the lease.
+    for summary in ctx.api.all_sessions(harness=adapter.harness, lease_host=ctx.host):
         lease = summary["state"]["lease"]
         sid = summary["session_id"]
         if lease["state"] != "held" or lease.get("host") != ctx.host:

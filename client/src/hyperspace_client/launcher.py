@@ -93,6 +93,11 @@ _SOCKS_AUTH = re.compile(
     r"\b(?:authentication|username|password|methods?)\b", re.IGNORECASE
 )
 
+# The read timeout of the launcher's session lists. A tick sends its
+# heartbeat first and then lists, so a long wait for a list delays the next
+# heartbeat. A heartbeat expires after three intervals.
+LIST_TIMEOUT = 30.0
+
 # The most output of `claude --bg` that the launcher reads.
 _MAX_OUTPUT = 64 * 1024
 
@@ -560,11 +565,8 @@ class Launcher:
     def resume_held(self, live: list[str]) -> None:
         """Resume the sessions whose lease this host holds and that need a
         process (runner mode)."""
-        held = self.ctx.api.sessions(
-            harness=self.adapter.harness,
-            lease_host=self.ctx.host,
-            open="1",
-            limit="1000",
+        held = self.ctx.api.all_sessions(
+            harness=self.adapter.harness, lease_host=self.ctx.host, open="1"
         )
         for summary in held:
             sid = summary["session_id"]

@@ -1025,15 +1025,15 @@ def test_failed_boot_restore_is_retried(
     clock = Clock()
     run, fresh = fresh_runner(ctx, tmp_path, bg, clock)
     api = run.ctx.api
-    sessions, manifest = api.sessions, api.manifest
+    session_page, manifest = api.session_page, api.manifest
     fails = [1]
 
     def flaky_sessions(**filters: Any) -> Any:
-        # Only the unfiltered list of `restore_held`.
-        if failure == "list" and "lease_host" not in filters and fails:
+        # Only the list of `restore_held`, which has no `open` filter.
+        if failure == "list" and "open" not in filters and fails:
             fails.pop()
             raise httpx.ConnectError("server not available")
-        return sessions(**filters)
+        return session_page(**filters)
 
     def flaky_manifest(*args: Any) -> Any:
         if failure == "session" and fails:
@@ -1041,7 +1041,7 @@ def test_failed_boot_restore_is_retried(
             raise ApiError(503, "unavailable")
         return manifest(*args)
 
-    monkeypatch.setattr(api, "sessions", flaky_sessions)
+    monkeypatch.setattr(api, "session_page", flaky_sessions)
     monkeypatch.setattr(api, "manifest", flaky_manifest)
     run.run(max_ticks=1)
     assert not fails

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterator
 from typing import Any, Self, cast
 from urllib.parse import quote
 
@@ -11,6 +12,7 @@ import zstandard
 
 from hyperspace_protocol import (
     API_PREFIX,
+    CAP_LIST_CURSOR,
     CAP_RESTORE_PRECONDITION,
     CAP_WORKSPACE_UTF8,
     HEADER_ACTIVITY,
@@ -27,6 +29,7 @@ from hyperspace_protocol import (
     HeartbeatResponse,
     HostInfo,
     Manifest,
+    SessionList,
     SessionMetadata,
     SessionStateBody,
     SessionSummary,
@@ -36,6 +39,12 @@ from hyperspace_protocol import (
     encode_workspace,
     validate_workspace,
 )
+
+# The longest wait for the response to a session list. A server with slow
+# storage can need much more time for a list than for other requests.
+LIST_TIMEOUT = 120.0
+# The largest page of the session list that a server gives.
+MAX_PAGE = 1000
 
 
 class ApiError(Exception):
@@ -75,10 +84,14 @@ class Api:
         token: str,
         timeout: float = 30.0,
         client: httpx.Client | None = None,
+        list_timeout: float = LIST_TIMEOUT,
     ) -> None:
         """`client`, if given, is an HTTP client with the base URL (including
         the API prefix) and the Authorization header already set. Tests use
-        it to talk to an in-process server."""
+        it to talk to an in-process server. `list_timeout` is the read
+        timeout of the session list; `timeout` applies to all else."""
+        self._timeout = timeout
+        self.list_timeout = list_timeout
         self._client = client or httpx.Client(
             base_url=url + API_PREFIX,
             headers={"Authorization": f"Bearer {token}"},
@@ -169,11 +182,53 @@ class Api:
 
     # --- Sessions ----------------------------------------------------------
 
-    def sessions(self, **filters: str | list[str]) -> list[SessionSummary]:
-        """A list filter with a list value repeats the query parameter."""
+    def session_page(self, **filters: str | list[str]) -> SessionList:
+        """One page of the session list. A filter with a list value repeats
+        the query parameter. The request is not sent again after a timeout:
+        the server can still do the work of the first request."""
         params = {k: v for k, v in filters.items() if v}
-        body = self._json("GET", "/sessions", params=params)
-        return cast(list[SessionSummary], body["sessions"])
+        request = self._client.build_request(
+            "GET",
+            "/sessions",
+            params=params,
+            timeout=httpx.Timeout(self._timeout, read=self.list_timeout),
+        )
+        response = self._client.send(request)
+        self._raise(response)
+        return cast(SessionList, response.json())
+
+    def sessions(self, **filters: str | list[str]) -> list[SessionSummary]:
+        """The sessions of one page of the session list."""
+        return self.session_page(**filters)["sessions"]
+
+    def all_sessions(
+        self, page_size: int | None = None, **filters: str | list[str]
+    ) -> Iterator[SessionSummary]:
+        """Every session that matches the filters, newest first, in pages of
+        `page_size` (default `MAX_PAGE`) sessions.
+
+        A server without `list-cursor` ignores `cursor=` and gives the first
+        page again. Thus the client sends `cursor=` only to a server that
+        advertises the capability. To a server without it, it sends one
+        request for `MAX_PAGE` sessions, the most that such a server gives.
+        The pass also stops at a page with no `next`, or with a `next` that
+        an earlier page gave."""
+        if not self.has_capability(CAP_LIST_CURSOR):
+            yield from self.sessions(**filters, limit=str(MAX_PAGE))
+            return
+        params: dict[str, str | list[str]] = {
+            **filters,
+            "limit": str(page_size or MAX_PAGE),
+        }
+        seen: set[str] = set()
+        while True:
+            page = self.session_page(**params)
+            yield from page["sessions"]
+            cursor = page.get("next")
+            if cursor is None or cursor in seen:
+                return
+            seen.add(cursor)
+            params["cursor"] = cursor
 
     def manifest(self, harness: str, sid: str) -> Manifest:
         return cast(Manifest, self._json("GET", self._s(harness, sid)))

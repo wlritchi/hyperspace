@@ -190,9 +190,16 @@ def test_a_large_file_is_not_a_stub(
     assert forked.transcript.exists()
 
 
+@pytest.mark.parametrize("page", [1000, 1])
 def test_restore_and_fork_refuse_a_stub(
-    server: Server, fake: FakeClaude, ctx: Context
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    monkeypatch: pytest.MonkeyPatch,
+    page: int,
 ) -> None:
+    # With pages of one session, the search finds the session on a later page.
+    monkeypatch.setattr("hyperspace_client.api.MAX_PAGE", page)
     s, j = background_job(fake)
     sync(ctx, s)
     # An older client backed up the stub.

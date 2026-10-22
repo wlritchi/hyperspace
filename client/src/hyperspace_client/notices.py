@@ -235,15 +235,13 @@ def _fully_synced(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> b
 
 
 def refresh_states(ctx: Context, adapter: ClaudeCode) -> int:
-    """Update the saved lease and state of this host's sessions with one
-    request, and act on lost leases (see `after_sync`). A sync with no new
-    bytes gets no session state, so the sweep calls this. Return the number
-    of sessions whose saved state changed."""
+    """Update the saved lease and state of this host's sessions from the
+    session list, and act on lost leases (see `after_sync`). A sync with no
+    new bytes gets no session state, so the sweep calls this. Return the
+    number of sessions whose saved state changed."""
     changed = 0
     index = adapter.transcript_index()
-    for summary in ctx.api.sessions(
-        harness=adapter.harness, host=ctx.host, limit="1000"
-    ):
+    for summary in ctx.api.all_sessions(harness=adapter.harness, host=ctx.host):
         sid = summary["session_id"]
         with ctx.state.try_lock(adapter.harness, sid) as locked:
             if not locked:

@@ -8,16 +8,19 @@ description:
 
 # Overview of open sessions
 
-1. List the open sessions (every session that is not done):
+1. List the open sessions (every session with the status `working`, `waiting`
+   or `ready`):
 
    ```
-   hyperspace ls --open --json --limit 200
+   hyperspace ls --status working,waiting,ready --json --limit 200
    ```
 
    Each entry has `state.status` (status, reason or wake kind, note, source),
    `state.liveness` (whether a process runs, and where), `state.last_append`,
    `metadata` (title, workspace) and `excerpt` (the start of the agent's last
-   message). A session with no `state.status` has not set a status yet.
+   message). The list does not include sessions that have no status, usually
+   old sessions from before session status. If the user asks for them, use
+   `--status none`.
 
 2. For sessions where the note and the excerpt do not say enough, read the
    last turns:

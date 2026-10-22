@@ -642,8 +642,11 @@ The CLI gives the overview stories their commands:
 - `hyperspace ls --open [--json]`: every session that is not `done`, with
   status, reason or wake kind, note, source, liveness, host, workspace, title,
   last activity, and excerpt (O1, U1, U2).
-- `hyperspace ls --status STATUS`: sessions with a status (repeatable), for
-  example `done` to find sessions that are done but not closed.
+- `hyperspace ls --status STATUS[,STATUS...]`: sessions with one of the
+  statuses, for example `done` to find sessions that are done but not closed,
+  or `none` for sessions with no status. The option takes a comma-separated
+  list and is repeatable. The client sends each status as its own `status=`
+  parameter, which also an older server accepts.
 - `hyperspace tail [<sid>] [-n N]`: the last N turns of the active branch. The
   adapter formats the records on the client (O2).
 - `hyperspace status [STATUS] [--session SID] [--reason R] [--wake W] [--note TEXT] [--by-user]`,
@@ -663,8 +666,10 @@ The plugin adds:
 
 - a `/done [note]` command (U3);
 - a skill that tells an agent when and how to set its status (A1, A2);
-- a skill for the overview agent that uses `ls --open` and `tail` (O1, O2,
-  O3).
+- a skill for the overview agent that uses `ls --status working,waiting,ready`
+  and `tail` (O1, O2, O3). It does not use `ls --open`, because `--open` also
+  gives the sessions with no status, usually old sessions from before session
+  status.
 
 This changes the main spec's decision "v1 has no skill". The skills only call
 the CLI; the plugin still holds no logic.
