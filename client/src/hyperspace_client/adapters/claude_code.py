@@ -83,9 +83,10 @@ _TOOL_SUMMARY = 100
 
 # Record types that name a session but hold no conversation. Claude Code
 # writes a transcript with only these records for the id of a background
-# job, while the job writes its conversation into the transcript of the
-# session that it continues. Any other record type, also an unknown one,
-# makes a transcript a real session.
+# job. Then it copies the conversation of the session that the job continues
+# into that transcript, or, in an older shape, the job writes its
+# conversation into the transcript of that session. Any other record type,
+# also an unknown one, makes a transcript a real session.
 _NAME_RECORDS = frozenset({"ai-title", "agent-name", "custom-title"})
 # A transcript larger than this is never a stub, and is not read to check.
 STUB_MAX = 64 * 1024
@@ -688,16 +689,26 @@ class ClaudeCode:
         continued_from: ContinuedFrom | None = None,
     ) -> tuple[str, ...]:
         """The sessions whose transcripts a process or a job with the id `own`
-        can write: `own` if it has a local transcript with a conversation,
-        `resumes` (the `resumeSessionId` of the job's state), and the sessions
-        that continued in `own`. A background job can write the transcript of
-        the session that it continues. With exactly one candidate, that is
-        the session. With none or more than one, the session is not known: a
-        stale or missing `continued_from` cannot show which one it is. A
-        `resumes` that is not a session id gives no candidates."""
+        can write. With exactly one candidate, that is the session. With none
+        or more than one, the session is not known: a stale or missing
+        `continued_from` cannot show which one it is.
+
+        If `own` has a local transcript with a conversation and `resumes`
+        (the `resumeSessionId` of the job's state) is None or `own`, the only
+        candidate is `own`. A job that `/background` makes copies the
+        conversation of the session into the transcript of its own id and
+        continues there, so the sessions that continued in `own` do not
+        count. Else the candidates are `own` if it has a conversation,
+        `resumes`, and the sessions that continued in `own`: an older job
+        shape writes the transcript of the session that it continues, and
+        the transcript of its own id is a stub. A `resumes` that is not a
+        session id gives no candidates."""
         if resumes is not None and _session_id(resumes) is None:
             return ()
-        candidates: list[str] = [own] if self._has_conversation(own) else []
+        has_own = self._has_conversation(own)
+        if has_own and resumes in (None, own):
+            return (own,)
+        candidates: list[str] = [own] if has_own else []
         for value in (resumes, *sorted((continued_from or {}).get(own, ()))):
             sid = _session_id(value)
             if sid is not None and sid != own and sid not in candidates:

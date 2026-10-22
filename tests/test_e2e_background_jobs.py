@@ -3,9 +3,11 @@
 lines.
 
 A background job gets its own id J. Claude Code writes a `continued-in`
-record into the transcript of the session S that the job continues, writes
-J.jsonl with only title records, and the job writes its conversation into
-S.jsonl.
+record into the transcript of the session S that the job continues, and
+writes J.jsonl with only title records. In the older shape, the job writes
+its conversation into S.jsonl (`background_job`). In the shape of
+`/background` in Claude Code 2.1.301, J.jsonl gets a copy of S's conversation
+and the job continues there (`copied_job`).
 """
 
 from __future__ import annotations
@@ -570,46 +572,42 @@ def test_a_job_whose_own_id_has_a_competing_conversation_is_not_closed(
     server: Server, fake: FakeClaude, ctx: Context
 ) -> None:
     # `claude --resume J` in a terminal gave J a conversation, while the job
-    # wrote S. The job's state names S (aa), or only the continued-in record
-    # of S links the two (bb).
-    pairs = [background_job(fake), background_job(fake)]
-    for s, j in pairs:
-        fake.write(j, prompt("in a terminal", cwd=WS))
-        sync(ctx, s)
-        sync(ctx, j)
-        add_status(ctx, j.stem, "done")
-        add_status(ctx, s.stem, "working", kind="hook")
-    (s, j), (s2, j2) = pairs
+    # wrote S. The job's state names S.
+    s, j = background_job(fake)
+    fake.write(j, prompt("in a terminal", cwd=WS))
+    sync(ctx, s)
+    sync(ctx, j)
+    add_status(ctx, j.stem, "done")
+    add_status(ctx, s.stem, "working", kind="hook")
     job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=s.stem)
-    job_dir(fake, "bb", sessionId=j2.stem, resumeSessionId=j2.stem)
     rm = Rm()
     run = launcher(ctx, fake, run_rm=rm)
     run.tick()
     run.tick()
     assert rm.calls == []
-    for short, sids in (("aa", (s, j)), ("bb", (s2, j2))):
-        for sid in sids:
-            assert close_blocked(ctx, sid.stem) == (
-                f"job {short} can write more than one session; close it yourself"
-            )
+    for sid in (s, j):
+        assert close_blocked(ctx, sid.stem) == (
+            "job aa can write more than one session; close it yourself"
+        )
 
 
-def test_a_link_to_the_job_during_the_close_keeps_the_job(
+def test_a_change_of_the_job_state_during_the_close_keeps_the_job(
     server: Server, fake: FakeClaude, ctx: Context, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     j = fake.transcript(WS)
     fake.write(j, prompt("own work", cwd=WS))
     sync(ctx, j)
     add_status(ctx, j.stem, "done")
-    job_dir(fake, "aa", sessionId=j.stem)
+    directory = job_dir(fake, "aa", sessionId=j.stem)
     other = str(uuid.uuid4())
     real = launcher_module.back_up
 
     def back_up(*args: Any) -> None:
         real(*args)
-        # A sync of another session records that it continued in J.
-        links = {"links": {"continued_in": j.stem}}
-        ctx.state.save_session(SessionRecord(H, other, metadata=links), ("metadata",))
+        # The job's state now names another session.
+        (directory / "state.json").write_text(
+            json.dumps({"sessionId": j.stem, "resumeSessionId": other})
+        )
 
     monkeypatch.setattr(launcher_module, "back_up", back_up)
     rm = Rm()
@@ -751,6 +749,112 @@ def test_a_notice_for_a_session_flags_the_id_that_it_continued_in(
     assert ctx.state.take_notices(H, s.stem) == ["[hyperspace] marked done"]
     assert not ctx.state.notice_flag(s.stem).exists()
     assert not ctx.state.notice_flag(j.stem).exists()
+
+
+# --- Jobs that copy their session ---------------------------------------------------
+
+
+def copied_job(fake: FakeClaude) -> tuple[Path, Path]:
+    """`/background` in a session S, as Claude Code 2.1.301 does it: the job J
+    gets a copy of S's conversation in J.jsonl, with J as the `sessionId` of
+    each record, S's transcript gets a `continued-in` record with J, and S
+    ends. Return the two transcripts."""
+    s, j = fake.transcript(WS), fake.transcript(WS)
+    first = prompt("investigate", cwd=WS)
+    fake.write(
+        s,
+        {**first, "sessionId": s.stem},
+        {"type": "continued-in", "continuedInSessionId": j.stem, "sessionId": s.stem},
+    )
+    fake.write(j, {**first, "sessionId": j.stem})
+    return s, j
+
+
+@needs_proc
+def test_a_job_that_copied_its_session_acts_on_its_own_id(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    s, j = copied_job(fake)
+    sync(ctx, s)
+    continued = ctx.state.continued_from(H)
+    assert continued == {j.stem: [s.stem]}
+    directory = job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=j.stem)
+    hook_env(monkeypatch, fake, directory)
+    register(fake, sessionId=j.stem, jobId="aa")
+    monkeypatch.setenv(SESSION_ENV, j.stem)
+    assert _current(ctx.state) == j.stem
+    (job,) = fake.adapter.jobs(continued)
+    assert (job.session_id, job.candidates) == (j.stem, (j.stem,))
+    # S stays live while the job runs, so that nothing else resumes it.
+    assert fake.adapter.live_sessions(continued) == [j.stem, s.stem]
+    assert fake.adapter.is_running(s.stem)
+    cfg = Config(host="laptop", state_dir=tmp_path / "state")
+    payload = {"transcript_path": str(j), "cwd": WS}
+    started: list[list[str]] = []
+    handle({**payload, "hook_event_name": "Stop"}, cfg, start=started.append)
+    assert started[0][4] == str(j)
+    queued = ctx.state.wanted_status(H, j.stem)
+    assert queued is not None and queued[0]["status"] == "ready"
+    assert ctx.state.wanted_status(H, s.stem) is None
+    # The end of the job starts its close when J is done.
+    sync(ctx, j)
+    event = add_status(ctx, j.stem, "done")
+    ctx.state.save_status(H, j.stem, event, None)
+    started.clear()
+    handle({**payload, "hook_event_name": "SessionEnd"}, cfg, start=started.append)
+    assert ["--quiet", "launcher", "--close-job", "aa"] in started
+
+
+def test_a_done_job_that_copied_its_session_closes(
+    server: Server, fake: FakeClaude, ctx: Context
+) -> None:
+    s, j = copied_job(fake)
+    for t in (s, j):
+        sync(ctx, t)
+    add_status(ctx, s.stem, "working", kind="hook")
+    add_status(ctx, j.stem, "done")
+    job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=j.stem)
+    rm = Rm()
+    run = launcher(ctx, fake, run_rm=rm)
+    run.tick()
+    run.tick()
+    assert rm.calls == [["claude", "rm", "aa"]]
+    assert "close_blocked" not in ctx.api.state(H, j.stem).get("liveness", {})
+
+
+@needs_proc
+def test_a_job_before_the_copy_of_its_session_acts_on_none(
+    server: Server,
+    fake: FakeClaude,
+    ctx: Context,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The job starts with only title records in J.jsonl, and the continued-in
+    # record of S is not synced yet.
+    s, j = fake.transcript(WS), fake.transcript(WS)
+    fake.write(
+        s,
+        prompt("investigate", cwd=WS),
+        {"type": "continued-in", "continuedInSessionId": j.stem, "sessionId": s.stem},
+    )
+    fake.write(j, *stub_records(j.stem))
+    directory = job_dir(fake, "aa", sessionId=j.stem, resumeSessionId=j.stem)
+    hook_env(monkeypatch, fake, directory)
+    register(fake, sessionId=j.stem, jobId="aa")
+    monkeypatch.setenv(SESSION_ENV, j.stem)
+    assert _current(ctx.state) is None
+    cfg = Config(host="laptop", state_dir=tmp_path / "state")
+    acts_on_none(ctx, cfg, {"transcript_path": str(j), "cwd": WS}, (s.stem, j.stem))
+    # The copy arrives, and then S's link is synced.
+    fake.write(j, prompt("investigate", cwd=WS))
+    assert _current(ctx.state) == j.stem
+    sync(ctx, s)
+    assert _current(ctx.state) == j.stem
 
 
 # --- Jobs whose session is not known ------------------------------------------------
