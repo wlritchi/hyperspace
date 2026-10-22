@@ -720,7 +720,11 @@ Changes to existing bodies:
   list entries) gets `status` (the latest event, with `seq`) and `liveness`.
   Thus a client learns of a mark from outside at its next append (A3).
 - `GET /sessions` gets the filters `status=` (repeatable), `open=1` (not
-  `done`), `lease_host=` and `liveness=`.
+  `done`), `lease_host=` and `liveness=`. A value of `status=` or `liveness=`
+  can also be a comma-separated list, for example
+  `status=working,waiting,ready`. Servers before the list performance work
+  refuse the comma form, so a client that must work with them repeats the
+  parameter.
 - `GET /whoami` advertises the capabilities `session-status` and `liveness`. A
   client does not send status or heartbeats to a server without them.
 

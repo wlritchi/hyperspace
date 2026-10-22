@@ -702,6 +702,11 @@ $HYPERSPACE_DATA_DIR/
 - For each segment the index stores the frame's offset and length in the
   `.zst` file, so the server can serve a byte range without decompressing the
   whole generation.
+- The row of each session has a copy of its latest status and of the body of
+  its latest metadata event. The write of a status or metadata event updates
+  the copy in the same transaction. The session list filters and sorts in SQL
+  with these copies, and reads the other data only for the sessions that it
+  returns. The event tables stay the source of truth.
 - Write order: append the frame, `fsync`, then commit the index row. At
   startup, the server truncates each generation file to the end of its last
   committed frame. This removes only bytes that no index row refers to.
