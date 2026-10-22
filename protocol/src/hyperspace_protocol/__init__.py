@@ -27,12 +27,16 @@ CAP_SESSION_STATUS = "session-status"
 CAP_LIVENESS = "liveness"
 # `GET /sessions` takes `cursor=` and returns `next` (see `SessionList`).
 CAP_LIST_CURSOR = "list-cursor"
+# `GET /sessions` takes `top_level=1` and `parent=` (see "Child sessions" in
+# the spec).
+CAP_CHILD_SESSIONS = "child-sessions"
 CAPABILITIES = [
     CAP_WORKSPACE_UTF8,
     CAP_RESTORE_PRECONDITION,
     CAP_SESSION_STATUS,
     CAP_LIVENESS,
     CAP_LIST_CURSOR,
+    CAP_CHILD_SESSIONS,
 ]
 
 # One request carries at most this much uncompressed file data. The client
@@ -188,6 +192,7 @@ def validate_metadata(value: dict[str, Any]) -> SessionMetadata:
         "first_timestamp",
         "last_timestamp",
         "harness_version",
+        "automation",
     ):
         if key in value and not isinstance(value[key], str):
             raise ValidationError(f"metadata {key} must be a string")
@@ -488,8 +493,13 @@ class SessionMetadata(TypedDict, total=False):
     last_timestamp: str
     harness_version: str
     record_count: int
-    # Links to other sessions, for example {"forked_from": "<sid>"}.
+    # Links to other sessions, for example {"forked_from": "<sid>"}. A child
+    # session has {"parent": "<sid>"}.
     links: dict[str, str]
+    # The tool that started the session for the work of another session,
+    # for example "security-review". Such a session is not top-level, also
+    # with no parent link.
+    automation: str
 
 
 class TeleportEvent(TypedDict):

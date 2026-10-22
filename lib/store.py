@@ -281,6 +281,32 @@ _MIGRATIONS: list[str] = [
     CREATE INDEX placements_workspace ON placements (workspace, session);
     CREATE INDEX metadata_events_author ON metadata_events (session, host);
     """,
+    # Child sessions. `parent` is a copy of `links.parent` of the latest
+    # metadata, and `top_level` is 0 for a session with a parent or with
+    # `automation` metadata. `add_metadata` updates them with `metadata`.
+    # `top_level` is the last column of `sessions_recent`, so that the
+    # filter `top_level=1` does not read the table row of a child session.
+    """
+    ALTER TABLE sessions ADD COLUMN parent TEXT;
+    ALTER TABLE sessions ADD COLUMN top_level INTEGER NOT NULL DEFAULT 1;
+    UPDATE sessions SET parent = json_extract(metadata, '$.links.parent')
+    WHERE json_valid(metadata)
+        AND json_type(metadata, '$.links.parent') = 'text'
+        AND NOT EXISTS (
+            SELECT 1 FROM json_each(metadata, '$.links') WHERE type != 'text'
+        );
+    UPDATE sessions SET top_level = 0
+    WHERE parent IS NOT NULL
+        OR (json_valid(metadata) AND json_type(metadata, '$.automation') = 'text');
+    DROP INDEX sessions_recent;
+    CREATE INDEX sessions_recent ON sessions (
+        account, COALESCE(last_activity, created),
+        status, lease_state, lease_host, harness, top_level
+    );
+    CREATE INDEX sessions_parent ON sessions (
+        account, parent, COALESCE(last_activity, created)
+    ) WHERE parent IS NOT NULL;
+    """,
 ]
 
 # Read access to the session `s` for the host `:host`, for scopes other than
@@ -1168,6 +1194,8 @@ class Store:
     ) -> None:
         validate_metadata(dict(metadata))
         body = json.dumps(metadata)
+        parent = metadata.get("links", {}).get("parent")
+        top_level = parent is None and "automation" not in metadata
         with self._tx():
             session = self._ensure_session(key)
             self._db.execute(
@@ -1176,7 +1204,9 @@ class Store:
                 (session["id"], writer.host, self.now(), body),
             )
             self._db.execute(
-                "UPDATE sessions SET metadata = ? WHERE id = ?", (body, session["id"])
+                "UPDATE sessions SET metadata = ?, parent = ?, top_level = ? "
+                "WHERE id = ?",
+                (body, parent, int(top_level), session["id"]),
             )
 
     def _latest_metadata(self, session: int) -> SessionMetadata:
@@ -2303,6 +2333,8 @@ class Store:
         liveness: set[str] | None = None,
         limit: int = 200,
         before: ListPosition | None = None,
+        top_level: bool = False,
+        parent: str | None = None,
     ) -> list[SessionSummary]:
         """List readable sessions, newest first. See `list_sessions_page`."""
         return self.list_sessions_page(
@@ -2320,6 +2352,8 @@ class Store:
             liveness=liveness,
             limit=limit,
             before=before,
+            top_level=top_level,
+            parent=parent,
         )[0]
 
     @_reading
@@ -2339,6 +2373,8 @@ class Store:
         liveness: set[str] | None = None,
         limit: int = 200,
         before: ListPosition | None = None,
+        top_level: bool = False,
+        parent: str | None = None,
     ) -> tuple[list[SessionSummary], ListPosition | None]:
         """List readable sessions, newest first, after the position `before`.
 
@@ -2350,6 +2386,9 @@ class Store:
         `statuses` and `liveness` can contain `none`, which matches a session
         with no status event or with no liveness. `open_only` keeps the
         sessions whose latest status is not `done`.
+
+        `top_level` keeps the sessions with no parent and no `automation`
+        metadata. `parent` keeps the children of the session with that id.
 
         SQL applies all filters except `title` and `liveness`, and sorts with
         the index `sessions_recent`. Without these two filters, SQL also
@@ -2371,6 +2410,11 @@ class Store:
         if harness is not None:
             where.append("s.harness = :harness")
             params["harness"] = harness
+        if top_level:
+            where.append("s.top_level = 1")
+        if parent is not None:
+            where.append("s.parent = :parent")
+            params["parent"] = parent
         if since is not None:
             where.append(f"{_SORT_KEY} >= :since")
             params["since"] = since
