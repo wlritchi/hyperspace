@@ -693,8 +693,10 @@ asks the agent to set its status with a note, and to change nothing else.
   the session of the turn, and not as the user, so text in one transcript
   cannot change the status of other sessions. It skips sessions that are live
   (also a session that a job under its own id writes), that have a status, or
-  whose lease a different host holds, and transcripts that hold no
-  conversation (the stub of a job's own id).
+  whose lease a different host holds, transcripts that hold no conversation
+  (the stub of a job's own id), and sessions that a tool started (with
+  `automation` metadata, for example security reviews; see "Child sessions" in
+  the main spec), which gain nothing from the message.
 - It records each session that it messages before the resume starts. A second
   run, for example after an interruption, skips these sessions unless
   `--retry` is given. `--dry-run` lists the sessions and messages none.
