@@ -103,9 +103,14 @@ The image must provide:
 - The client and the plugin (see "The image"), and `claude` on the `PATH` (or
   `HYPERSPACE_CLAUDE`).
 - The environment of "Credential and environment", and the Claude Code options
-  for each resume as a JSON list in `HYPERSPACE_LAUNCHER_CLAUDE_ARGS`. Do not
-  put `--bg`, `--resume`, `--continue`, `--fork-session`, `--session-id` or
-  `--print` in it; the launcher refuses them. For example:
+  for each resume as a JSON list in `HYPERSPACE_LAUNCHER_CLAUDE_ARGS`. The
+  launcher sets some options itself and refuses a list that contains one of
+  them, also in the `--option=value` form: `--bg`, `--background`, `--resume`,
+  `-r`, `--continue`, `-c`, `--fork-session`, `--session-id`, `--print` and
+  `-p`. It also refuses a bare `--` and a group of short options such as
+  `-pc`, because these can hide a refused option. Do not put `--name` in the
+  list: the list applies to each session that the launcher resumes. For
+  example:
 
   ```yaml
   - name: HYPERSPACE_LAUNCHER_CLAUDE_ARGS
