@@ -606,7 +606,10 @@ The launcher reads the Claude Code options for a resume (model, agent, and
 channels) from `launcher_claude_args`, or from
 `HYPERSPACE_LAUNCHER_CLAUDE_ARGS` as a JSON list. The runner image gives that
 configuration. The launcher refuses an option that it sets itself, for example
-`--resume` or `--fork-session`.
+`--resume` or `--fork-session`. It also refuses a list whose last option takes
+a list of values, for example `--dangerously-load-development-channels <spec>`
+or `--add-dir=<dir>`, because `claude --bg` puts the first message after the
+options, and that option would take the message as a value.
 
 ## Messages to a session
 

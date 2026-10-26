@@ -108,16 +108,21 @@ The image must provide:
   them, also in the `--option=value` form: `--bg`, `--background`, `--resume`,
   `-r`, `--continue`, `-c`, `--fork-session`, `--session-id`, `--print` and
   `-p`. It also refuses a bare `--` and a group of short options such as
-  `-pc`, because these can hide a refused option. Do not put `--name` in the
+  `-pc`, because these can hide a refused option. The launcher puts its first
+  message after the list, so the last option in the list cannot be an option
+  that takes a list of values, for example `--add-dir`, `--allowed-tools`,
+  `--mcp-config` or `--dangerously-load-development-channels`, also in the
+  `--option=value` form: that option would take the message as a value. Put an
+  option that takes no list of values after it. Do not put `--name` in the
   list: the list applies to each session that the launcher resumes. For
   example:
 
   ```yaml
   - name: HYPERSPACE_LAUNCHER_CLAUDE_ARGS
     value: >-
-      ["--model", "opus", "--agent", "claude",
-       "--dangerously-load-development-channels",
-       "plugin:notifications@wlr-cc-plugins"]
+      ["--dangerously-load-development-channels",
+       "plugin:notifications@wlr-cc-plugins",
+       "--model", "opus", "--agent", "claude"]
   ```
 
 - An entrypoint that starts in the workspace and then runs the launcher:
