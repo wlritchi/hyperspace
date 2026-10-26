@@ -527,10 +527,13 @@ again.
 ### Workstation mode
 
 The SessionStart hook starts the launcher as a detached process if it does not
-run, in the same way that it starts a checkpoint. When no session has run on
-the host for 10 minutes, the launcher sends a last heartbeat with an empty
-list and stops. The sessions of the host then show as `stopped`, not
-`unknown`.
+run, in the same way that it starts a checkpoint. The hook does this only on a
+workstation (`host_kind` `workstation`). On a runner, the launcher is the
+entrypoint's main process, or there is none: a launcher that a hook started
+would hold the host's launcher lock, and the runner's launcher would then
+refuse to start. When no session has run on the host for 10 minutes, the
+launcher sends a last heartbeat with an empty list and stops. The sessions of
+the host then show as `stopped`, not `unknown`.
 
 The launcher gets its token as the checkpoint that the SessionStart hook
 starts does: it can read the keyring once, when it starts at a session start

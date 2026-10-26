@@ -100,6 +100,19 @@ def test_launcher_off_switch(cfg: Config, monkeypatch: pytest.MonkeyPatch) -> No
     assert not any("launcher" in args for args in started)
 
 
+def test_a_runner_hook_does_not_start_a_launcher(
+    cfg: Config, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The runner's launcher is the entrypoint's main process. A hook in a
+    # process that runs before it (for example a probe with `claude -p`) must
+    # not take the host's launcher lock.
+    monkeypatch.setenv("HYPERSPACE_LAUNCHER", "runner")
+    cfg.host_kind = "runner"
+    _, started = run(cfg, hook_event_name="SessionStart", source="startup")
+    assert not any("launcher" in args for args in started)
+    assert ["--quiet", "sync", "--all", "--if-stale", "3600", "--unlock"] in started
+
+
 def _seen_status(cfg: Config, status: str) -> None:
     state = State(cfg.state_dir)
     try:

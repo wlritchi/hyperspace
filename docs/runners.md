@@ -132,8 +132,10 @@ a message to a stopped session waits until a user or the runner resumes it.
 
 ## At boot, with your own supervisor
 
-If the entrypoint keeps its own supervisor, two rules keep leases correct
-across restarts:
+If the entrypoint keeps its own supervisor, the plugin's hooks still back up
+the sessions, but they do not start a launcher on a runner. Thus such a runner
+sends no heartbeats, and its sessions show liveness `unknown`. Two rules keep
+leases correct across restarts:
 
 1. If the harness config directory does not persist, restore the sessions
    whose lease the runner holds before the agent starts:

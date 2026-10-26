@@ -133,7 +133,10 @@ def handle(
     if event == "SessionStart":
         sweep = ["--quiet", "sync", "--all", "--if-stale", SWEEP_EVERY]
         start(sweep + ["--unlock"] if unlock else sweep)
-        if not launcher.off():
+        # On a runner, the launcher is the entrypoint's main process, or there
+        # is none. A launcher that a hook starts there would hold the host's
+        # launcher lock, and the runner's launcher would then refuse to start.
+        if not launcher.off() and cfg.host_kind == "workstation":
             run = ["--quiet", "launcher", "--if-absent"]
             start(run + ["--unlock"] if unlock else run)
         state = State(cfg.state_dir)
