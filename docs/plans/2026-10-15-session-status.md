@@ -968,12 +968,39 @@ session, stop and record an `UnclosedSession`-style reason in the heartbeat
 
 ### Facts to confirm
 
+All three were confirmed on 2026-10-26 in a throwaway runner pod (hyperspace
+0.7.2, Claude Code 2.1.301, an empty config directory at each start):
+
 - `claude --bg --resume <sid> <prompt>` continues the same session id and
-  starts with the prompt.
+  starts with the prompt. Confirmed: the transcript kept one session id, and
+  the launcher's message was the next user turn. The agent then checked its
+  interrupted work and ran it again.
 - On a runner with a fresh harness config directory, `restore --held` and then
-  `claude --bg --resume` work with no job state.
+  `claude --bg --resume` work with no job state. Confirmed: the launcher
+  restored the held sessions and resumed the `working` one.
 - The job that `claude --bg --resume <sid>` makes has `sessionId` and
-  `resumeSessionId` in its state, and which ids they hold.
+  `resumeSessionId` in its state, and which ids they hold. Confirmed: both are
+  the resumed session's id.
+
+The same test found these facts, which the code and `docs/runners.md` now
+follow:
+
+- `claude --bg` stores the worker's options in the job's `respawnFlags` and
+  puts the positional prompt after them. If the last option takes a list of
+  values (for example `--dangerously-load-development-channels`), the worker
+  takes the prompt as one more value and exits before init. The client refuses
+  such a `HYPERSPACE_LAUNCHER_CLAUDE_ARGS`.
+- `claude --bg` returns 0 when it dispatches, before the worker starts. The
+  launcher reads the new job's state to find a failed start.
+- A plugin hook in a process that runs before the runner's launcher (for
+  example a probe with `claude -p`) must not start a launcher, or it holds the
+  host's launcher lock. Hooks start a launcher only on a workstation.
+- A new job's first hooks run before its transcript has a conversation, so the
+  first `working` can come only from a later hook; PreToolUse writes it when
+  no status is known.
+- With the channel option before the other options, a resumed worker loads its
+  channels: the channel plugin logged its registration for the resumed
+  session.
 
 ### Tests
 
@@ -985,7 +1012,7 @@ session, stop and record an `UnclosedSession`-style reason in the heartbeat
 ### Done when
 
 - [ ] Tests pass; ruff and pyright are clean.
-- [ ] The two facts are confirmed in a throwaway runner pod.
+- [x] The facts are confirmed in a throwaway runner pod (2026-10-26).
 - [ ] Commit type `feat(client)`.
 
 ### Step 5 as built
