@@ -163,8 +163,12 @@ def transition(
     if event == "PreToolUse":
         if tool == _ASK_TOOL:
             return _want("ready", reason="asked")
-        if current in ("ready", "waiting") and known.declared is None:
-            # A turn that started with no prompt, for example from a cron.
+        if current in (None, "ready", "waiting") and known.declared is None:
+            # A turn that started with no prompt, for example from a cron. Or
+            # the first turn of a new job: its first UserPromptSubmit comes
+            # before its transcript has a conversation, so that hook writes
+            # no status. The base of the write keeps a status from a
+            # different writer that the client did not see.
             return _want("working")
         return None
     if event in ("PostToolUse", "PostToolUseFailure"):

@@ -232,6 +232,7 @@ The adapter maps harness events to status writes. For Claude Code:
 | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | UserPromptSubmit                                                            | `working`. If the current status is `done`, this write reopens the session and is explicit. |
 | A cron or other trigger starts a turn with no prompt                        | As UserPromptSubmit.                                                                        |
+| PreToolUse, with no known status and no declaration in this turn            | `working`. For example, the first turn of a new background job (see below).                 |
 | PreToolUse for AskUserQuestion, or a Notification for a permission prompt   | `ready`, reason `asked`.                                                                    |
 | PostToolUse for AskUserQuestion, or the tool call after a permission prompt | `working`.                                                                                  |
 | Stop, with an explicit status from the agent in this turn                   | No write. The agent's declaration stays (see below).                                        |
@@ -289,7 +290,14 @@ session that it would have to guess. A `resumeSessionId` that is not a session
 id gives no candidates. The synced metadata keeps only the last `continued-in`
 link of a session, so a missing link does not show that the job writes J. A
 new job whose transcript has no conversation yet has no candidate, so its
-hooks write no status until the first prompt is in the transcript.
+hooks write no status until the first prompt is in the transcript. Thus the
+UserPromptSubmit hook of the job's first prompt usually writes no status, and
+the job's first tool call writes `working`. A tool call writes `working` from
+no known status as it does from `ready` or `waiting`, so a long tool call in
+the first turn does not leave the session with no status. The write cannot
+replace a status that the client did not see, because its base is the latest
+event that the client saw (see "Conditional writes"). A subagent's tool call
+does not write.
 
 Before the copy, a job that `/background` made looks like a job of the older
 shape. If the `continued-in` link of S is already synced then, the session of

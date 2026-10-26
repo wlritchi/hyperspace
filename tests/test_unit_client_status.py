@@ -85,6 +85,18 @@ DECLARED = {
         # A turn that started with no prompt (for example from a cron).
         ("PreToolUse", BASH, ("ready", "idle"), False, 0, ("working", None, False)),
         ("PreToolUse", BASH, ("waiting", None), False, 0, ("working", None, False)),
+        # A new job: the hook of its first prompt wrote no status.
+        ("PreToolUse", BASH, (None, None), False, 0, ("working", None, False)),
+        ("PreToolUse", ASK, (None, None), False, 0, ("ready", "asked", False)),
+        (
+            "PreToolUse",
+            {**BASH, "agent_id": "a1"},
+            (None, None),
+            False,
+            0,
+            None,
+        ),
+        ("PostToolUse", BASH, (None, None), False, 0, None),
         # The agent declared `waiting` in this turn, then calls more tools.
         ("PreToolUse", BASH, ("waiting", None), True, 0, None),
         ("PostToolUse", ASK, ("ready", "asked"), False, 0, ("working", None, False)),
@@ -774,6 +786,30 @@ def _done_session(ctx: Context, server: StatusServer) -> LocalSession:
     server.latest = _done(13, "laptop")
     _seen(ctx, server.latest)
     return _session(ctx)
+
+
+def test_a_tool_call_with_no_known_status_writes_working(
+    ctx: Context, server: StatusServer
+) -> None:
+    # A new job: the hook of its first prompt wrote no status.
+    session = _session(ctx)
+    on_hook(ctx.state, cast(ClaudeCode, ctx.adapter), H, SID, "PreToolUse", BASH)
+    send_wanted(ctx, session)
+    assert _latest(server) == (1, "working", None, False, "hook")
+
+
+def test_a_tool_call_with_no_known_status_keeps_a_status_that_it_did_not_see(
+    ctx: Context, server: StatusServer
+) -> None:
+    # The client saw no status, but the user marked the session done.
+    server.latest = _done(13, "desk")
+    session = _session(ctx)
+    on_hook(ctx.state, cast(ClaudeCode, ctx.adapter), H, SID, "PreToolUse", BASH)
+    queued = ctx.state.wanted_status(H, SID)
+    assert queued is not None
+    assert (queued[0]["status"], queued[0]["base_seq"]) == ("working", 0)
+    send_wanted(ctx, session)
+    assert _latest(server) == (13, "done", None, True, "user")
 
 
 def test_a_stop_during_the_send_of_a_reopen_is_written(
