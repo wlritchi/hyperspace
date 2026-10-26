@@ -25,7 +25,7 @@ from hyperspace_client.adapters.claude_code import ClaudeCode, ContinuedFrom
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.backfill import RunResult
 from hyperspace_client.cli import _hook_heartbeat, main, status_label
-from hyperspace_client.config import Config, ConfigError, load
+from hyperspace_client.config import Config, ConfigError, check_claude_args, load
 from hyperspace_client.hooks import handle
 from hyperspace_client.launcher import (
     MAX_RESUMES,
@@ -1102,6 +1102,54 @@ def test_launcher_claude_args_config(tmp_path: Path) -> None:
     ):
         with pytest.raises(ConfigError):
             load({"HYPERSPACE_LAUNCHER_CLAUDE_ARGS": bad}, none)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--dangerously-load-development-channels", "plugin:a@b"],
+        ["--model", "opus", "--add-dir", "/a", "/b"],
+        ["--allowedTools", "Bash"],
+        ["--allowed-tools", "Bash"],
+        ["--disallowedTools", "Bash"],
+        ["--disallowed-tools", "Bash"],
+        ["--betas", "x"],
+        ["--channels", "plugin:a@b"],
+        ["--file", "spec"],
+        ["--mcp-config", "a.json"],
+        ["--tools", "Bash"],
+        # With no value, the option takes the message.
+        ["--model", "opus", "--tools"],
+        # The `=` form also takes the arguments after it.
+        ["--model", "opus", "--add-dir=/a"],
+        ["--model", "opus", "--add-dir=/a", "/b"],
+        ["--dangerously-load-development-channels=plugin:a@b"],
+    ],
+)
+def test_launcher_claude_args_cannot_end_with_a_list_option(args: list[str]) -> None:
+    last = [a for a in args if a.startswith("-")][-1].split("=", 1)[0]
+    with pytest.raises(ConfigError, match="put an option that") as exc:
+        check_claude_args(args)
+    assert f"cannot be {last}," in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [
+            "--dangerously-load-development-channels",
+            "plugin:a@b",
+            "--dangerously-skip-permissions",
+        ],
+        ["--add-dir", "/a", "/b", "--model", "opus"],
+        ["--add-dir=/a", "--model", "opus"],
+        ["--model", "opus"],
+        ["--dangerously-skip-permissions"],
+        [],
+    ],
+)
+def test_launcher_claude_args_can_end_with_other_options(args: list[str]) -> None:
+    assert check_claude_args(args) == args
 
 
 def test_pending_restore_blocks_the_resume(

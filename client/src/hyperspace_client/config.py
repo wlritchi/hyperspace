@@ -151,11 +151,32 @@ _LAUNCHER_OWNS = frozenset(
         "-p",
     }
 )
+# The Claude Code options (2.1.301) that take all the arguments after them
+# up to the next option, also in the `--option=value` form. `claude --bg`
+# puts the options of a job before its first message, so such an option as
+# the last option of the list takes the message as one of its values, and
+# the job fails before it starts.
+_VARIADIC = frozenset(
+    {
+        "--add-dir",
+        "--allowedTools",
+        "--allowed-tools",
+        "--betas",
+        "--channels",
+        "--dangerously-load-development-channels",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--file",
+        "--mcp-config",
+        "--tools",
+    }
+)
 
 
 def check_claude_args(value: object) -> list[str]:
     """The launcher's extra Claude Code options: a list of strings with no
-    option that the launcher sets itself."""
+    option that the launcher sets itself, and whose last option does not
+    take a list of values."""
     if not isinstance(value, list) or not all(
         isinstance(a, str) and a and "\0" not in a for a in value
     ):
@@ -167,6 +188,14 @@ def check_claude_args(value: object) -> list[str]:
         short_group = arg.startswith("-") and not arg.startswith("--") and len(arg) > 2
         if arg == "--" or short_group or arg.split("=", 1)[0] in _LAUNCHER_OWNS:
             raise ConfigError(f"launcher_claude_args cannot contain {arg}")
+    last = next((a for a in reversed(args) if a.startswith("-")), "")
+    name = last.split("=", 1)[0]
+    if name in _VARIADIC:
+        raise ConfigError(
+            f"the last option of launcher_claude_args cannot be {name}, because "
+            "it would also take the launcher's first message as a value: put an "
+            "option that takes no list of values after it"
+        )
     return args
 
 
