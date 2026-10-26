@@ -1249,6 +1249,8 @@ def test_launcher_claude_args_config(tmp_path: Path) -> None:
         ["--file", "spec"],
         ["--mcp-config", "a.json"],
         ["--tools", "Bash"],
+        ["--plugin-dir", "/opt/plugins"],
+        ["--model", "opus", "--plugin-dir=/opt/plugins"],
         # With no value, the option takes the message.
         ["--model", "opus", "--tools"],
         # The `=` form also takes the arguments after it.

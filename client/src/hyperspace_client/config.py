@@ -155,10 +155,12 @@ _LAUNCHER_OWNS = frozenset(
 # up to the next option, also in the `--option=value` form. `claude --bg`
 # puts the options of a job before its first message, so such an option as
 # the last option of the list takes the message as one of its values, and
-# the job fails before it starts.
+# the job fails before it starts. `--plugin-dir` takes one value in 2.1.301,
+# but it is in the set because other versions can take a list.
 _VARIADIC = frozenset(
     {
         "--add-dir",
+        "--plugin-dir",
         "--allowedTools",
         "--allowed-tools",
         "--betas",
