@@ -68,6 +68,11 @@ RESUME_WAITING = (
 )
 # `claude --bg` returns when the daemon has the job.
 RESUME_TIMEOUT = 120.0
+# After `claude --bg` returns, the launcher waits at most this long for the
+# job's process to start or to fail. `claude --bg` returns before the process
+# starts, so its exit status does not show a failed start.
+START_CHECK = 10.0
+_START_POLL = 0.5
 # At most this many resumes of one session in RESUME_WINDOW seconds, so that a
 # session that stops at once is not resumed in a loop.
 MAX_RESUMES = 5
@@ -578,7 +583,7 @@ class Launcher:
         """Resume a session as a background job, in the workspace that this
         host recorded for it. Do not resume while its restore is pending, or
         while another process holds its sync lock. Return True if
-        `claude --bg` succeeded."""
+        `claude --bg` succeeded and the job did not fail at its start."""
         now = self.clock()
         recent = self._resumes.setdefault(sid, deque[float]())
         while recent and now - recent[0] >= RESUME_WINDOW:
@@ -615,13 +620,37 @@ class Launcher:
                 return False
             recent.append(now)
             argv = [self.claude, *self.claude_args, "--bg", "--resume", sid, prompt]
+            before = self.adapter.job_names()
             result = self.run_claude(argv, workspace, RESUME_TIMEOUT)
-        if result.returncode == 0:
-            log.info("%s: resumed in %s", sid, workspace)
-            return True
-        first = next(iter(printable(result.output).splitlines()), "")
-        log.warning("%s: resume failed (%s): %s", sid, result.returncode, first)
-        return False
+        if result.returncode != 0:
+            first = next(iter(printable(result.output).splitlines()), "")
+            log.warning("%s: resume failed (%s): %s", sid, result.returncode, first)
+            return False
+        failure = self._start_failure(sid, before)
+        if failure is not None:
+            log.warning("%s: resume failed: %s", sid, failure)
+            return False
+        log.info("%s: resumed in %s", sid, workspace)
+        return True
+
+    def _start_failure(self, sid: str, before: set[str]) -> str | None:
+        """Why the job that `claude --bg` made for the session failed before
+        its process started, or None. None also if the launcher cannot find
+        the job or read its state, or if the job still starts after
+        START_CHECK seconds."""
+        deadline = self.clock() + START_CHECK
+        short: str | None = None
+        while True:
+            short = short or self.adapter.new_job(before, sid)
+            start = self.adapter.job_start(short) if short else None
+            if start is not None and not start.starting:
+                if not start.failed:
+                    return None
+                detail = clean_note(printable(start.detail)) or "no detail"
+                return f"the job {short} failed at its start: {detail}"
+            if self.clock() >= deadline:
+                return None
+            self.sleep(_START_POLL)
 
     @contextmanager
     def _hold(self, sid: str) -> Iterator[bool]:

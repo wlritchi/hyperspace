@@ -85,7 +85,10 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
    does not resume a session that the server shows as `live` on any host, also
    on the runner itself (for example from a different harness config
    directory). The message tells the agent that the runner restarted, and that
-   its crons, Monitors and background tasks stopped.
+   its crons, Monitors and background tasks stopped. `claude --bg` returns
+   before the job's process starts, so the launcher then reads the job's
+   `state.json` for at most 10 seconds. If the job failed at its start, the
+   launcher logs the job's `detail` and counts the resume as a failed resume.
 4. Does not resume a session that is `ready`, `done`, `waiting` with
    `wake: message`, or that has no status. The user, or a message, wakes these
    sessions. Sessions from before the session status feature have no status

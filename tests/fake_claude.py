@@ -8,13 +8,17 @@ prints an error with color codes and exits 1. `FAKE_CLAUDE_MODE=hang`
 starts a child process that writes its pid to `FAKE_CLAUDE_PIDFILE`, then
 both wait for ever. `FAKE_CLAUDE_MODE=daemon` does the same as `hang`, but
 exits at once, as `claude --bg` does when it starts the Claude Code daemon;
-the child keeps the standard output open."""
+the child keeps the standard output open. `FAKE_CLAUDE_MODE=job` writes
+`FAKE_CLAUDE_JOB_STATE` (JSON) as the state.json of a new job in
+`CLAUDE_CONFIG_DIR`, with the name `FAKE_CLAUDE_JOB` or a random name, then
+exits 0, as `claude --bg` does after it gives the job to the daemon."""
 
 import json
 import os
 import subprocess
 import sys
 import time
+import uuid
 
 
 def main() -> None:
@@ -30,6 +34,17 @@ def main() -> None:
         }
         print("thinking")
         print(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "env": env}))
+        return
+    if mode == "job":
+        job = os.path.join(
+            os.environ["CLAUDE_CONFIG_DIR"],
+            "jobs",
+            os.environ.get("FAKE_CLAUDE_JOB") or uuid.uuid4().hex[:8],
+        )
+        os.makedirs(job)
+        with open(os.path.join(job, "state.json"), "w") as f:
+            f.write(os.environ["FAKE_CLAUDE_JOB_STATE"])
+        print("job started")
         return
     if mode == "fail":
         print("\x1b[31merror:\x1b[0m worktree has unpushed commits", file=sys.stderr)

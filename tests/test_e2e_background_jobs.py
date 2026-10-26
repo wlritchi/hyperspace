@@ -524,7 +524,22 @@ def test_the_runner_does_not_resume_a_session_that_a_job_writes(
         calls.append(argv)
         return RunResult(0, "")
 
-    run = launcher(ctx, fake, runner=True, workspace=str(ws), run_claude=bg)
+    now = [0.0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    # The fake `claude --bg` makes no job, so the start check waits for its
+    # whole time. The clock is fake, so the test does not wait.
+    run = launcher(
+        ctx,
+        fake,
+        runner=True,
+        workspace=str(ws),
+        run_claude=bg,
+        sleep=sleep,
+        clock=lambda: now[0],
+    )
     run.tick()
     assert calls == []
     assert liveness(ctx, s.stem) == "live"

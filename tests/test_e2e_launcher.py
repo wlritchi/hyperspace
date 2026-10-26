@@ -7,11 +7,13 @@ the real ~/.claude are never used."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import socket
 import sys
 import threading
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -23,7 +25,7 @@ from _hs import FakeClaude, Server, make_server, prompt, text_reply
 from hyperspace_client import launcher as launcher_mod
 from hyperspace_client.adapters.claude_code import ClaudeCode, ContinuedFrom
 from hyperspace_client.api import Api, ApiError
-from hyperspace_client.backfill import RunResult
+from hyperspace_client.backfill import Runner, RunResult
 from hyperspace_client.cli import _hook_heartbeat, main, status_label
 from hyperspace_client.config import Config, ConfigError, check_claude_args, load
 from hyperspace_client.hooks import handle
@@ -31,6 +33,7 @@ from hyperspace_client.launcher import (
     MAX_RESUMES,
     RESUME_WAITING,
     RESUME_WORKING,
+    START_CHECK,
     START_RETRY,
     Launcher,
     close_after_exit,
@@ -964,6 +967,134 @@ def test_resume_limit(
     clock.t += 3600
     run.tick()
     assert len(bg.calls) == MAX_RESUMES + 1
+
+
+def job_bg(
+    fake: FakeClaude, monkeypatch: pytest.MonkeyPatch, job_state: object
+) -> Runner:
+    """A `claude --bg` that runs the fake, which makes a new job with
+    `job_state` in its state.json."""
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "job")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake.root))
+    raw = job_state if isinstance(job_state, str) else json.dumps(job_state)
+    monkeypatch.setenv("FAKE_CLAUDE_JOB_STATE", raw)
+
+    def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
+        return run_bg([sys.executable, FAKE, *argv[1:]], cwd, timeout)
+
+    return bg
+
+
+# The detail that Claude Code 2.1.301 wrote when a channel option took the
+# first message as a channel spec, with an escape sequence and more text.
+CRASH = "exit 1 before init \u2014 \x1b[31mError:\x1b[0m bad channel spec " + "x" * 600
+
+
+def test_a_job_that_fails_at_its_start_is_a_failed_resume(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="hyperspace")
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    bg = job_bg(fake, monkeypatch, {"state": "failed", "detail": CRASH})
+    clock = Clock()
+    run = runner(ctx, host, Bg(), clock)
+    run.run_claude = bg
+    assert run.resume(sid, RESUME_WORKING) is False
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "failed at its start: exit 1 before init" in warnings[0]
+    assert "bad channel spec" in warnings[0]
+    assert "\x1b" not in warnings[0]
+    assert len(warnings[0]) < 400
+    assert "resumed in" not in caplog.text
+    # The failed start counts toward the limit of resumes.
+    for _ in range(MAX_RESUMES + 2):
+        run.tick()
+        clock.t += 60
+    assert len(list((fake.root / "jobs").iterdir())) == MAX_RESUMES
+
+
+def test_a_job_that_fails_after_some_polls_is_a_failed_resume(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    monkeypatch.setenv("FAKE_CLAUDE_JOB", "j1")
+    bg = job_bg(fake, monkeypatch, {"state": "working", "detail": "starting\u2026"})
+    clock = Clock()
+    path = fake.root / "jobs" / "j1" / "state.json"
+    tick = clock.sleep
+
+    def sleep(seconds: float) -> None:
+        tick(seconds)
+        if clock.sleeps == 3:
+            path.write_text(json.dumps({"state": "failed", "detail": "exit 1"}))
+
+    run = runner(ctx, host, Bg(), clock)
+    run.run_claude = bg
+    run.sleep = sleep
+    assert run.resume(sid, RESUME_WORKING) is False
+    assert clock.sleeps == 3
+
+
+@pytest.mark.parametrize(
+    ("job_state", "waits"),
+    [
+        # The process started.
+        ({"state": "working", "detail": "Reading files"}, False),
+        ({"state": "blocked", "detail": "starting\u2026"}, False),
+        # The process does not start in the time of the check.
+        ({"state": "working", "detail": "starting\u2026"}, True),
+        # The launcher cannot read the job's state.
+        ("not json", True),
+        ({"detail": "exit 1"}, True),
+    ],
+)
+def test_a_job_that_does_not_fail_at_its_start_is_resumed(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    job_state: object,
+    waits: bool,
+) -> None:
+    caplog.set_level(logging.INFO, logger="hyperspace")
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    clock = Clock()
+    run = runner(ctx, host, Bg(), clock)
+    run.run_claude = job_bg(fake, monkeypatch, job_state)
+    assert run.resume(sid, RESUME_WORKING) is True
+    assert f"{sid}: resumed in" in caplog.text
+    assert (clock.t >= START_CHECK) == waits
+    assert clock.t < START_CHECK + 1
+
+
+def test_new_job_finds_the_job_of_the_resume(fake: FakeClaude) -> None:
+    sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    job(fake, "old", sid)
+    before = fake.adapter.job_names()
+    assert fake.adapter.new_job(before, sid) is None
+    # One new job: its state does not have to name the session.
+    job(fake, "a1", other)
+    assert fake.adapter.new_job(before, sid) == "a1"
+    # Two new jobs: only the one whose state names the session.
+    job(fake, "b2", other, resumeSessionId=sid)
+    assert fake.adapter.new_job(before, sid) == "b2"
+    job(fake, "c3", sid)
+    assert fake.adapter.new_job(before, sid) is None
 
 
 def test_resume_needs_a_local_copy_and_workspace(

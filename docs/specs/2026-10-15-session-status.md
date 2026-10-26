@@ -602,6 +602,19 @@ checkpoint if the session is dirty (main spec, "Checkpoint scheduling"). The
 first message tells the agent that the runner restarted, and, for a `waiting`
 session, that its crons, Monitors and background tasks stopped.
 
+`claude --bg` returns 0 when the daemon has the job, before the job's process
+starts. Thus the exit status does not show a process that fails before it
+starts, for example because an option took the first message as a value. After
+the lock release, the launcher finds the new job (the one job directory that
+`claude --bg` added, or else the one new job whose state names the session)
+and reads its `state.json` for at most 10 seconds, until the job leaves its
+start state (Claude Code 2.1.301 writes `state` `working` with `detail`
+`starting…`). If the job's `state` is `failed`, the launcher logs the job's
+`detail` (printable, on one line, cut to the length of a status note) and
+counts the resume as a failed resume. If it cannot find the job or read its
+state, or the job still starts at the end of the wait, it counts the resume as
+a resume that succeeded.
+
 The launcher reads the Claude Code options for a resume (model, agent, and
 channels) from `launcher_claude_args`, or from
 `HYPERSPACE_LAUNCHER_CLAUDE_ARGS` as a JSON list. The runner image gives that

@@ -54,6 +54,30 @@ class Job:
         return self.own_id if self.candidates == (self.own_id,) else None
 
 
+# Claude Code 2.1.301 writes the state.json of a new job with this state and
+# detail. When the job's process starts, or fails before it starts, Claude
+# Code changes them.
+_JOB_START = ("working", "starting…")
+
+
+@dataclass(frozen=True)
+class JobStart:
+    """The state of a background job just after `claude --bg`, from its
+    state.json. The format is not a stable interface."""
+
+    state: str
+    detail: str
+
+    @property
+    def starting(self) -> bool:
+        """True while the job's process has not started and has not failed."""
+        return (self.state, self.detail) == _JOB_START
+
+    @property
+    def failed(self) -> bool:
+        return self.state == "failed"
+
+
 # A job directory name that cannot be read as an option.
 _JOB_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
@@ -906,6 +930,34 @@ class ClaudeCode:
             return None
         candidates = self.writes(own, record.get("resumeSessionId"), continued_from)
         return Job(short, mtime, own, candidates)
+
+    def job_names(self) -> set[str]:
+        """The names of the job directories now, for `new_job`."""
+        try:
+            return {p.name for p in (self.config_dir / "jobs").iterdir()}
+        except OSError:
+            return set()
+
+    def new_job(self, before: Collection[str], session_id: str) -> str | None:
+        """The job that a `claude --bg --resume <session_id>` made after
+        `job_names` gave `before`: the one new job directory, or else the one
+        new job whose state names the session. None if that is not known."""
+        new = sorted(
+            name for name in self.job_names() - set(before) if _JOB_NAME.fullmatch(name)
+        )
+        if len(new) > 1:
+            new = [name for name in new if session_id in self._job_sessions(name)]
+        return new[0] if len(new) == 1 else None
+
+    def job_start(self, short: str) -> JobStart | None:
+        """The start of the job `short`, from its state.json. None if the file
+        or its `state` field is missing."""
+        record = _read_state(self.config_dir / "jobs" / short / "state.json")
+        state = record.get("state") if record else None
+        if record is None or not isinstance(state, str):
+            return None
+        detail = record.get("detail")
+        return JobStart(state, detail if isinstance(detail, str) else "")
 
     def writes(
         self,
