@@ -116,6 +116,10 @@ _TOOL_SUMMARY = 100
 _NAME_RECORDS = frozenset({"ai-title", "agent-name", "custom-title"})
 # A transcript larger than this is never a stub, and is not read to check.
 STUB_MAX = 64 * 1024
+# Record types of the conversation. `claude --resume` finds no conversation
+# in a transcript that has none of them. Older Claude Code versions also
+# wrote transcripts with only `summary` and `file-history-snapshot` records.
+_MESSAGE_RECORDS = frozenset({"user", "assistant"})
 # A job id names a directory in `<config dir>/jobs/`.
 _JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # Session id to the sessions whose transcripts have a `continued-in` record
@@ -745,6 +749,20 @@ class ClaudeCode:
         except OSError:
             return False
         return is_stub(data)
+
+    def has_messages(self, session: LocalSession) -> bool:
+        """True if the transcript has a message of the conversation, so that
+        `claude --resume` can continue it. False if the file cannot be
+        read."""
+        try:
+            with open(session.transcript, "rb") as f:
+                for line in f:
+                    record = _parse(line)
+                    if record is not None and record.get("type") in _MESSAGE_RECORDS:
+                        return True
+        except OSError:
+            pass
+        return False
 
     # --- Teleport support -------------------------------------------------------
 

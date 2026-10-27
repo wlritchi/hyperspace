@@ -274,6 +274,29 @@ def review(fake: FakeClaude, ws: str) -> Path:
     return path
 
 
+def test_select_skips_transcripts_with_no_messages(
+    ctx: Context, fake: FakeClaude, ws: str
+) -> None:
+    snapshot = {
+        "type": "file-history-snapshot",
+        "messageId": "m1",
+        "snapshot": {"messageId": "m1", "trackedFileBackups": {}},
+        "isSnapshotUpdate": False,
+    }
+    summary = {"type": "summary", "summary": "Plan the work", "leafUuid": "u1"}
+    for records in ([snapshot], [summary, summary, snapshot]):
+        path = fake.transcript(ws)
+        fake.write(path, *records)
+        sync(ctx, path, ws)
+    # A conversation after such records is a session.
+    eligible, path = new_session(fake, ws)
+    path.write_text(json.dumps(snapshot) + "\n" + path.read_text())
+    sync(ctx, path, ws)
+    selection = select(ctx, fake.adapter, MONTH, time.time())
+    assert [c.session.session_id for c in selection.candidates] == [eligible]
+    assert selection.skipped == {"no conversation": 2}
+
+
 def test_backfill_skips_automation(ctx: Context, fake: FakeClaude, ws: str) -> None:
     eligible = synced_session(ctx, fake, ws)
     # One review that the sweep classified, and one that no sweep saw yet.

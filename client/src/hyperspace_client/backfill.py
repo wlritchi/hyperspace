@@ -166,9 +166,10 @@ def _local_reason(
         return "messaged before", ""
     if sid in live:
         return "live", ""
-    if adapter.is_stub(session):
-        # For example, the own id of a background job: its conversation is
-        # in the transcript of the session that it continues.
+    if not adapter.has_messages(session):
+        # For example, the own id of a background job (its conversation is
+        # in the transcript of the session that it continues), or a file of
+        # summaries from an older Claude Code. A resume of it fails.
         return "no conversation", ""
     record = ctx.state.session(adapter.harness, sid)
     # A session that a tool started, for example a security review, gains
