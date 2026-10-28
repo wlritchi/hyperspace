@@ -77,6 +77,22 @@ A runner with `--read granted` can read only its own sessions and the sessions
 granted to it. Revoke a credential with
 `scripts/revoke-credential.py <credential id>`; it stops working at once.
 
+### A credential for subspace
+
+Subspace wakes a stopped session through `POST /v1/wake/{harness}` (see the
+[wake spec](specs/2026-10-28-wake.md)). Give it a credential with the `wake`
+scope and no other scope. Its host name is only a name for logs:
+
+```sh
+kubectl -n hyperspace exec deploy/hyperspace -- \
+  python /app/hyperspace/scripts/new-credential.py \
+  --host subspace --scopes wake
+```
+
+Put the token and the URL `https://hyperspace.example.com/v1/wake/claude-code`
+in the wake configuration of subspace. A `wake` credential can call only the
+wake endpoint, so a leak of it exposes no transcript.
+
 ### Credentials from a provisioner
 
 A provisioner (for example, OpenTofu) can make credentials with no step in the
@@ -233,6 +249,24 @@ Under launchd, on macOS:
 ```sh
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/hyperspace-launcher.plist
 ```
+
+With `--stay`, the launcher also acts on wakes: when a message arrives for a
+stopped session that this host holds, it resumes the session as a background
+job (see the [wake spec](specs/2026-10-28-wake.md)). The resumed session gets
+its messages only if the channel that relays subspace messages loads, so put
+the Claude Code options for a resume in `config.toml`:
+
+```toml
+launcher_claude_args = [
+  "--dangerously-load-development-channels", "plugin:notifications@wlr-cc-plugins",
+]
+```
+
+The launcher refuses some options in this list, and the last option must not
+take a list of values; see "At boot: the launcher" in
+[runners.md](runners.md). A launcher without `--stay` does not act on wakes:
+the wake request then stays pending until you resume the session, or until a
+launcher with `--stay` runs.
 
 Only one launcher runs for each host and harness config directory, so a
 launcher from a hook and one from a service manager do not conflict.

@@ -135,8 +135,19 @@ The image must provide:
   exec hyperspace launcher --runner
   ```
 
-The launcher does not yet receive wake requests from subspace. Until it does,
-a message to a stopped session waits until a user or the runner resumes it.
+### Wakes
+
+When a message arrives for a stopped session, subspace sends a wake to the
+server, and the server records a wake request on the session. At its next
+tick, the launcher resumes each held session that has a pending request and
+does not run, whatever its status, with a first message that says that
+messages arrived. The relay in the resumed session then connects to subspace
+and delivers the messages. Thus the channel that relays subspace messages must
+be in `HYPERSPACE_LAUNCHER_CLAUDE_ARGS`, as in the example above; without it,
+the resumed session does not get its messages. The launcher tells the server
+that it acts on wakes in each heartbeat, so subspace gets the verdict `waking`
+while the runner is up, and `queued` while it is down. See the
+[wake spec](specs/2026-10-28-wake.md).
 
 ## At boot, with your own supervisor
 

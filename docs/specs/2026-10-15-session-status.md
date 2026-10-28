@@ -519,7 +519,8 @@ agent-initiated teleport (main spec, "Later"). It:
 - sends the heartbeat;
 - closes `done` jobs (see "Closing a done session");
 - resumes sessions that need a process (runner mode only);
-- receives wake requests (see "Messages to a session").
+- resumes a held session that has a pending wake request (see the
+  [wake spec](2026-10-28-wake.md)).
 
 A lock in the client state directory makes sure that only one launcher runs
 for each host and harness config directory. The SessionStart and SessionEnd
@@ -551,9 +552,10 @@ runs.
 
 This mode needs no service manager, so it works on each OS where the hooks
 work. (The client itself works only on Linux and macOS.) A user who wants the
-launcher all the time, for example for later work that receives sessions with
-no user action, can run `hyperspace launcher --stay` from a systemd user unit
-or a launchd agent. `docs/deploy.md` has examples of both.
+launcher all the time, for example so that a message to a stopped session
+resumes it (see the [wake spec](2026-10-28-wake.md)), can run
+`hyperspace launcher --stay` from a systemd user unit or a launchd agent.
+`docs/deploy.md` has examples of both.
 
 ### Runner mode
 
@@ -582,12 +584,14 @@ request fail. `--stay` waits in the same way. At boot it:
    `local`, as a background job, with `claude --bg --resume <sid>` in the
    session's workspace. It does not resume a session that is `ready`,
    `waiting` with wake `message`, or `done`, or that has no status (R1, R2,
-   R3). It also does not resume a session that the server shows as `live`, on
-   any host, so that the resume does not make a second copy. This includes its
-   own host, because a different harness config directory on the host can run
-   the session, and the launcher's own live-process check does not see that
-   process. The launcher sends its heartbeat before it resumes, so a `live`
-   from its own heartbeat before a restart does not stay.
+   R3), unless the session has a pending wake request (see the
+   [wake spec](2026-10-28-wake.md)). It also does not resume a session that
+   the server shows as `live`, on any host, so that the resume does not make a
+   second copy. This includes its own host, because a different harness config
+   directory on the host can run the session, and the launcher's own
+   live-process check does not see that process. The launcher sends its
+   heartbeat before it resumes, so a `live` from its own heartbeat before a
+   restart does not stay.
 
 At each tick, it does step 3 again for the held sessions that do not run. It
 does not resume a job that the Claude Code daemon stopped if its session is
@@ -634,33 +638,26 @@ options, and that option would take the message as a value.
 
 ## Messages to a session
 
-Subspace already wakes an agent that is not connected: it sends a `wake`
-request to a configured webhook URL. The launcher is that webhook on a runner.
-It maps the subspace handle to a session id, and the lease tells an operator
-(later) which runner to wake.
+Subspace delivers messages through the relay in the session's process. When
+the session has no process, subspace sends a wake to the hyperspace server,
+and the launcher of the host that holds the lease resumes the session at its
+next tick. The [wake spec](2026-10-28-wake.md) gives the endpoint, the `wake`
+scope, the verdicts, and the launcher rules. The launcher is not a webhook: it
+makes only outbound requests, and the server is the meeting point.
 
-The webhook answers with a _verdict_. Subspace must also work with webhooks
-that it does not control, so it uses the HTTP status first, and the body only
-for detail:
+The server refuses a wake for a `done` session with `409` and a message such
+as "session done: <outcome note>" (M1). A `reopen` with a reason (M2), and the
+notices to the sender (M1, M3), are later work (see "Later").
 
-| Response                              | Meaning for subspace                                                                                             |
-| ------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| 2xx                                   | Accepted. A body `{"verdict": "waking"}` or a reason is optional.                                                |
-| 4xx                                   | Refused. Do not retry. Tell the sender that the message was not delivered, with the body's `message` if present. |
-| 5xx, a timeout, or a connection error | Not delivered yet. Keep the message, retry, and tell the sender that it is queued (M3).                          |
-
-The launcher refuses a wake for a `done` session with `409` and a message such
-as "session done: <outcome note>" (M1). A sender that must reach the session
-sends the message with `reopen` and a reason (M2). The launcher then writes an
-explicit `ready` event, with the sender's session as the source and the reason
-as the note, and resumes the session with the message.
+A resume must continue the session under the same id. Subspace keys its state
+by session id, and the relay connects as that id. Hyperspace owns this rule
+for each resume that it does, on each host kind and in each launcher mode
+(wake spec, "Session identity").
 
 A `done` session that is still live (its process did not stop yet) gets
-messages directly, with no webhook. The message is new activity, so it reopens
-the session (U5). The process still runs, so the session can still be in use.
-
-Subspace needs these changes: verdict handling, non-delivery and queued
-notices to the sender, and the `reopen` option. They are outside this spec.
+messages directly, through its relay. The message is new activity, so it
+reopens the session (U5). The process still runs, so the session can still be
+in use.
 
 ## Overview
 
@@ -786,6 +783,9 @@ A heartbeat applies only to the credential's own host.
 
 ## Later
 
+- **Reopen and notices.** A `reopen` with a reason for a `done` session (M2),
+  and the notices to the sender that a message was not delivered or is queued
+  (M1, M3).
 - **Scale to zero.** An operator stops a runner when no session on it is
   `working` or `waiting` with wake `local`, and starts it when a wake request
   comes for a session whose lease the runner holds.
