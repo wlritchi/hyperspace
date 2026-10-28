@@ -59,6 +59,7 @@ def env(tmp_path: Path) -> Iterator[Env]:
         "laptop": ("laptop", {"append", "read", "grant"}, "all"),
         "agent": ("agent-1", {"append", "read", "grant"}, "granted"),
         "reader": ("reader", {"read"}, "all"),
+        "waker": ("subspace", {"wake"}, "own"),
     }
     tokens: dict[str, str] = {}
     creds: dict[str, Credential] = {}
@@ -137,6 +138,7 @@ def test_auth(env: Env) -> None:
             "liveness",
             "list-cursor",
             "child-sessions",
+            "wake",
         ],
     }
 
@@ -646,3 +648,133 @@ def test_teleport_after_heartbeat_has_no_stale_snapshot(env: Env) -> None:
         },
     )
     assert r.status_code == 200, r.text
+
+
+WAKE = "/v1/wake/claude-code"
+
+
+def wake(env: Env, sid: str = SID, who: str = "waker", **extra: Any) -> Any:
+    body = {
+        "event": "wake",
+        "account": "other",
+        "session": sid,
+        "handle": "reviewer",
+        "pending": 2,
+        "items": [],
+        **extra,
+    }
+    return env.client.post(WAKE, headers=env.h(who), json=body)
+
+
+def heartbeat(env: Env, *sids: str, **extra: Any) -> None:
+    sessions = [{"harness": "claude-code", "session_id": sid} for sid in sids]
+    r = env.client.put(
+        "/v1/hosts/self/heartbeat",
+        headers=env.h("laptop"),
+        json={"interval": 60, "sessions": sessions, **extra},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_wake_scope_rules(env: Env) -> None:
+    g = new_gen(env, "laptop", WS_LAPTOP)
+    append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)
+    # A wake credential can call only the wake endpoint. This includes the
+    # endpoints that need no scope.
+    w = env.h("waker", WS_LAPTOP)
+    refused = [
+        env.client.get("/v1/whoami", headers=w),
+        env.client.put("/v1/hosts/self", headers=w, json={"kind": "runner"}),
+        env.client.put("/v1/hosts/self/heartbeat", headers=w, json={"interval": 60}),
+        env.client.get("/v1/hosts", headers=w),
+        env.client.get("/v1/sessions", headers=w),
+        env.client.get(S, headers=w),
+        env.client.get(f"{S}/state", headers=w),
+        env.client.post(f"{S}/status", headers=w, json=status_body()),
+        env.client.post(f"{S}/generations", headers=w, json={"path": "x"}),
+    ]
+    assert [r.status_code for r in refused] == [403] * len(refused)
+    assert all(r.json()["error"] == "forbidden" for r in refused)
+    for who in ("laptop", "reader"):
+        r = wake(env, who=who)
+        assert r.status_code == 403
+        assert r.json() == {"error": "forbidden", "detail": "missing scope: wake"}
+    # A wake does not register the host of the credential.
+    assert wake(env).status_code == 200
+    hosts = env.client.get("/v1/hosts", headers=env.h("laptop")).json()["hosts"]
+    assert "subspace" not in [h["name"] for h in hosts]
+
+
+def test_wake_verdicts(env: Env) -> None:
+    assert wake(env).status_code == 404
+    g = new_gen(env, "laptop", WS_LAPTOP)
+    append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)
+    # The account in the body does not matter: the credential gives it.
+    r = wake(env)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"verdict": "queued"}
+    state = env.client.get(f"{S}/state", headers=env.h("laptop")).json()
+    assert state["wake_request"]["count"] == 2
+    heartbeat(env, wakes=True)
+    assert wake(env, pending=5).json() == {"verdict": "waking"}
+
+    def listed(query: str) -> list[str]:
+        r = env.client.get(f"/v1/sessions?{query}", headers=env.h("laptop"))
+        assert r.status_code == 200, r.text
+        return [s["session_id"] for s in r.json()["sessions"]]
+
+    assert listed("wake=pending") == [SID]
+    # A new run ends the request.
+    heartbeat(env, SID, wakes=True)
+    assert listed("wake=pending") == []
+    state = env.client.get(f"{S}/state", headers=env.h("laptop")).json()
+    assert "wake_request" not in state
+    assert wake(env).json() == {"verdict": "live"}
+    assert listed("wake=pending") == [SID]
+    r = env.client.get("/v1/sessions?wake=other", headers=env.h("laptop"))
+    assert r.status_code == 400
+
+
+def test_wake_refusals(env: Env) -> None:
+    r = env.client.post(
+        "/v1/sessions/claude-code/other/meta",
+        headers=env.h("laptop", WS_LAPTOP),
+        json={"title": "no lease yet"},
+    )
+    assert r.status_code == 200, r.text
+    r = wake(env, "other")
+    assert r.status_code == 409
+    assert r.json() == {"error": "lease_free", "detail": "no host holds the session"}
+    r = env.client.post(
+        "/v1/sessions/claude-code/other/status",
+        headers=env.h("laptop"),
+        json=status_body(status="done", reason=None, note="merged"),
+    )
+    assert r.status_code == 200, r.text
+    r = wake(env, "other")
+    assert r.status_code == 409
+    assert r.json() == {"error": "session_done", "detail": "session done: merged"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"session": "../x"},
+        {"session": 7},
+        {"session": SID, "pending": -1},
+        {"session": SID, "pending": True},
+        {"session": SID, "handle": "a\nb"},
+    ],
+)
+def test_wake_bad_bodies(env: Env, body: dict[str, Any]) -> None:
+    r = env.client.post(WAKE, headers=env.h("waker"), json=body)
+    assert r.status_code == 400
+    assert r.json()["error"] == "bad_request"
+
+
+def test_wake_bad_harness(env: Env) -> None:
+    r = env.client.post(
+        "/v1/wake/Bad_Harness", headers=env.h("waker"), json={"session": SID}
+    )
+    assert r.status_code == 400

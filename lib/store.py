@@ -59,6 +59,8 @@ from hyperspace_protocol import (
     TeleportEvent,
     UnclosedSession,
     ValidationError,
+    WakeRequest,
+    WakeVerdict,
     validate_metadata,
 )
 from objects import ObjectStore
@@ -320,6 +322,22 @@ _MIGRATIONS: list[str] = [
     );
     INSERT INTO copy_marks VALUES ('status_events', 0, ''), ('metadata_events', 0, '');
     """,
+    # Wakes. A session has at most one wake request; a new wake replaces it.
+    # `run_started` is the start of the current run of a session on a host
+    # and source. Unlike `first_listed`, a heartbeat gap does not reset it.
+    # `wakes_received` and `wakes_interval` are the time and the interval of
+    # the last heartbeat with `wakes: true` of the source.
+    """
+    CREATE TABLE wake_requests (
+        session INTEGER PRIMARY KEY REFERENCES sessions (id),
+        received TEXT NOT NULL,
+        count INTEGER NOT NULL
+    );
+    ALTER TABLE session_liveness ADD COLUMN run_started TEXT;
+    UPDATE session_liveness SET run_started = first_listed;
+    ALTER TABLE host_heartbeats ADD COLUMN wakes_received TEXT;
+    ALTER TABLE host_heartbeats ADD COLUMN wakes_interval INTEGER;
+    """,
 ]
 
 # The event tables whose latest event has a copy in the session row, with an
@@ -412,6 +430,17 @@ _READABLE = """(
 # the table row.
 _SORT_KEY = "COALESCE(s.last_activity, s.created)"
 _RECENT = f"{_SORT_KEY} DESC, s.harness DESC, s.session_id DESC"
+
+# The wake request `w` of the session `s` is pending: the session is not
+# `done`, and no run of the session started after the request. The session
+# state and the filter `wake=pending` use the same rule.
+_WAKE_PENDING = """(
+    (s.status IS NULL OR s.status != 'done')
+    AND NOT EXISTS (
+        SELECT 1 FROM session_liveness l
+        WHERE l.session = s.id AND l.run_started > w.received
+    )
+)"""
 
 
 @dataclass(frozen=True)
@@ -568,6 +597,12 @@ def _iso(dt: datetime) -> str:
 
 def _parse_iso(value: str) -> datetime:
     return datetime.strptime(value, _ISO_FORMAT).replace(tzinfo=UTC)
+
+
+def _past_expiry(received: str, interval: int, now: str) -> bool:
+    """True if a heartbeat at `received` with `interval` expired at `now`."""
+    age = _parse_iso(now) - _parse_iso(received)
+    return age > timedelta(seconds=HEARTBEAT_EXPIRY * interval)
 
 
 def _new_id(prefix: str) -> str:
@@ -1833,6 +1868,9 @@ class Store:
             body["liveness"] = liveness
         if row["last_activity"] is not None:
             body["last_append"] = row["last_activity"]
+        wake = self._pending_wake(session)
+        if wake is not None:
+            body["wake_request"] = wake
         return body, latest[1] if latest is not None else None
 
     @_reading
@@ -1942,27 +1980,32 @@ class Store:
                     "WHERE session = ? AND host = ? AND source = ?",
                     (session["id"], host, source),
                 ).fetchone()
-                # `first_listed` is the start of the current run on this host.
-                # It stays only if the previous heartbeat listed the session
-                # and had not expired.
-                first = now
-                if (
+                # The run continues if the previous heartbeat of the source
+                # listed the session. A gap does not end the run: the process
+                # can continue while the host cannot reach the server. A new
+                # run ends a pending wake request.
+                continued = (
                     row is not None
                     and previous is not None
                     and row["last_listed"] >= previous["received"]
-                    and not self._expired(previous, now)
-                ):
+                )
+                run_started = row["run_started"] if continued else now
+                # `first_listed` is the `since` of a live session. It starts
+                # again also after a gap.
+                first = now
+                if continued and not self._expired(previous, now):
                     first = row["first_listed"]
                 self._db.execute(
                     """
                     INSERT INTO session_liveness
-                    (session, host, source, first_listed, last_listed)
-                    VALUES (?, ?, ?, ?, ?)
+                    (session, host, source, first_listed, last_listed, run_started)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     ON CONFLICT (session, host, source) DO UPDATE SET
                         first_listed = excluded.first_listed,
-                        last_listed = excluded.last_listed
+                        last_listed = excluded.last_listed,
+                        run_started = excluded.run_started
                     """,
-                    (session["id"], host, source, first, now),
+                    (session["id"], host, source, first, now, run_started),
                 )
                 recorded += 1
             unclosed: list[UnclosedSession] = []
@@ -1975,45 +2018,59 @@ class Store:
                 unclosed.append(item)
                 # A job can stop before any heartbeat lists it. Then the host
                 # has no liveness row for it, and `close_blocked` would not
-                # show. Record it as stopped at its last activity.
+                # show. Record it as stopped at its last activity. The job
+                # ran on the host, so the row also records a run.
                 since = session["last_activity"] or session["created"]
                 if since < now:
                     self._db.execute(
                         """
                         INSERT INTO session_liveness
-                        (session, host, source, first_listed, last_listed)
-                        VALUES (?, ?, ?, ?, ?)
+                        (session, host, source, first_listed, last_listed, run_started)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         ON CONFLICT (session, host, source) DO NOTHING
                         """,
-                        (session["id"], host, source, since, since),
+                        (session["id"], host, source, since, since, since),
                     )
+            # The wake mark. The heartbeats of the hooks do not send
+            # `wakes`, and they must not clear the mark of the launcher of
+            # the same source. A launcher that stops clears it.
+            final = request.get("final", False)
+            wakes = request.get("wakes", False) and not final
             self._db.execute(
                 """
                 INSERT INTO host_heartbeats
-                (account, host, source, received, interval, final, unclosed)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (account, host, source, received, interval, final, unclosed,
+                 wakes_received, wakes_interval)
+                VALUES (:account, :host, :source, :now, :interval, :final,
+                        :unclosed, :wakes_received, :wakes_interval)
                 ON CONFLICT (account, host, source) DO UPDATE SET
                     received = excluded.received,
                     interval = excluded.interval,
                     final = excluded.final,
-                    unclosed = excluded.unclosed
+                    unclosed = excluded.unclosed,
+                    wakes_received = CASE WHEN :set_mark
+                        THEN excluded.wakes_received ELSE wakes_received END,
+                    wakes_interval = CASE WHEN :set_mark
+                        THEN excluded.wakes_interval ELSE wakes_interval END
                 """,
-                (
-                    account,
-                    host,
-                    source,
-                    now,
-                    request["interval"],
-                    int(request.get("final", False)),
-                    json.dumps(unclosed),
-                ),
+                {
+                    "account": account,
+                    "host": host,
+                    "source": source,
+                    "now": now,
+                    "interval": request["interval"],
+                    "final": int(final),
+                    "unclosed": json.dumps(unclosed),
+                    "wakes_received": now if wakes else None,
+                    "wakes_interval": request["interval"] if wakes else None,
+                    "set_mark": int(wakes or final),
+                },
             )
             return {"received": now, "recorded": recorded}
 
     @staticmethod
     def _expired(heartbeat: sqlite3.Row, now: str) -> bool:
-        age = _parse_iso(now) - _parse_iso(heartbeat["received"])
-        return age > timedelta(seconds=HEARTBEAT_EXPIRY * heartbeat["interval"])
+        return _past_expiry(heartbeat["received"], heartbeat["interval"], now)
 
     def _liveness(self, session: sqlite3.Row) -> Liveness | None:
         # Each row has the heartbeat of its host and source (config
@@ -2075,6 +2132,73 @@ class Store:
             ):
                 liveness["close_blocked"] = item["reason"]
         return liveness
+
+    # --- Wakes ----------------------------------------------------------
+
+    def _pending_wake(self, session: int) -> WakeRequest | None:
+        row = self._db.execute(
+            "SELECT w.received, w.count FROM wake_requests w "
+            "JOIN sessions s ON s.id = w.session "
+            f"WHERE w.session = ? AND {_WAKE_PENDING}",
+            (session,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"received": row["received"], "count": row["count"]}
+
+    def _acts_on_wakes(self, account: str, host: str, now: str) -> bool:
+        """True if a launcher that acts on wakes runs on `host`: a heartbeat
+        of a source of the host with `wakes: true` has not expired."""
+        rows = self._db.execute(
+            "SELECT wakes_received, wakes_interval FROM host_heartbeats "
+            "WHERE account = ? AND host = ? AND wakes_received IS NOT NULL",
+            (account, host),
+        ).fetchall()
+        return any(
+            not _past_expiry(r["wakes_received"], r["wakes_interval"], now)
+            for r in rows
+        )
+
+    def wake(self, key: SessionKey, count: int) -> WakeVerdict:
+        """Record a wake request for the session, and return the verdict.
+
+        Raise `NotFound` if the session does not exist. Raise `StoreError`
+        with `session_done` or `lease_free` if its state refuses the wake.
+        This method does not check read access. A wake credential can wake
+        each session of its account.
+        """
+        with self._tx():
+            session = self._require_session(key)
+            latest = self._latest_status(session["id"])
+            if latest is not None and latest[0]["status"] == "done":
+                note = latest[0].get("note")
+                raise StoreError(
+                    "session_done", f"session done: {note}" if note else "session done"
+                )
+            lease = self._lease(session)
+            if lease["state"] == "free":
+                raise StoreError("lease_free", "no host holds the session")
+            now = self.now()
+            self._db.execute(
+                """
+                INSERT INTO wake_requests (session, received, count)
+                VALUES (?, ?, ?)
+                ON CONFLICT (session) DO UPDATE SET
+                    received = excluded.received,
+                    count = excluded.count
+                """,
+                (session["id"], now, count),
+            )
+            # A live session also gets the request: its liveness can be one
+            # heartbeat old.
+            liveness = self._liveness(session)
+            if liveness is not None and liveness["state"] == "live":
+                return "live"
+            if lease["state"] == "held" and self._acts_on_wakes(
+                key.account, session["lease_host"], now
+            ):
+                return "waking"
+            return "queued"
 
     @_reading
     def status_counts(self, key: SessionKey) -> dict[str, int]:
@@ -2283,6 +2407,7 @@ class Store:
             liveness = self._db.execute(
                 "DELETE FROM session_liveness WHERE session = ?", (sid,)
             ).rowcount
+            self._db.execute("DELETE FROM wake_requests WHERE session = ?", (sid,))
             self._db.execute("DELETE FROM files WHERE session = ?", (sid,))
             self._db.execute("DELETE FROM sessions WHERE id = ?", (sid,))
             # `_advance_copies` ran at the start of this transaction, and a
@@ -2437,12 +2562,13 @@ class Store:
                 "source_offset": session["forked_from_offset"],
                 "created": session["created"],
             }
-        # A heartbeat or a status write must not make a restore stale. An
-        # append changes `last_append`, but the files show the append too.
+        # A heartbeat, a status write or a wake must not make a restore
+        # stale. An append changes `last_append`, but the files show the
+        # append too.
         state = {
             name: value
             for name, value in manifest["state"].items()
-            if name not in ("status", "liveness", "last_append")
+            if name not in ("status", "liveness", "last_append", "wake_request")
         }
         hashed = {**manifest, "state": state}
         manifest["revision"] = hashlib.sha256(
@@ -2469,6 +2595,7 @@ class Store:
         before: ListPosition | None = None,
         top_level: bool = False,
         parent: str | None = None,
+        wake_pending: bool = False,
     ) -> list[SessionSummary]:
         """List readable sessions, newest first. See `list_sessions_page`."""
         return self.list_sessions_page(
@@ -2488,6 +2615,7 @@ class Store:
             before=before,
             top_level=top_level,
             parent=parent,
+            wake_pending=wake_pending,
         )[0]
 
     @_reading
@@ -2509,6 +2637,7 @@ class Store:
         before: ListPosition | None = None,
         top_level: bool = False,
         parent: str | None = None,
+        wake_pending: bool = False,
     ) -> tuple[list[SessionSummary], ListPosition | None]:
         """List readable sessions, newest first, after the position `before`.
 
@@ -2523,6 +2652,7 @@ class Store:
 
         `top_level` keeps the sessions with no parent and no `automation`
         metadata. `parent` keeps the children of the session with that id.
+        `wake_pending` keeps the sessions with a pending wake request.
 
         SQL applies all filters except `title` and `liveness`, and sorts with
         the index `sessions_recent`. Without these two filters, SQL also
@@ -2580,6 +2710,11 @@ class Store:
             where.append(f"({' OR '.join(matches)})")
         if open_only:
             where.append("(s.status IS NULL OR s.status != 'done')")
+        if wake_pending:
+            where.append(
+                "EXISTS (SELECT 1 FROM wake_requests w "
+                f"WHERE w.session = s.id AND {_WAKE_PENDING})"
+            )
         if scope != "all":
             # Last, so that the simple filters skip its subqueries.
             where.append(_READABLE)

@@ -50,6 +50,7 @@ from hyperspace_protocol import (
     SessionList,
     StatusResponse,
     ValidationError,
+    WakeResponse,
     decode_workspace,
     validate_file_path,
     validate_harness,
@@ -59,6 +60,7 @@ from hyperspace_protocol import (
     validate_session_id,
     validate_sha256,
     validate_status_request,
+    validate_wake_request,
     validate_workspace,
 )
 from store import (
@@ -92,6 +94,8 @@ _STATUS = {
     "stale_status": 409,
     "teleport_committed_conflict": 409,
     "teleport_committed_moved": 409,
+    "session_done": 409,
+    "lease_free": 409,
     "bad_request": 400,
     "bad_range": 400,
     "bad_digest": 400,
@@ -523,6 +527,10 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
                 missing = [s for s in scopes if s not in principal.scopes]
                 if missing:
                     return error("forbidden", f"missing scope: {', '.join(missing)}")
+                # A wake credential has no other scope, but it must not get
+                # the endpoints that need no scope either.
+                if "wake" in principal.scopes and "wake" not in scopes:
+                    return error("forbidden", "a wake credential can only send wakes")
                 try:
                     return await handler(request, principal)
                 except Conflict as exc:
@@ -712,6 +720,7 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         parent = q.get("parent")
         if parent is not None:
             validate_session_id(parent)
+        wake = choices(q.getlist("wake"), ("pending",), "wake")
         sessions, position = await run_in_threadpool(
             store.snapshot,
             lambda: store.list_sessions_page(
@@ -731,6 +740,7 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
                 before=before,
                 top_level=q.get("top_level") == "1",
                 parent=parent,
+                wake_pending=wake is not None,
             ),
         )
         body: SessionList = {"sessions": sessions}
@@ -980,6 +990,33 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         )
         return Response(data, media_type="application/octet-stream")
 
+    @authed("wake")
+    async def post_wake(request: Request, principal: Principal) -> Response:
+        harness = validate_harness(request.path_params["harness"])
+        body = validate_wake_request(await read_json(request))
+        key = SessionKey(principal.account, harness, body["session"])
+        pending = body.get("pending", 0)
+
+        def log_wake(verdict: str) -> None:
+            log.info(
+                "wake %s/%s/%s handle=%s pending=%d verdict=%s",
+                key.account,
+                key.harness,
+                key.session_id,
+                body.get("handle", "-"),
+                pending,
+                verdict,
+            )
+
+        try:
+            verdict = await run_in_threadpool(store.wake, key, pending)
+        except StoreError as exc:
+            log_wake(exc.code)
+            raise
+        log_wake(verdict)
+        response: WakeResponse = {"verdict": verdict}
+        return JSONResponse(response)
+
     s = f"{API_PREFIX}/sessions/{{harness}}/{{sid}}"
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
@@ -989,6 +1026,7 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         Route(f"{API_PREFIX}/hosts", get_hosts, methods=["GET"]),
         Route(f"{API_PREFIX}/workspaces", get_workspaces, methods=["GET"]),
         Route(f"{API_PREFIX}/sessions", list_sessions, methods=["GET"]),
+        Route(f"{API_PREFIX}/wake/{{harness}}", post_wake, methods=["POST"]),
         Route(s, get_manifest, methods=["GET"]),
         Route(f"{s}/state", get_state, methods=["GET"]),
         Route(f"{s}/meta", post_meta, methods=["POST"]),

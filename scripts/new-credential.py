@@ -4,6 +4,10 @@
 
     scripts/new-credential.py --host laptop --scopes append,read,grant --read all
     scripts/new-credential.py --host agent-1 --scopes append,read,grant --read granted
+    scripts/new-credential.py --host subspace --scopes wake
+
+A `wake` credential can only send wakes, so it has no other scope. Its host
+is a name for logs.
 
 Run it where the server's data directory is (inside the server container, for
 example with `kubectl exec`). The server reloads the accounts file when it

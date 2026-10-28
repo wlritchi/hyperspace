@@ -76,12 +76,23 @@ def test_dump_and_parse(tmp_path: Path) -> None:
         'secret_sha256 = "' + "0" * 64 + '"\nhost = "Laptop"',
         '[[accounts.default.credentials]]\nid = "abcdefghijkl"\n'
         'secret_sha256 = "' + "0" * 64 + '"\nhost = "laptop"\nscopes = ["admin"]',
+        '[[accounts.default.credentials]]\nid = "abcdefghijkl"\n'
+        'secret_sha256 = "' + "0" * 64 + '"\nhost = "subspace"\n'
+        'scopes = ["wake", "read"]',
         "not toml [",
     ],
 )
 def test_invalid_files(text: str) -> None:
     with pytest.raises(AccountsError):
         parse_accounts(text)
+
+
+def test_wake_credential(tmp_path: Path) -> None:
+    token, c = make(host="subspace", scopes=frozenset({"wake"}))
+    write(tmp_path / "accounts.toml", c)
+    assert 'scopes = ["wake"]' in (tmp_path / "accounts.toml").read_text()
+    principal = AccountsFile(tmp_path / "accounts.toml").authenticate(token, NOW)
+    assert principal is not None and principal.scopes == frozenset({"wake"})
 
 
 def test_authenticate(tmp_path: Path) -> None:
@@ -455,3 +466,38 @@ def test_new_credential_avoids_directory_ids(
     assert module.main() == 0
     written = parse_accounts((tmp_path / "accounts.toml").read_text())
     assert [c.id for c in written.accounts["default"].credentials] == [fresh[1]]
+
+
+@pytest.mark.parametrize(
+    ("scopes", "code", "written"),
+    [("wake", 0, frozenset({"wake"})), ("wake,read", 1, None)],
+)
+def test_new_credential_wake_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scopes: str,
+    code: int,
+    written: frozenset[str] | None,
+) -> None:
+    module = _script("new-credential")
+    monkeypatch.delenv("HYPERSPACE_ACCOUNTS_DIR", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "new-credential",
+            "--host",
+            "subspace",
+            "--scopes",
+            scopes,
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    assert module.main() == code
+    path = tmp_path / "accounts.toml"
+    if written is None:
+        assert not path.exists()
+    else:
+        creds = parse_accounts(path.read_text()).accounts["default"].credentials
+        assert [c.scopes for c in creds] == [written]
