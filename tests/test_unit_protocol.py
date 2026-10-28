@@ -10,6 +10,7 @@ from hyperspace_protocol import (
     MAX_STATUS_EXCERPT,
     MAX_STATUS_NOTE,
     MAX_WAKE_HANDLE,
+    MAX_WAKE_PENDING,
     ValidationError,
     validate_file_path,
     validate_harness,
@@ -241,6 +242,20 @@ def test_wake_request_validation() -> None:
         "pending": 2,
     }
     assert validate_wake_request({"session": "s1"}) == {"session": "s1", "pending": 0}
+    # `pending` and `handle` are for information only. A bad value is cut or
+    # dropped, so that the wake is not lost.
+    assert validate_wake_request({"session": "s1", "pending": 2**70}) == {
+        "session": "s1",
+        "pending": MAX_WAKE_PENDING,
+    }
+    for handle, kept in (
+        (3, None),
+        ("", None),
+        ("a\x1b[2J", "a?[2J"),
+        ("x" * (MAX_WAKE_HANDLE + 1), "x" * MAX_WAKE_HANDLE),
+    ):
+        checked = validate_wake_request({"session": "s1", "handle": handle})
+        assert checked.get("handle") == kept
     for bad in (
         {},
         {"session": 7},
@@ -248,9 +263,6 @@ def test_wake_request_validation() -> None:
         {"session": "s1", "pending": -1},
         {"session": "s1", "pending": "2"},
         {"session": "s1", "pending": False},
-        {"session": "s1", "handle": 3},
-        {"session": "s1", "handle": "a\x1b[2J"},
-        {"session": "s1", "handle": "x" * (MAX_WAKE_HANDLE + 1)},
     ):
         with pytest.raises(ValidationError):
             validate_wake_request(bad)

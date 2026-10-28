@@ -2018,18 +2018,20 @@ class Store:
                 unclosed.append(item)
                 # A job can stop before any heartbeat lists it. Then the host
                 # has no liveness row for it, and `close_blocked` would not
-                # show. Record it as stopped at its last activity. The job
-                # ran on the host, so the row also records a run.
+                # show. Record it as stopped at its last activity. The row
+                # has no run start: no heartbeat saw the run, and an append
+                # after a wake must not end the wake. A later listing starts
+                # a run, because this heartbeat does not list the session.
                 since = session["last_activity"] or session["created"]
                 if since < now:
                     self._db.execute(
                         """
                         INSERT INTO session_liveness
-                        (session, host, source, first_listed, last_listed, run_started)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                        (session, host, source, first_listed, last_listed)
+                        VALUES (?, ?, ?, ?, ?)
                         ON CONFLICT (session, host, source) DO NOTHING
                         """,
-                        (session["id"], host, source, since, since, since),
+                        (session["id"], host, source, since, since),
                     )
             # The wake mark. The heartbeats of the hooks do not send
             # `wakes`, and they must not clear the mark of the launcher of

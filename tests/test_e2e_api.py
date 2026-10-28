@@ -764,13 +764,31 @@ def test_wake_refusals(env: Env) -> None:
         {"session": 7},
         {"session": SID, "pending": -1},
         {"session": SID, "pending": True},
-        {"session": SID, "handle": "a\nb"},
     ],
 )
 def test_wake_bad_bodies(env: Env, body: dict[str, Any]) -> None:
     r = env.client.post(WAKE, headers=env.h("waker"), json=body)
     assert r.status_code == 400
     assert r.json()["error"] == "bad_request"
+
+
+def test_wake_keeps_bad_information_fields(env: Env) -> None:
+    g = new_gen(env, "laptop", WS_LAPTOP)
+    append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)
+    # `pending` and `handle` are for information only. Values that SQLite or
+    # the log cannot take must not lose the wake.
+    for extra in (
+        {"pending": 2**63},
+        {"pending": 2**31 - 1},
+        {"handle": "a\nb" + "x" * 1000},
+        {"handle": 7},
+        {"handle": None},
+    ):
+        r = wake(env, **extra)
+        assert r.status_code == 200, (extra, r.text)
+    r = wake(env, pending=2**63)
+    state = env.client.get(f"{S}/state", headers=env.h("laptop")).json()
+    assert state["wake_request"]["count"] == 2**31 - 1
 
 
 def test_wake_bad_harness(env: Env) -> None:

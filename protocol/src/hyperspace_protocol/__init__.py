@@ -61,6 +61,9 @@ MAX_HEARTBEAT_SESSIONS = 1000
 MIN_HEARTBEAT_INTERVAL = 10
 MAX_HEARTBEAT_INTERVAL = 3600
 MAX_WAKE_HANDLE = 128
+# The largest `pending` of a wake that the server keeps. A larger value is
+# cut to this one. SQLite cannot store integers above 2**63 - 1.
+MAX_WAKE_PENDING = 2**31 - 1
 
 FileKind = Literal["log", "blob"]
 HostKind = Literal["workstation", "runner"]
@@ -348,26 +351,24 @@ def validate_heartbeat(value: dict[str, Any]) -> HeartbeatRequest:
 
 def validate_wake_request(value: dict[str, Any]) -> WakeRequestBody:
     """Check a wake, and return it with only `session`, `pending` and
-    `handle`. Other fields are not refused: the sender can add fields."""
+    `handle`. Other fields are not refused: the sender can add fields.
+
+    `pending` and `handle` are only for information. A value that is too
+    large or not clean is cut, or dropped, so that the wake is not lost."""
     session = value.get("session")
     if not isinstance(session, str):
         raise ValidationError("session must be a string")
+    pending = _nonnegative_int(value.get("pending", 0), "pending")
     request: dict[str, Any] = {
         "session": validate_session_id(session),
-        "pending": _nonnegative_int(value.get("pending", 0), "pending"),
+        "pending": min(pending, MAX_WAKE_PENDING),
     }
     handle = value.get("handle")
-    if handle is not None:
-        if (
-            not isinstance(handle, str)
-            or len(handle) > MAX_WAKE_HANDLE
-            or any(_is_control(c) for c in handle)
-        ):
-            raise ValidationError(
-                f"handle must be a string of at most {MAX_WAKE_HANDLE} "
-                "characters with no control characters"
-            )
-        request["handle"] = handle
+    if isinstance(handle, str):
+        # The server writes the handle to its log.
+        clean = "".join("?" if _is_control(c) else c for c in handle)
+        if clean:
+            request["handle"] = clean[:MAX_WAKE_HANDLE]
     return cast(WakeRequestBody, request)
 
 

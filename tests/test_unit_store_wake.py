@@ -178,16 +178,24 @@ def test_a_run_from_before_the_wake_does_not_end_it(store: Store) -> None:
     assert not pending(store)
 
 
-def test_unclosed_job_is_a_run_from_its_last_activity(store: Store) -> None:
+def test_unclosed_job_is_not_a_run(store: Store) -> None:
     start(store)
     store.wake(KEY, 1)
+    # An append that arrives after the wake (a delayed sync of the job) moves
+    # the last activity after the wake. The job then shows only as unclosed.
+    data = b"two\n"
+    gen = store.manifest(KEY)["files"][0]["generations"][0]["id"]
+    store.append(KEY, gen, LAPTOP, 4, data, hashlib.sha256(data).hexdigest(), 1)
     unclosed = [{"harness": KEY.harness, "session_id": KEY.session_id, "reason": "x"}]
     beat(store, "laptop", unclosed=unclosed)
-    # The job stopped before the wake, so the request stays.
-    assert pending(store)
     with store._read():
         row = store._db.execute("SELECT * FROM session_liveness").fetchone()
-    assert row["run_started"] == row["first_listed"] == row["last_listed"]
+    assert row["last_listed"] > store.session_state(KEY)["wake_request"]["received"]
+    assert row["run_started"] is None
+    # No heartbeat listed a run, so the request stays.
+    assert pending(store)
+    assert store.list_sessions("acct", "laptop", "all", wake_pending=True)
+    # The first listing starts a run.
     beat(store, "laptop", KEY)
     assert not pending(store)
 
