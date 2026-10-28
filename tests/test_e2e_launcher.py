@@ -1506,6 +1506,7 @@ def test_runner_resumes_pending_wake(
     bg, clock = Bg(), Clock()
     run = runner(ctx, host, bg, clock)
     run.tick()
+    assert sender.wake(HARNESS, {"session": sid})["verdict"] == "waking"
     expected = (
         f"{RESUME_WORKING}\n{RESUME_WAKE}" if status == "working" else RESUME_WAKE
     )

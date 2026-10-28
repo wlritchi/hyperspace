@@ -696,8 +696,8 @@ class Launcher:
             log.warning("%s: no checkpoint after the resume: %s", sid, exc)
 
     def tick(self) -> list[str]:
-        """One heartbeat and one sweep, and in runner mode the restores and
-        the resumes. Return the live sessions."""
+        """Send a heartbeat and sweep stopped jobs. Restore in runner mode.
+        Resume as needed in runner mode or with --stay. Return live sessions."""
         live = self.adapter.live_sessions(
             self.ctx.state.continued_from(self.adapter.harness)
         )
