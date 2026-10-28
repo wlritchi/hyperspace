@@ -26,12 +26,18 @@ from hyperspace_client import launcher as launcher_mod
 from hyperspace_client.adapters.claude_code import ClaudeCode, ContinuedFrom
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.backfill import Runner, RunResult
-from hyperspace_client.cli import _hook_heartbeat, main, status_label
+from hyperspace_client.cli import (
+    _hook_heartbeat,
+    _print_status_table,
+    main,
+    status_label,
+)
 from hyperspace_client.config import Config, ConfigError, check_claude_args, load
 from hyperspace_client.hooks import handle
 from hyperspace_client.launcher import (
     MAX_RESUMES,
     RESUME_WAITING,
+    RESUME_WAKE,
     RESUME_WORKING,
     START_CHECK,
     START_RETRY,
@@ -102,7 +108,14 @@ class Rm:
 
 @pytest.fixture
 def server(tmp_path: Path) -> Iterator[Server]:
-    s = make_server(tmp_path / "server")
+    s = make_server(
+        tmp_path / "server",
+        hosts={
+            "laptop": ("laptop", {"append", "read", "grant"}, "all"),
+            "agent": ("agent-1", {"append", "read", "grant"}, "granted"),
+            "sender": ("sender", {"wake"}, "own"),
+        },
+    )
     yield s
     s.close()
 
@@ -1470,3 +1483,111 @@ def test_a_checkpoint_that_the_launch_blocks_runs_after_it(
         assert transcript.stat().st_size in lengths
     finally:
         ctx.state.close()
+
+
+@pytest.mark.parametrize("status", [None, "ready", "waiting", "working"])
+def test_runner_resumes_pending_wake(
+    ctx: Context,
+    server: Server,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    status: str | None,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "workspace")
+    if status == "ready":
+        set_status(ctx, sid, status, reason="idle")
+    elif status == "waiting":
+        set_status(ctx, sid, status, wake="message")
+    elif status is not None:
+        set_status(ctx, sid, status)
+    sender = server.api("sender")
+    assert sender.wake(HARNESS, {"session": sid})["verdict"] == "queued"
+    bg, clock = Bg(), Clock()
+    run = runner(ctx, host, bg, clock)
+    run.tick()
+    expected = (
+        f"{RESUME_WORKING}\n{RESUME_WAKE}" if status == "working" else RESUME_WAKE
+    )
+    assert [argv[-1] for argv, _ in bg.calls] == [expected]
+    assert state(ctx, sid).get("wake_request") is not None
+    host.live = [sid]
+    run.tick()
+    assert "wake_request" not in state(ctx, sid)
+    assert len(bg.calls) == 1
+    sender.close()
+
+
+@pytest.mark.parametrize("stay", [False, True])
+def test_workstation_wakes(
+    ctx: Context,
+    server: Server,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    stay: bool,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "workspace")
+    set_status(ctx, sid, "working")
+    bg, clock = Bg(), Clock()
+    run = launcher(ctx, host, Rm(ctx), clock, stay=stay, run_claude=bg)
+    requests: list[httpx.Request] = []
+    server.clients[0].event_hooks["request"].append(requests.append)
+    run.tick()
+    assert not bg.calls
+    heartbeats = [
+        json.loads(r.content) for r in requests if r.url.path.endswith("heartbeat")
+    ]
+    assert bool(heartbeats[-1].get("wakes")) == stay
+    host.live = [sid]
+    run.tick()
+    sender = server.api("sender")
+    assert sender.wake(HARNESS, {"session": sid})["verdict"] == "live"
+    run.tick()
+    assert not bg.calls
+    host.live = []
+    run.tick()
+    assert [argv[-1] for argv, _ in bg.calls] == ([RESUME_WAKE] if stay else [])
+    sender.close()
+
+
+def test_ls_shows_pending_wake(
+    ctx: Context,
+    server: Server,
+    fake: FakeClaude,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "workspace")
+    sender = server.api("sender")
+    sender.wake(HARNESS, {"session": sid, "pending": 2})
+    _print_status_table(ctx.api.sessions(), 3600)
+    assert "wake pending" in capsys.readouterr().out
+    assert [s["session_id"] for s in ctx.api.all_sessions(wake="pending")] == [sid]
+    sender.close()
+
+
+@pytest.mark.parametrize("runner_mode", [False, True])
+def test_done_session_is_not_resumed_for_a_wake(runner_mode: bool) -> None:
+    summary = _summary({"status": "done"})
+    summary["state"]["wake_request"] = {"received": "t", "count": 1}
+    assert needs_process(summary, "agent-1", False, runner_mode) is None
+
+
+def test_workstation_without_wake_capability(
+    ctx: Context,
+    server: Server,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "workspace")
+    sender = server.api("sender")
+    sender.wake(HARNESS, {"session": sid})
+    ctx.api._capabilities = {"liveness"}  # pyright: ignore[reportPrivateUsage]
+    bg, clock = Bg(), Clock()
+    run = launcher(ctx, host, Rm(ctx), clock, stay=True, run_claude=bg)
+    run.tick()
+    assert not bg.calls
+    assert sender.wake(HARNESS, {"session": sid})["verdict"] == "queued"
+    sender.close()

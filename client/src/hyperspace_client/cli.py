@@ -438,6 +438,8 @@ def _print_status_table(sessions: list[SessionSummary], stalled_after: float) ->
     for s in sessions:
         state = s["state"]
         label = status_label(state, now, stalled_after)
+        if state.get("wake_request") is not None:
+            label += ", wake pending"
         live = state.get("liveness")
         lease = state["lease"]
         host = (
@@ -970,6 +972,7 @@ def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
                     None if args.stay or args.runner else cfg.launcher_idle_exit,
                     before_tick=lambda: _refresh_token(cfg, ctx),
                     runner=args.runner,
+                    stay=args.stay,
                     claude_args=cfg.launcher_claude_args,
                     workspace=str(Path.cwd().resolve()),
                 ).run()

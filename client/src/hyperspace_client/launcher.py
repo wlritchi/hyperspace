@@ -37,6 +37,7 @@ from hyperspace_client.sync import Context, register_host
 from hyperspace_client.teleport import TeleportError, back_up, restore_held
 from hyperspace_protocol import (
     CAP_LIVENESS,
+    CAP_WAKE,
     MAX_HEARTBEAT_SESSIONS,
     HeartbeatRequest,
     SessionSummary,
@@ -66,6 +67,7 @@ RESUME_WAITING = (
     "tasks stopped. Set them up again if you still need them, then continue "
     "to wait."
 )
+RESUME_WAKE = "[hyperspace] Messages arrived while this session was stopped."
 # `claude --bg` returns when the daemon has the job.
 RESUME_TIMEOUT = 120.0
 # After `claude --bg` returns, the launcher waits at most this long for the
@@ -227,6 +229,7 @@ def send_heartbeat(
     live: list[str],
     interval: int,
     final: bool = False,
+    wakes: bool = False,
 ) -> None:
     """Send the heartbeat of `adapter`'s config directory. It includes the
     refused jobs that the launcher recorded, because each heartbeat replaces
@@ -247,6 +250,8 @@ def send_heartbeat(
     ]
     if unclosed:
         request["unclosed"] = unclosed[:MAX_HEARTBEAT_SESSIONS]
+    if wakes:
+        request["wakes"] = True
     if final:
         request["final"] = True
     ctx.api.heartbeat(request)
@@ -463,10 +468,12 @@ def connect(
         delay = min(delay * 2, START_RETRY_MAX)
 
 
-def needs_process(summary: SessionSummary, host: str, running: bool) -> str | None:
-    """The first message for a resume of a held session on a runner, or None
-    if the session needs no process here (R1 to R3 in the spec), or if the
-    server shows it as `live` on any host."""
+def needs_process(
+    summary: SessionSummary, host: str, running: bool, runner: bool = True
+) -> str | None:
+    """The first message for a held session that needs a process here.
+    Wakes apply in both modes; status alone applies only in runner mode.
+    Never resume a session that is live on any host."""
     state = summary["state"]
     lease = state["lease"]
     if running or lease["state"] != "held" or lease.get("host") != host:
@@ -477,14 +484,17 @@ def needs_process(summary: SessionSummary, host: str, running: bool) -> str | No
         # another config directory. A resume would make a second copy.
         return None
     event = state.get("status")
-    if event is None:
-        # From before the status feature; the backfill gives it a status.
+    if event is not None and event["status"] == "done":
         return None
-    if event["status"] == "working":
-        return RESUME_WORKING
-    if event["status"] == "waiting" and event.get("wake") == "local":
-        return RESUME_WAITING
-    return None
+    message: str | None = None
+    if runner and event is not None:
+        if event["status"] == "working":
+            message = RESUME_WORKING
+        elif event["status"] == "waiting" and event.get("wake") == "local":
+            message = RESUME_WAITING
+    if state.get("wake_request") is not None:
+        return f"{message}\n{RESUME_WAKE}" if message else RESUME_WAKE
+    return message
 
 
 @dataclass
@@ -500,6 +510,7 @@ class Launcher:
     before_tick: Callable[[], None] | None = None
     # Runner mode: restore and resume the sessions whose lease the host holds.
     runner: bool = False
+    stay: bool = False
     # More Claude Code options for each resume, from the configuration.
     claude_args: list[str] = field(default_factory=list[str])
     # The workspace for a held session that has no workspace of its own.
@@ -569,13 +580,16 @@ class Launcher:
 
     def resume_held(self, live: list[str]) -> None:
         """Resume the sessions whose lease this host holds and that need a
-        process (runner mode)."""
+        process, for status in runner mode or for a pending wake."""
+        filters: dict[str, str | list[str]] = (
+            {"open": "1"} if self.runner else {"wake": "pending"}
+        )
         held = self.ctx.api.all_sessions(
-            harness=self.adapter.harness, lease_host=self.ctx.host, open="1"
+            None, harness=self.adapter.harness, lease_host=self.ctx.host, **filters
         )
         for summary in held:
             sid = summary["session_id"]
-            prompt = needs_process(summary, self.ctx.host, sid in live)
+            prompt = needs_process(summary, self.ctx.host, sid in live, self.runner)
             if prompt is not None:
                 self.resume(sid, prompt)
 
@@ -692,10 +706,12 @@ class Launcher:
                 self.before_tick()
             # Send the heartbeat before the resumes, so that a stale `live`
             # from before a restart clears.
-            send_heartbeat(self.ctx, self.adapter, live, self.interval)
+            wakes = (self.runner or self.stay) and self.ctx.api.has_capability(CAP_WAKE)
+            send_heartbeat(self.ctx, self.adapter, live, self.interval, wakes=wakes)
             self.sweep(live)
             if self.runner:
                 self.restore()
+            if self.runner or wakes:
                 self.resume_held(live)
         except (ApiError, httpx.HTTPError, OSError) as exc:
             # The next tick tries again.

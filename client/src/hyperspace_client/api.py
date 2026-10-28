@@ -37,6 +37,8 @@ from hyperspace_protocol import (
     StatusEvent,
     StatusRequest,
     TeleportResponse,
+    WakeRequestBody,
+    WakeResponse,
     encode_workspace,
     validate_workspace,
 )
@@ -184,6 +186,12 @@ class Api:
     def heartbeat(self, request: HeartbeatRequest) -> HeartbeatResponse:
         return cast(
             HeartbeatResponse, self._json("PUT", "/hosts/self/heartbeat", json=request)
+        )
+
+    def wake(self, harness: str, body: WakeRequestBody) -> WakeResponse:
+        return cast(
+            WakeResponse,
+            self._json("POST", f"/wake/{quote(harness, safe='')}", json=body),
         )
 
     # --- Sessions ----------------------------------------------------------
