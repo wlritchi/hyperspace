@@ -89,10 +89,11 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
    before the job's process starts, so the launcher then reads the job's
    `state.json` for at most 10 seconds. If the job failed at its start, the
    launcher logs the job's `detail` and counts the resume as a failed resume.
-4. Does not resume a session that is `ready`, `done`, `waiting` with
-   `wake: message`, or that has no status. The user, or a message, wakes these
-   sessions. Sessions from before the session status feature have no status
-   until the backfill gives them one (`hyperspace backfill-status`).
+4. Does not resume a `done` session. Resumes a session that is `ready`,
+   `waiting` with `wake: message`, or that has no status only for a pending
+   wake request (see "Wakes"). Sessions from before the session status feature
+   have no status until the backfill gives them one
+   (`hyperspace backfill-status`).
 5. Each minute: sends the heartbeat, closes the background jobs of `done`
    sessions with `claude rm`, and resumes again a held session that needs a
    process and does not run. It resumes one session at most 5 times in an

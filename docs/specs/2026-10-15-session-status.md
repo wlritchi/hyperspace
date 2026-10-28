@@ -610,9 +610,11 @@ process does not get the lock, and its hooks do not wait for it without a
 limit, so the hold cannot block the new session. A checkpoint that a hook
 starts during the hold does not sync. Thus, when the launcher releases the
 lock, also after a failure or a timeout of `claude --bg`, it starts a
-checkpoint if the session is dirty (main spec, "Checkpoint scheduling"). The
-first message tells the agent that the runner restarted, and, for a `waiting`
-session, that its crons, Monitors and background tasks stopped.
+checkpoint if the session is dirty (main spec, "Checkpoint scheduling"). For a
+resume that the status needs, the first message tells the agent that the
+runner restarted, and, for a `waiting` session, that its crons, Monitors and
+background tasks stopped. For a resume that a wake request needs, see "The
+first message" in the [wake spec](2026-10-28-wake.md).
 
 `claude --bg` returns 0 when the daemon has the job, before the job's process
 starts. Thus the exit status does not show a process that fails before it
