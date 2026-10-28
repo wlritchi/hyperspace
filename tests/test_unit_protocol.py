@@ -9,6 +9,7 @@ from hyperspace_protocol import (
     MAX_HEARTBEAT_SESSIONS,
     MAX_STATUS_EXCERPT,
     MAX_STATUS_NOTE,
+    MAX_WAKE_HANDLE,
     ValidationError,
     validate_file_path,
     validate_harness,
@@ -18,6 +19,7 @@ from hyperspace_protocol import (
     validate_session_id,
     validate_sha256,
     validate_status_request,
+    validate_wake_request,
     validate_workspace,
 )
 
@@ -192,8 +194,10 @@ def test_heartbeat_validation() -> None:
         "sessions": [],
         "unclosed": [{**ref, "reason": "unpushed work"}],
         "final": True,
+        "wakes": True,
     }
     assert validate_heartbeat(full) == full
+    assert "wakes" not in validate_heartbeat({"interval": 60, "wakes": False})
     assert validate_heartbeat({"interval": 3600}) == {"interval": 3600, "sessions": []}
     assert validate_heartbeat({"interval": 60, "source": "ab_12-"}) == {
         "interval": 60,
@@ -212,9 +216,41 @@ def test_heartbeat_validation() -> None:
         {"interval": 60, "unclosed": [ref]},
         {"interval": 60, "unclosed": [{**ref, "reason": "a\nb"}]},
         {"interval": 60, "final": "yes"},
+        {"interval": 60, "wakes": 1},
         {"interval": 60, "source": "../x"},
         {"interval": 60, "source": "x" * 65},
         {"interval": 60, "source": 3},
     ):
         with pytest.raises(ValidationError):
             validate_heartbeat(bad)
+
+
+def test_wake_request_validation() -> None:
+    body = {
+        "event": "wake",
+        "account": "default",
+        "session": "s1",
+        "handle": "reviewer",
+        "pending": 2,
+        "items": [{"text": "not read"}],
+        "later": "field",
+    }
+    assert validate_wake_request(body) == {
+        "session": "s1",
+        "handle": "reviewer",
+        "pending": 2,
+    }
+    assert validate_wake_request({"session": "s1"}) == {"session": "s1", "pending": 0}
+    for bad in (
+        {},
+        {"session": 7},
+        {"session": "../x"},
+        {"session": "s1", "pending": -1},
+        {"session": "s1", "pending": "2"},
+        {"session": "s1", "pending": False},
+        {"session": "s1", "handle": 3},
+        {"session": "s1", "handle": "a\x1b[2J"},
+        {"session": "s1", "handle": "x" * (MAX_WAKE_HANDLE + 1)},
+    ):
+        with pytest.raises(ValidationError):
+            validate_wake_request(bad)

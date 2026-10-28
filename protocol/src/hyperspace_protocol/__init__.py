@@ -30,6 +30,9 @@ CAP_LIST_CURSOR = "list-cursor"
 # `GET /sessions` takes `top_level=1` and `parent=` (see "Child sessions" in
 # the spec).
 CAP_CHILD_SESSIONS = "child-sessions"
+# `POST /wake/{harness}`, the `wake` scope, `wake_request` in the session
+# state, and `wake=pending` for `GET /sessions` (see the wake spec).
+CAP_WAKE = "wake"
 CAPABILITIES = [
     CAP_WORKSPACE_UTF8,
     CAP_RESTORE_PRECONDITION,
@@ -37,6 +40,7 @@ CAPABILITIES = [
     CAP_LIVENESS,
     CAP_LIST_CURSOR,
     CAP_CHILD_SESSIONS,
+    CAP_WAKE,
 ]
 
 # One request carries at most this much uncompressed file data. The client
@@ -56,11 +60,12 @@ MAX_HEARTBEAT_SESSIONS = 1000
 # Heartbeat intervals, in seconds.
 MIN_HEARTBEAT_INTERVAL = 10
 MAX_HEARTBEAT_INTERVAL = 3600
+MAX_WAKE_HANDLE = 128
 
 FileKind = Literal["log", "blob"]
 HostKind = Literal["workstation", "runner"]
 ReadScope = Literal["own", "granted", "all"]
-Scope = Literal["append", "read", "grant"]
+Scope = Literal["append", "read", "grant", "wake"]
 GenerationCause = Literal["root", "rewrite", "diverge", "fork"]
 PlacementCause = Literal["start", "move", "teleport", "steal", "diverge"]
 SessionState = Literal["normal", "conflicted"]
@@ -70,6 +75,7 @@ ReadyReason = Literal["asked", "idle"]
 WakeKind = Literal["local", "message"]
 StatusSourceKind = Literal["user", "agent", "hook"]
 LivenessState = Literal["live", "stopped", "unknown"]
+WakeVerdict = Literal["live", "waking", "queued"]
 
 FILE_KINDS: tuple[FileKind, ...] = ("log", "blob")
 HOST_KINDS: tuple[HostKind, ...] = ("workstation", "runner")
@@ -332,7 +338,37 @@ def validate_heartbeat(value: dict[str, Any]) -> HeartbeatRequest:
         raise ValidationError("final must be a boolean")
     if final:
         request["final"] = True
+    wakes = value.get("wakes", False)
+    if not isinstance(wakes, bool):
+        raise ValidationError("wakes must be a boolean")
+    if wakes:
+        request["wakes"] = True
     return cast(HeartbeatRequest, request)
+
+
+def validate_wake_request(value: dict[str, Any]) -> WakeRequestBody:
+    """Check a wake, and return it with only `session`, `pending` and
+    `handle`. Other fields are not refused: the sender can add fields."""
+    session = value.get("session")
+    if not isinstance(session, str):
+        raise ValidationError("session must be a string")
+    request: dict[str, Any] = {
+        "session": validate_session_id(session),
+        "pending": _nonnegative_int(value.get("pending", 0), "pending"),
+    }
+    handle = value.get("handle")
+    if handle is not None:
+        if (
+            not isinstance(handle, str)
+            or len(handle) > MAX_WAKE_HANDLE
+            or any(_is_control(c) for c in handle)
+        ):
+            raise ValidationError(
+                f"handle must be a string of at most {MAX_WAKE_HANDLE} "
+                "characters with no control characters"
+            )
+        request["handle"] = handle
+    return cast(WakeRequestBody, request)
 
 
 # --- Bodies -----------------------------------------------------------------
@@ -418,6 +454,14 @@ class Liveness(TypedDict):
     close_blocked: NotRequired[str]
 
 
+class WakeRequest(TypedDict):
+    """The latest wake of a session."""
+
+    received: str
+    # The number of messages that waited, from the wake.
+    count: int
+
+
 class SessionStateBody(TypedDict):
     state: SessionState
     lease: Lease
@@ -428,6 +472,8 @@ class SessionStateBody(TypedDict):
     # Absent until a host lists the session in a heartbeat.
     liveness: NotRequired[Liveness]
     last_append: NotRequired[str]
+    # Present only while the wake request is pending.
+    wake_request: NotRequired[WakeRequest]
 
 
 class AppendResponse(TypedDict):
@@ -625,9 +671,30 @@ class HeartbeatRequest(TypedDict):
     unclosed: NotRequired[list[UnclosedSession]]
     # The launcher stops after this heartbeat.
     final: NotRequired[bool]
+    # A launcher that acts on wakes sends this. A heartbeat without it (for
+    # example from a hook) keeps the wake mark of the source.
+    wakes: NotRequired[bool]
 
 
 class HeartbeatResponse(TypedDict):
     received: str
     # The listed sessions that the server recorded.
     recorded: int
+
+
+class WakeRequestBody(TypedDict):
+    """The body of `POST /wake/{harness}`. The server ignores `event`,
+    `account` and `items`: the credential gives the account."""
+
+    event: NotRequired[str]
+    account: NotRequired[str]
+    session: str
+    # A name of the session for logs.
+    handle: NotRequired[str]
+    # The number of messages that wait. Absent: 0.
+    pending: NotRequired[int]
+    items: NotRequired[list[Any]]
+
+
+class WakeResponse(TypedDict):
+    verdict: WakeVerdict
