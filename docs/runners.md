@@ -125,7 +125,7 @@ The image must provide:
   - name: HYPERSPACE_LAUNCHER_CLAUDE_ARGS
     value: >-
       ["--dangerously-load-development-channels",
-       "plugin:notifications@wlr-cc-plugins",
+       "plugin:subspace@subspace",
        "--model", "opus", "--agent", "claude"]
   ```
 

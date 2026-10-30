@@ -258,7 +258,7 @@ the Claude Code options for a resume in `config.toml`:
 
 ```toml
 launcher_claude_args = [
-  "--dangerously-load-development-channels", "plugin:notifications@wlr-cc-plugins",
+  "--dangerously-load-development-channels", "plugin:subspace@subspace",
   "--model", "opus",
 ]
 ```
