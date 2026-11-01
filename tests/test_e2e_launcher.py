@@ -1110,6 +1110,237 @@ def test_new_job_finds_the_job_of_the_resume(fake: FakeClaude) -> None:
     assert fake.adapter.new_job(before, sid) is None
 
 
+def fake_jobs(fake: FakeClaude, monkeypatch: pytest.MonkeyPatch, run: Launcher) -> None:
+    """Make `run` use the fake for `claude --bg` and `claude rm`, with the
+    job records of Claude Code 2.1.301."""
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "resume")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake.root))
+
+    def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
+        return run_bg([sys.executable, FAKE, *argv[1:]], cwd, timeout)
+
+    def rm(argv: list[str]) -> tuple[int, str]:
+        return run_rm([sys.executable, FAKE, *argv[1:]])
+
+    run.run_claude = bg
+    run.run_rm = rm
+
+
+def job_ids(fake: FakeClaude) -> dict[str, str]:
+    """Job name to the job's own id."""
+    return {j.short: j.own_id for j in fake.adapter.jobs()}
+
+
+def test_a_stopped_job_is_removed_so_the_resume_keeps_the_id(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="hyperspace")
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    # The job record from before the runner restarted.
+    job(fake, sid[:8], sid, state="stopped")
+    transcripts = host.find_transcripts(sid)
+    run = runner(ctx, host, Bg(), Clock())
+    fake_jobs(fake, monkeypatch, run)
+    assert run.resume(sid, RESUME_WORKING) is True
+    assert job_ids(fake) == {sid[:8]: sid}
+    assert host.find_transcripts(sid) == transcripts
+    assert len(list(transcripts[0].parent.glob("*.jsonl"))) == 1
+    assert f"removed the job {sid[:8]}" in caplog.text
+    assert "copied" not in caplog.text
+
+
+def test_the_fake_copies_a_session_that_has_a_job_record_for_options(
+    ctx: Context, fake: FakeClaude, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    job(fake, sid[:8], sid, state="stopped")
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "resume")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake.root))
+    argv = [sys.executable, FAKE, "--bg", "--resume", sid, "hi"]
+    assert run_bg(argv, WS, 30).returncode == 0
+    assert job_ids(fake) == {sid[:8]: sid}
+    argv[2:2] = ["--model", "opus"]
+    result = run_bg(argv, WS, 30)
+    assert result.returncode == 0
+    copy = next(own for short, own in job_ids(fake).items() if short != sid[:8])
+    assert f"started a copy as {copy[:8]}" in result.output
+    assert fake.adapter.find_transcripts(copy)
+
+
+def test_a_refused_rm_blocks_the_resume(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    job(fake, sid[:8], sid, state="stopped")
+    clock = Clock()
+    run = runner(ctx, host, Bg(), clock)
+    fake_jobs(fake, monkeypatch, run)
+    monkeypatch.setenv("FAKE_CLAUDE_RM", "refuse")
+    calls: list[list[str]] = []
+    rm = run.run_rm
+
+    def counted(argv: list[str]) -> tuple[int, str]:
+        calls.append(argv)
+        return rm(argv)
+
+    run.run_rm = counted
+    assert run.resume(sid, RESUME_WORKING) is False
+    assert job_ids(fake) == {sid[:8]: sid}
+    assert len(list(host.find_transcripts(sid)[0].parent.glob("*.jsonl"))) == 1
+    assert f"claude rm {sid[:8]}: error: job has unpushed commits" in caplog.text
+    # The limit of resumes also applies to the failed removals.
+    for _ in range(MAX_RESUMES + 2):
+        run.tick()
+        clock.t += 60
+    assert len(calls) == MAX_RESUMES
+    assert calls[0] == ["claude", "rm", sid[:8]]
+
+
+def test_no_resume_if_the_transcript_goes_with_the_job(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    job(fake, sid[:8], sid, state="stopped")
+
+    def rm(argv: list[str]) -> tuple[int, str]:
+        for path in host.find_transcripts(sid):
+            path.unlink()
+        return 0, ""
+
+    bg = Bg()
+    run = runner(ctx, host, bg, Clock())
+    run.run_rm = rm
+    assert run.resume(sid, RESUME_WORKING) is False
+    assert bg.calls == []
+    assert "no transcript after claude rm" in caplog.text
+
+
+def test_a_job_with_a_worktree_resumes_with_its_saved_options(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="hyperspace")
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    job(fake, sid[:8], sid, state="stopped", worktreePath=str(tmp_path / "ws"))
+    run = runner(ctx, host, Bg(), Clock())
+    fake_jobs(fake, monkeypatch, run)
+    calls: list[list[str]] = []
+    bg, rm = run.run_claude, Rm(ctx)
+
+    def counted(argv: list[str], cwd: str, timeout: float) -> RunResult:
+        calls.append(argv)
+        return bg(argv, cwd, timeout)
+
+    run.run_claude, run.run_rm = counted, rm
+    assert run.resume(sid, RESUME_WORKING) is True
+    # `claude rm` can remove the worktree, so the job stays.
+    assert rm.calls == []
+    assert calls == [["claude", "--bg", "--resume", sid, RESUME_WORKING]]
+    assert job_ids(fake) == {sid[:8]: sid}
+    assert f"the job {sid[:8]} has a worktree" in caplog.text
+    assert "copied" not in caplog.text
+
+
+def test_a_job_with_a_worktree_that_fails_at_its_start_is_a_failed_resume(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    path = job(fake, sid[:8], sid, state="stopped", worktreePath=str(tmp_path))
+    run = runner(ctx, host, Bg(), Clock())
+    fake_jobs(fake, monkeypatch, run)
+    bg = run.run_claude
+
+    def fails(argv: list[str], cwd: str, timeout: float) -> RunResult:
+        result = bg(argv, cwd, timeout)
+        state = json.loads(path.read_text())
+        path.write_text(json.dumps({**state, "state": "failed", "detail": "exit 1"}))
+        return result
+
+    run.run_claude = fails
+    assert run.resume(sid, RESUME_WORKING) is False
+    assert f"the job {sid[:8]} failed at its start: exit 1" in caplog.text
+
+
+def test_the_state_of_a_kept_job_from_before_the_resume_does_not_count(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    job(fake, sid[:8], sid, state="failed", detail="old", worktreePath=str(tmp_path))
+    clock = Clock()
+    # A `claude --bg` that does not change the job's state.
+    run = runner(ctx, host, Bg(), clock)
+    assert run.resume(sid, RESUME_WORKING) is True
+    assert clock.t >= START_CHECK
+
+
+def test_the_resume_logs_a_copy(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    run = runner(ctx, host, Bg(), Clock())
+    fake_jobs(fake, monkeypatch, run)
+    monkeypatch.setenv("FAKE_CLAUDE_COPY", "1")
+    assert run.resume(sid, RESUME_WORKING) is True
+    (copy,) = job_ids(fake).values()
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert errors == [
+        f"{sid}: the resume copied the session under the new id {copy[:8]}"
+    ]
+
+
+def test_the_resume_finds_a_copy_from_the_job_state(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    copy = str(uuid.uuid4())
+    run = runner(ctx, host, Bg(), Clock())
+    # No note in the output: the state of the new job has the copy's id.
+    run.run_claude = job_bg(
+        fake, monkeypatch, {"sessionId": copy, "state": "working", "detail": "x"}
+    )
+    assert run.resume(sid, RESUME_WORKING) is True
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert errors == [f"{sid}: the resume copied the session under the new id {copy}"]
+
+
 def test_resume_needs_a_local_copy_and_workspace(
     ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
 ) -> None:

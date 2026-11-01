@@ -79,6 +79,9 @@ _START_POLL = 0.5
 # session that stops at once is not resumed in a loop.
 MAX_RESUMES = 5
 RESUME_WINDOW = 3600.0
+# Claude Code 2.1.301 writes this note when `claude --bg --resume` starts a
+# copy under a new id, for example "... so this started a copy as f2b49853."
+_COPY_NOTE = re.compile(r"started a copy as ([A-Za-z0-9_-]+)")
 # The longest wait between restores of held sessions after failures. The wait
 # starts at one tick interval and doubles after each failure.
 RESTORE_RETRY_MAX = 3600.0
@@ -596,7 +599,8 @@ class Launcher:
     def resume(self, sid: str, prompt: str) -> bool:
         """Resume a session as a background job, in the workspace that this
         host recorded for it. Do not resume while its restore is pending, or
-        while another process holds its sync lock. Return True if
+        while another process holds its sync lock. First remove the job
+        records under its id (see `_resume_options`). Return True if
         `claude --bg` succeeded and the job did not fail at its start."""
         now = self.clock()
         recent = self._resumes.setdefault(sid, deque[float]())
@@ -632,30 +636,97 @@ class Launcher:
             # Claude Code starts a copy under a new id if the session runs.
             if self.adapter.is_running(sid):
                 return False
+            # Before the removal of job records, so that the limit also
+            # applies to a `claude rm` that fails at each tick.
             recent.append(now)
-            argv = [self.claude, *self.claude_args, "--bg", "--resume", sid, prompt]
+            prepared = self._resume_options(sid)
+            if prepared is None:
+                return False
+            options, kept = prepared
+            argv = [self.claude, *options, "--bg", "--resume", sid, prompt]
             before = self.adapter.job_names()
             result = self.run_claude(argv, workspace, RESUME_TIMEOUT)
         if result.returncode != 0:
             first = next(iter(printable(result.output).splitlines()), "")
             log.warning("%s: resume failed (%s): %s", sid, result.returncode, first)
             return False
-        failure = self._start_failure(sid, before)
+        failure = self._start_failure(sid, before, kept)
+        copy = self._copy_id(sid, before, result.output)
+        if copy is not None:
+            log.error(
+                "%s: the resume copied the session under the new id %s", sid, copy
+            )
         if failure is not None:
             log.warning("%s: resume failed: %s", sid, failure)
             return False
         log.info("%s: resumed in %s", sid, workspace)
         return True
 
-    def _start_failure(self, sid: str, before: set[str]) -> str | None:
-        """Why the job that `claude --bg` made for the session failed before
-        its process started, or None. None also if the launcher cannot find
-        the job or read its state, or if the job still starts after
-        START_CHECK seconds."""
+    def _resume_options(self, sid: str) -> tuple[list[str], Job | None] | None:
+        """The launcher's Claude Code options for the resume, and the job
+        that the resume continues in place, if any. None if the session must
+        not resume. With a job record under the session's own
+        id, Claude Code 2.1.301 `claude --bg --resume` with options copies
+        the session under a new id. Thus remove such records with
+        `claude rm` first. A job with a worktree stays, because `claude rm`
+        can remove the worktree, which can be the session's workspace. Its
+        resume has no options, and then continues the session with the
+        job's saved options."""
+        jobs = [j for j in self.adapter.jobs() if j.own_id == sid]
+        if not jobs:
+            return self.claude_args, None
+        kept = next((j for j in jobs if j.worktree is not None), None)
+        if kept is not None:
+            log.info(
+                "%s: the job %s has a worktree, so it keeps its saved options",
+                sid,
+                kept.short,
+            )
+            return [], kept
+        for job in jobs:
+            # Never with --discard-unpushed or --force-remove-worktree: a
+            # refusal keeps the work, and the user decides.
+            code, output = self.run_rm([self.claude, "rm", job.short])
+            if code != 0:
+                reason = _reason(code, output)
+                log.warning("%s: not resumed: claude rm %s: %s", sid, job.short, reason)
+                return None
+            log.info("%s: removed the job %s before the resume", sid, job.short)
+        if not self.adapter.find_transcripts(sid):
+            log.error("%s: not resumed: no transcript after claude rm", sid)
+            return None
+        return self.claude_args, None
+
+    def _copy_id(self, sid: str, before: set[str], output: str) -> str | None:
+        """The id of a copy that `claude --bg --resume` started in place of
+        the session, or None. Claude Code says so in its output, and the
+        state of the new job has the copy's id."""
+        note = _COPY_NOTE.search(printable(output))
+        if note is not None:
+            return note.group(1)
+        short = self.adapter.new_job(before, sid)
+        job = self.adapter.job(short) if short else None
+        if job is not None and job.own_id != sid:
+            return job.own_id
+        return None
+
+    def _start_failure(
+        self, sid: str, before: set[str], kept: Job | None = None
+    ) -> str | None:
+        """Why the job that `claude --bg` made for the session, or the job
+        `kept` that it continues, failed before its process started, or None.
+        None also if the launcher cannot find the job or read its state, or
+        if the job still starts after START_CHECK seconds."""
         deadline = self.clock() + START_CHECK
         short: str | None = None
         while True:
             short = short or self.adapter.new_job(before, sid)
+            if short is None and kept is not None:
+                again = self.adapter.job(kept.short)
+                # Only a state.json that changed after `claude --bg` shows
+                # this start, not the state from before it.
+                if again is not None and again.mtime != kept.mtime:
+                    short = kept.short
             start = self.adapter.job_start(short) if short else None
             if start is not None and not start.starting:
                 if not start.failed:

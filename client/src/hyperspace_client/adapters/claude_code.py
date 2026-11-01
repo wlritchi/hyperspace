@@ -45,6 +45,8 @@ class Job:
     # The sessions whose transcripts the job can write (see
     # `ClaudeCode.writes`).
     candidates: tuple[str, ...] = ()
+    # The job's worktree (`worktreePath` in its state), if it has one.
+    worktree: str | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -947,7 +949,10 @@ class ClaudeCode:
         if record is None or own is None:
             return None
         candidates = self.writes(own, record.get("resumeSessionId"), continued_from)
-        return Job(short, mtime, own, candidates)
+        # Any value other than empty counts, so that the launcher never
+        # removes a job that can have a worktree.
+        worktree = record.get("worktreePath")
+        return Job(short, mtime, own, candidates, str(worktree) if worktree else None)
 
     def job_names(self) -> set[str]:
         """The names of the job directories now, for `new_job`."""
