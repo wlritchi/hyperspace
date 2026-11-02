@@ -82,6 +82,8 @@ _START_POLL = 0.5
 # session that stops at once is not resumed in a loop.
 MAX_RESUMES = 5
 RESUME_WINDOW = 3600.0
+# The default of `max_sessions`.
+MAX_SESSIONS = 10
 # Claude Code 2.1.301 writes this note when `claude --bg --resume` starts a
 # copy under a new id, for example "... so this started a copy as f2b49853."
 _COPY_NOTE = re.compile(r"started a copy as ([A-Za-z0-9_-]+)")
@@ -558,6 +560,9 @@ class Launcher:
     stay: bool = False
     # More Claude Code options for each resume, from the configuration.
     claude_args: list[str] = field(default_factory=list[str])
+    # No resume while this many Claude Code processes run on the host, so
+    # that many wakes at a time do not use all the memory of a runner.
+    max_sessions: int = MAX_SESSIONS
     # The workspace for a held session that has no workspace of its own.
     workspace: str = ""
     run_claude: BgRunner = run_bg
@@ -576,6 +581,8 @@ class Launcher:
     _limited: set[str] = field(default_factory=set[str])
     # The last error of `resume_env`, logged once until it changes.
     _env_error: str | None = None
+    # True while the cap on processes holds resumes, so that it logs once.
+    _capped: bool = False
     # The earliest time of the next restore of held sessions; None after a
     # restore with no failure.
     _restore_at: float | None = float("-inf")
@@ -637,11 +644,30 @@ class Launcher:
         held = self.ctx.api.all_sessions(
             None, harness=self.adapter.harness, lease_host=self.ctx.host, **filters
         )
+        running = len(
+            self.adapter.live_processes(
+                self.ctx.state.continued_from(self.adapter.harness)
+            )
+        )
+        waiting = 0
         for summary in held:
             sid = summary["session_id"]
             prompt = needs_process(summary, self.ctx.host, sid in live, self.runner)
-            if prompt is not None:
-                self.resume(sid, prompt)
+            if prompt is None:
+                continue
+            if running >= self.max_sessions:
+                waiting += 1
+            elif self.resume(sid, prompt):
+                running += 1
+        if waiting and not self._capped:
+            log.warning(
+                "launcher: %d Claude Code processes run (at most %d); %d"
+                " resumes wait until one stops",
+                running,
+                self.max_sessions,
+                waiting,
+            )
+        self._capped = bool(waiting)
 
     def resume(self, sid: str, prompt: str) -> bool:
         """Resume a session as a background job, in the workspace that this

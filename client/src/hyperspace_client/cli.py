@@ -1030,6 +1030,7 @@ def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
                     runner=args.runner,
                     stay=args.stay,
                     claude_args=cfg.launcher_claude_args,
+                    max_sessions=cfg.launcher_max_sessions,
                     resume_env=env,
                     workspace=str(Path.cwd().resolve()),
                 ).run()

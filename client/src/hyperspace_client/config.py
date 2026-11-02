@@ -16,6 +16,7 @@ environment.
 | Claude Code binary | `HYPERSPACE_CLAUDE`       | `claude_bin`         |
 | Runner resume args | `HYPERSPACE_LAUNCHER_CLAUDE_ARGS` (JSON) | `launcher_claude_args` |
 | Resume environment |                           | `launcher_env`       |
+| Resume process cap | `HYPERSPACE_LAUNCHER_MAX_SESSIONS` | `launcher_max_sessions` |
 | Resume secrets     |                           | `launcher_secret_env`|
 
 With no token in the environment or a file, the token comes from the token
@@ -112,6 +113,8 @@ class Config:
     # values in the keyring (see `credentials`).
     launcher_env: dict[str, str] = field(default_factory=dict[str, str])
     launcher_secret_env: list[str] = field(default_factory=list[str])
+    # No resume while this many Claude Code processes run on the host.
+    launcher_max_sessions: int = 10
     state_dir: Path = field(default_factory=state_dir)
 
     def require_server(self) -> tuple[str, str]:
@@ -341,6 +344,14 @@ def load(env: dict[str, str] | None = None, path: Path | None = None) -> Config:
     else:
         claude_args = data.get("launcher_claude_args", [])
     cfg.launcher_claude_args = check_claude_args(claude_args)
+    cap: object = env.get("HYPERSPACE_LAUNCHER_MAX_SESSIONS") or data.get(
+        "launcher_max_sessions", 10
+    )
+    if isinstance(cap, str) and cap.isdigit():
+        cap = int(cap)
+    if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
+        raise ConfigError("launcher_max_sessions must be a whole number >= 1")
+    cfg.launcher_max_sessions = cap
     cfg.launcher_env, cfg.launcher_secret_env = check_launcher_env(
         data.get("launcher_env", {}), data.get("launcher_secret_env", [])
     )

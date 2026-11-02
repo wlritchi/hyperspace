@@ -309,6 +309,10 @@ the launcher does not resume a session and logs an error. If this happens, or
 if the token comes from a file, run `hyperspace secret load`. See "The
 environment of a resume" in the [spec](specs/2026-10-12-hyperspace.md).
 
+The launcher does not resume while `launcher_max_sessions` (default 10) Claude
+Code processes run on the host, and your own sessions count. Set a higher
+value if you often run more sessions than that.
+
 The launcher refuses some options in this list, and the last option must not
 take a list of values; see "At boot: the launcher" in
 [runners.md](runners.md). A launcher without `--stay` does not act on wakes:

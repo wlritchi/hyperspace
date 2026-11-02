@@ -1054,6 +1054,49 @@ def test_a_resume_gets_the_launchers_environment(
     assert bg.envs[-1]["RELAY_TOKEN"] == "s3cret"
 
 
+def test_resumes_wait_while_the_host_runs_max_sessions(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    for name in ("a", "b", "c"):
+        set_status(ctx, held_session(ctx, fake, tmp_path / name), "working")
+    bg = Bg()
+    run = runner(ctx, host, bg, Clock(), max_sessions=3)
+    # One process runs already, for example the runner's resident session.
+    monkeypatch.setattr(run.adapter, "live_processes", lambda *_: [["resident"]])
+    run.tick()
+    assert len(bg.calls) == 2
+    run.tick()
+    warnings = [r for r in caplog.records if "resumes wait" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "3 Claude Code processes run (at most 3); 1 resumes" in (
+        warnings[0].getMessage()
+    )
+    # The resumes that wait do not count toward the resume limit.
+    assert sum(len(d) for d in run._resumes.values()) == 4  # pyright: ignore[reportPrivateUsage]
+
+
+def test_launcher_max_sessions_config(tmp_path: Path) -> None:
+    none = tmp_path / "none.toml"
+    assert load({}, none).launcher_max_sessions == 10
+    assert (
+        load({"HYPERSPACE_LAUNCHER_MAX_SESSIONS": "4"}, none).launcher_max_sessions == 4
+    )
+    toml = tmp_path / "config.toml"
+    toml.write_text("launcher_max_sessions = 2\n")
+    assert load({}, toml).launcher_max_sessions == 2
+    for bad in ("launcher_max_sessions = 0\n", 'launcher_max_sessions = "x"\n'):
+        toml.write_text(bad)
+        with pytest.raises(ConfigError, match="launcher_max_sessions"):
+            load({}, toml)
+    with pytest.raises(ConfigError, match="launcher_max_sessions"):
+        load({"HYPERSPACE_LAUNCHER_MAX_SESSIONS": "-1"}, none)
+
+
 def test_run_bg_adds_the_environment(tmp_path: Path) -> None:
     out = tmp_path / "env"
     argv = [

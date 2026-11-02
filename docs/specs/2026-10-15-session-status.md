@@ -597,7 +597,11 @@ At each tick, it does step 3 again for the held sessions that do not run. It
 does not resume a job that the Claude Code daemon stopped if its session is
 `done`, or if no event needs a process (R2, R3). It resumes one session at
 most 5 times in an hour, so that a session that stops at once does not start
-in a loop. A runner with no session to resume runs only the launcher.
+in a loop. It does not resume while `launcher_max_sessions` (default 10)
+Claude Code processes run on the host, so that many wakes at a time do not use
+all the memory of the host. Such a resume waits for a later tick, and it does
+not count toward the limit of 5. A runner with no session to resume runs only
+the launcher.
 
 The resume runs in the workspace that the runner recorded for the session in
 its local state, and only for a session with a local transcript and no

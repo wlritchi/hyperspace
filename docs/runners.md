@@ -109,7 +109,10 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
    sessions with `claude rm`, and resumes again a held session that needs a
    process and does not run. It resumes one session at most 5 times in an
    hour. At that limit, it logs an error, and the session stays stopped for
-   the rest of the hour.
+   the rest of the hour. It does not resume while 10 Claude Code processes run
+   on the runner (`HYPERSPACE_LAUNCHER_MAX_SESSIONS`), so that many wakes at a
+   time do not use all of the pod's memory. It logs a warning, and the resume
+   waits until a process stops.
 
 The launcher never stops when no session runs. A runner with no session that
 needs a process runs only the launcher.
