@@ -368,6 +368,161 @@ def test_rewrite_can_replace_own_tail_after_teleport(store: Store) -> None:
     assert active["kind"] == "log" and active["active"] == r["id"]
 
 
+def _own_later_branch(store: Store) -> tuple[str, str, int, int]:
+    """A root generation with three records, and a laptop rewrite at its end
+    with one more record. Return (root, rewrite, end of the second record,
+    end of the rewrite)."""
+    g = root(store)
+    n = put(store, g, 0, b"a1\n", activity=1)
+    mid = put(store, g, n, b"a2\n", activity=1)
+    end = put(store, g, mid, b"a3\n", activity=1)
+    g1 = store.create_generation(
+        KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=end
+    )["id"]
+    return g, g1, mid, put(store, g1, end, b"b1\n", activity=1)
+
+
+def test_rewrite_from_ancestor_conflicts(store: Store) -> None:
+    # The laptop syncs from an old cursor on the root. The server cannot tell
+    # a moved file from a second local copy, so the rewrite does not replace
+    # the later branch. The client prevents this case for a moved file.
+    g, g1, mid, _ = _own_later_branch(store)
+    g2 = store.create_generation(
+        KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=mid
+    )["id"]
+    n = put(store, g2, mid, b"a3\nb1\n", activity=2)
+    put(store, g2, n, b"c1\n", activity=1)
+    state = store.session_state(KEY)
+    assert state["state"] == "conflicted"
+    assert {b["generation"] for b in state.get("branches", [])} == {g1, g2}
+
+
+def test_rewrite_from_a_second_copy_keeps_both_hosts_work(store: Store) -> None:
+    # The laptop keeps a second local copy at an old state. The agent and
+    # then the laptop continue the session. A sync of the old copy must not
+    # hide their work.
+    g = root(store)
+    n = put(store, g, 0, b"a1\n", activity=1)
+    mid = put(store, g, n, b"a2\n", activity=1)
+    put(store, g, mid, b"a3\n", activity=1)
+    store.teleport(KEY, AGENT, steal=True)
+    b1 = store.create_generation(
+        KEY, PATH, AGENT, "rewrite", parent=g, fork_offset=mid
+    )["id"]
+    b_end = put(store, b1, mid, b"agent work\n", writer=AGENT, activity=1)
+    store.teleport(KEY, LAPTOP, steal=True)
+    a1 = store.create_generation(
+        KEY, PATH, LAPTOP, "rewrite", parent=b1, fork_offset=b_end
+    )["id"]
+    put(store, a1, b_end, b"laptop work\n", activity=1)
+    k = store.create_generation(KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=n)
+    put(store, k["id"], n, b"old copy\n", activity=1)
+    state = store.session_state(KEY)
+    assert state["state"] == "conflicted"
+    assert {b["generation"] for b in state.get("branches", [])} == {a1, k["id"]}
+
+
+def test_rewrite_from_ancestor_keeps_another_hosts_branch(store: Store) -> None:
+    g, g1, mid, _ = _own_later_branch(store)
+    # The restore at the steal gives the agent the rewrite branch. A rewrite
+    # from the root comes from an older copy of the agent.
+    store.teleport(KEY, AGENT, steal=True)
+    r = store.create_generation(KEY, PATH, AGENT, "rewrite", parent=g, fork_offset=mid)
+    put(store, r["id"], mid, b"agent work\n", writer=AGENT, activity=1)
+    state = store.session_state(KEY)
+    assert state["state"] == "conflicted"
+    assert {b["generation"] for b in state.get("branches", [])} == {g1, r["id"]}
+
+
+def test_stale_rewrite_from_ancestor_keeps_later_appends(store: Store) -> None:
+    g, g1, mid, end = _own_later_branch(store)
+    store.teleport(KEY, AGENT, steal=True)
+    put(store, g1, end, b"agent work\n", writer=AGENT, activity=1)
+    # The laptop did not see the agent's append.
+    r = store.create_generation(KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=mid)
+    put(store, r["id"], mid, b"laptop work\n", activity=1)
+    state = store.session_state(KEY)
+    assert state["state"] == "conflicted"
+    assert {b["generation"] for b in state.get("branches", [])} == {g1, r["id"]}
+
+
+def test_rewrite_from_ancestor_keeps_a_later_append(store: Store) -> None:
+    # An append to the old branch after the rewrite's creation can hold work
+    # that the rewrite did not see.
+    g, g1, mid, end = _own_later_branch(store)
+    r = store.create_generation(KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=mid)
+    put(store, g1, end, b"late work\n", activity=1)
+    put(store, r["id"], mid, b"new work\n", activity=1)
+    assert store.session_state(KEY)["state"] == "conflicted"
+
+
+def _moved_back(store: Store, same: bool) -> tuple[str, str]:
+    """A rewrite from an old cursor on the root, after the rewrite branch
+    `g1`. With `same`, the new branch holds the bytes of `g1` and more.
+    Return (g1, the new branch)."""
+    g, g1, mid, _ = _own_later_branch(store)
+    g2 = store.create_generation(
+        KEY, PATH, LAPTOP, "rewrite", parent=g, fork_offset=mid
+    )["id"]
+    data = b"a3\nb1\nc1\n" if same else b"a3\nx1\nc1\n"
+    put(store, g2, mid, data, activity=2)
+    return g1, g2
+
+
+def test_recheck_clears_a_conflict_whose_branch_is_contained(store: Store) -> None:
+    g1, g2 = _moved_back(store, same=True)
+    assert store.session_state(KEY)["state"] == "conflicted"
+    dry = store.recheck_conflict(KEY, write=False)
+    assert dry["after"]["state"] == "normal" and not dry["written"]
+    assert dry["logs"] == [
+        {"path": PATH, "active": g2, "contained": [g1], "not_contained": []}
+    ]
+    assert store.session_state(KEY)["state"] == "conflicted"
+    assert store.recheck_conflict(KEY, write=True)["written"]
+    assert store.session_state(KEY)["state"] == "normal"
+    # A later append to the active branch does not make the conflict again.
+    end = next(
+        x["length"]
+        for f in store.manifest(KEY)["files"]
+        for x in f.get("generations", [])
+        if x["id"] == g2
+    )
+    put(store, g2, end, b"c2\n", activity=1)
+    assert store.session_state(KEY)["state"] == "normal"
+    active = next(f for f in store.manifest(KEY)["files"] if f["path"] == PATH)
+    assert active["kind"] == "log" and active["active"] == g2
+
+
+def test_recheck_keeps_a_conflict_with_different_bytes(store: Store) -> None:
+    g1, _ = _moved_back(store, same=False)
+    result = store.recheck_conflict(KEY, write=True)
+    assert result["logs"][0]["not_contained"] == [g1]
+    assert not result["written"]
+    assert store.session_state(KEY)["state"] == "conflicted"
+
+
+@pytest.mark.parametrize("clock", ["forward", "same", "back"])
+def test_an_append_to_a_contained_tip_makes_it_a_branch_again(
+    store: Store, clock: str
+) -> None:
+    g1, _ = _moved_back(store, same=True)
+    store.recheck_conflict(KEY, write=True)
+    # The append must count also if its time is not after the check.
+    checked = store.now()
+    if clock == "same":
+        store._clock = lambda: datetime.fromisoformat(checked)
+    elif clock == "back":
+        store._clock = lambda: datetime.fromisoformat(checked) - timedelta(hours=1)
+    end = next(
+        x["length"]
+        for f in store.manifest(KEY)["files"]
+        for x in f.get("generations", [])
+        if x["id"] == g1
+    )
+    put(store, g1, end, b"late work\n", activity=1)
+    assert store.session_state(KEY)["state"] == "conflicted"
+
+
 def _diverge(store: Store, laptop_activity: int, agent_activity: int) -> str:
     g = root(store)
     n = put(store, g, 0, b"base\n", activity=1)

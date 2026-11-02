@@ -301,6 +301,14 @@ the new file can be empty for a moment; a fork at that time would make the
 empty file the active branch. The surrender of a teleport does not wait,
 because it needs the server copy to match the local file.
 
+A cursor can be older than its file. For example, Claude Code moves a
+transcript to a different project directory at a `/cd`, and later moves it
+back. Thus, before the client forks for a rewrite, it compares the local file
+with the server's active branch. If the file starts with all bytes of the
+active branch, the file continues that branch: the client moves the cursor to
+the end of the branch and makes no fork. A sync also forgets the cursors of
+the same file at other paths that have no file now.
+
 ### Metadata
 
 The adapter extracts session metadata on the client and sends it with each
@@ -618,7 +626,11 @@ Each new generation has a cause:
 - **Conflicted.** Two or more branches (from `diverge`, or from a `rewrite`
   that did not replace its parent's tail) have meaningful activity after their
   common fork point. The server records the time and the branches. A
-  conflicted session id stays conflicted.
+  conflicted session id stays conflicted. An admin can check a conflict again
+  with `scripts/recheck-conflict.py`. The conflict is false if, in each log
+  with a conflict, the bytes of each other tip are a prefix of the bytes of
+  the active tip. Then the script records these tips (they are not branches
+  while they get no append) and sets the session back to normal.
 
 For a conflicted session:
 
@@ -890,6 +902,8 @@ run inside the server container, so they need shell access to the pod
   emergency (for example, a secret in a transcript). It records each purge in
   the index.
 - `scripts/stats.py`: sizes per host, per workspace, and per harness.
+- `scripts/recheck-conflict.py`: clear a false conflict, if the bytes of the
+  other branches are in the active branch.
 
 ### Accounts files
 

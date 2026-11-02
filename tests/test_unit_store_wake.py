@@ -287,10 +287,11 @@ def test_migration_copies_the_run_start(tmp_path: Path) -> None:
     data = tmp_path / "data"
     data.mkdir()
     db = sqlite3.connect(data / "index.sqlite3")
-    for migration in _MIGRATIONS[:-1]:
+    wake = next(i for i, m in enumerate(_MIGRATIONS) if "wake_requests" in m)
+    for migration in _MIGRATIONS[:wake]:
         db.executescript(migration)
     db.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
-    db.execute("INSERT INTO schema_version VALUES (?)", (len(_MIGRATIONS) - 1,))
+    db.execute("INSERT INTO schema_version VALUES (?)", (wake,))
     db.execute(
         "INSERT INTO sessions (id, account, harness, session_id, created) "
         "VALUES (1, 'acct', 'claude-code', 's1', 't1')"

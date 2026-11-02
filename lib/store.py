@@ -338,7 +338,22 @@ _MIGRATIONS: list[str] = [
     ALTER TABLE host_heartbeats ADD COLUMN wakes_received TEXT;
     ALTER TABLE host_heartbeats ADD COLUMN wakes_interval INTEGER;
     """,
+    # Tips that `recheck_conflict` found in a different tip (`within`) when
+    # the tip had the length `length`, at the time `checked`. There are no
+    # foreign keys, so that a purge by an older server does not fail on these
+    # rows.
+    """
+    CREATE TABLE contained_tips (
+        generation TEXT PRIMARY KEY,
+        within TEXT NOT NULL,
+        length INTEGER NOT NULL,
+        checked TEXT NOT NULL
+    );
+    """,
 ]
+
+# `recheck_conflict` compares two branches in pieces of this size.
+_COMPARE_WINDOW = 8 * 1024 * 1024
 
 # The event tables whose latest event has a copy in the session row, with an
 # expression that identifies an event. A server before migration 4 writes
@@ -1740,7 +1755,10 @@ class Store:
 
         A generation is a tip if it has bytes that no child inherits (or no
         children). A `rewrite` child retires a tip only if its host had all
-        bytes of the tip and no append followed the child's creation.
+        bytes of the tip and no append followed the child's creation. A tip
+        that `recheck_conflict` found in a different tip is not a tip while
+        its length is the length at that check. A generation only grows, so
+        the length shows a later append also when the clock goes back.
         """
         gens = self._gens_of_file(file)
         by_id = {g.id: g for g in gens}
@@ -1748,10 +1766,21 @@ class Store:
         for g in gens:
             if g.parent is not None:
                 children.setdefault(g.parent, []).append(g)
+        contained = {
+            r["generation"]: (r["within"], r["length"])
+            for r in self._db.execute(
+                "SELECT c.generation, c.within, c.length FROM contained_tips c "
+                "JOIN generations g ON g.id = c.generation WHERE g.file = ?",
+                (file,),
+            ).fetchall()
+        }
         tips: list[_Gen] = []
         for g in gens:
             kids = children.get(g.id, [])
             if kids and g.length <= max(k.fork_offset for k in kids):
+                continue
+            within, length = contained.get(g.id, (None, -1))
+            if within in by_id and length == g.length:
                 continue
             retired = any(
                 k.cause == "rewrite"
@@ -1839,6 +1868,93 @@ class Store:
                 "WHERE id = ?",
                 (self.now(), session),
             )
+
+    def _same_bytes(self, a: _Gen, b: _Gen, start: int, end: int) -> bool:
+        """True if the lineages of `a` and `b` hold the same bytes in the
+        range from `start` to `end`."""
+        for lo in range(start, end, _COMPARE_WINDOW):
+            hi = min(end, lo + _COMPARE_WINDOW)
+            if b"".join(self._read_range(a, lo, hi)) != b"".join(
+                self._read_range(b, lo, hi)
+            ):
+                return False
+        return True
+
+    def _contained_tips(self, file: int) -> tuple[_Gen | None, list[_Gen], list[_Gen]]:
+        """Return (active tip, the other tips whose bytes are a prefix of the
+        bytes of the active tip, the other tips that are not) for a log."""
+        tips, by_id = self._candidates(file)
+        active, _, _ = self._file_branches(file)
+        if active is None:
+            return None, [], []
+        lineage = self._lineage(active, by_id)
+        inside: list[_Gen] = []
+        outside: list[_Gen] = []
+        for t in tips:
+            if t.id == active.id:
+                continue
+            start = self._divergence(lineage, self._lineage(t, by_id))
+            if t.length <= active.length and self._same_bytes(
+                active, t, start, t.length
+            ):
+                inside.append(t)
+            else:
+                outside.append(t)
+        return active, inside, outside
+
+    def recheck_conflict(self, key: SessionKey, write: bool) -> dict[str, Any]:
+        """Check a conflicted session again, and clear a false conflict.
+
+        A conflicted session stays conflicted at appends. A conflict is false
+        if, in each log with a conflict, the bytes of each other tip are a
+        prefix of the bytes of the active tip. Then no tip holds work that
+        the active branch does not have. If `write` is True, the server
+        records these tips, so that they are not branches while they get no
+        append, and the session becomes normal again. Return the state
+        before and after, and the result for each log with a conflict.
+        """
+        with self._tx():
+            row = self._require_session(key)
+            logs: list[dict[str, Any]] = []
+            found: list[tuple[str, str, int]] = []
+            if row["state"] == "conflicted":
+                for f in self._db.execute(
+                    "SELECT id, path FROM files WHERE session = ? AND kind = 'log'",
+                    (row["id"],),
+                ).fetchall():
+                    if not self._file_branches(f["id"])[2]:
+                        continue
+                    active, inside, outside = self._contained_tips(f["id"])
+                    assert active is not None
+                    logs.append(
+                        {
+                            "path": f["path"],
+                            "active": active.id,
+                            "contained": [t.id for t in inside],
+                            "not_contained": [t.id for t in outside],
+                        }
+                    )
+                    found.extend((t.id, active.id, t.length) for t in inside)
+            before = {"state": row["state"], "conflicted_at": row["conflicted_at"]}
+            after = before
+            if row["state"] == "conflicted" and not any(
+                log["not_contained"] for log in logs
+            ):
+                after = {"state": "normal", "conflicted_at": None}
+            written = write and after != before
+            if written:
+                now = self.now()
+                self._db.executemany(
+                    "INSERT OR REPLACE INTO contained_tips "
+                    "(generation, within, length, checked) VALUES (?, ?, ?, ?)",
+                    [(gen, within, length, now) for gen, within, length in found],
+                )
+                self._db.execute(
+                    "UPDATE sessions SET state = 'normal', conflicted_at = NULL "
+                    "WHERE id = ?",
+                    (row["id"],),
+                )
+        return {"before": before, "after": after, "logs": logs, "written": written}
 
     def _session_state(self, session: int) -> SessionStateBody:
         row = self._db.execute(
@@ -2341,6 +2457,10 @@ class Store:
             segments += self._db.execute(
                 "DELETE FROM segments WHERE generation = ?", (gid,)
             ).rowcount
+            self._db.execute(
+                "DELETE FROM contained_tips WHERE generation = ? OR within = ?",
+                (gid, gid),
+            )
             self._db.execute("DELETE FROM generations WHERE id = ?", (gid,))
         return segments
 

@@ -146,3 +146,62 @@ def test_stats_does_not_name_a_session_for_an_old_read_of_unknown_session(
     new = next(line for line in reads if "new-host" in line)
     assert "(unknown)" in old and "fresh-session" not in old
     assert "claude-code/fresh-session" in new and "(purged)" not in new
+
+
+def _put(
+    store: Store, key: SessionKey, gen: str, base: int, data: bytes, writer: Writer = W
+) -> int:
+    sha = hashlib.sha256(data).hexdigest()
+    return store.append(key, gen, writer, base, data, sha, 1)[0]["length"]
+
+
+@pytest.mark.slow
+def test_recheck_conflict_clears_a_false_conflict(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    store = Store(data)
+    path = "transcript.jsonl"
+    # The laptop forks a rewrite from an old cursor on the root, before its
+    # own later rewrite branch. The new branch holds all bytes of the old one.
+    g = store.create_generation(KEY, path, W, "root")["id"]
+    mid = _put(store, KEY, g, 0, b"a1\n")
+    end = _put(store, KEY, g, mid, b"a2\n")
+    g1 = store.create_generation(KEY, path, W, "rewrite", parent=g, fork_offset=end)
+    _put(store, KEY, g1["id"], end, b"b1\n")
+    g2 = store.create_generation(KEY, path, W, "rewrite", parent=g, fork_offset=mid)
+    _put(store, KEY, g2["id"], mid, b"a2\nb1\nc1\n")
+    assert store.session_state(KEY)["state"] == "conflicted"
+    # A real conflict in a second session: the same shape, other bytes.
+    other = SessionKey("default", "claude-code", "22222222-2222-2222-2222-222222222222")
+    h = store.create_generation(other, path, W, "root")["id"]
+    mid = _put(store, other, h, 0, b"a1\n")
+    end = _put(store, other, h, mid, b"a2\n")
+    h1 = store.create_generation(other, path, W, "rewrite", parent=h, fork_offset=end)
+    _put(store, other, h1["id"], end, b"b1\n")
+    h2 = store.create_generation(other, path, W, "rewrite", parent=h, fork_offset=mid)
+    _put(store, other, h2["id"], mid, b"a2\nx1\nc1\n")
+    assert store.session_state(other)["state"] == "conflicted"
+    store.close()
+
+    args = ["--data-dir", str(data), "claude-code"]
+    dry = run("recheck-conflict.py", *args, KEY.session_id)
+    assert dry.returncode == 0, dry.stderr
+    assert "before: conflicted since" in dry.stdout
+    assert f"{g1['id']}: contained in the active tip" in dry.stdout
+    assert "after: normal. Run again with --write" in dry.stdout
+    store = Store(data)
+    assert store.session_state(KEY)["state"] == "conflicted"
+    store.close()
+
+    done = run("recheck-conflict.py", "--write", *args, KEY.session_id)
+    assert done.returncode == 0, done.stderr
+    assert "after: normal (written)" in done.stdout
+    real = run("recheck-conflict.py", "--write", *args, other.session_id)
+    assert real.returncode == 0, real.stderr
+    assert f"{h1['id']}: NOT contained in the active tip" in real.stdout
+    assert "after: no change" in real.stdout
+    store = Store(data)
+    assert store.session_state(KEY)["state"] == "normal"
+    assert store.session_state(other)["state"] == "conflicted"
+    store.close()
+    missing = run("recheck-conflict.py", *args, "no-such-session")
+    assert missing.returncode == 1 and "error:" in missing.stderr
