@@ -350,6 +350,28 @@ _MIGRATIONS: list[str] = [
         checked TEXT NOT NULL
     );
     """,
+    # A teleport id is unique in its session, not in the index. The client
+    # chooses the id, so a global key would tell a client that an id of
+    # another account exists. SQLite cannot change a primary key in place,
+    # so the table is built again with the same columns in the same order.
+    # An older server still reads and writes it.
+    """
+    CREATE TABLE teleports_by_session (
+        id TEXT NOT NULL,
+        session INTEGER NOT NULL REFERENCES sessions (id),
+        source TEXT,
+        target_host TEXT NOT NULL,
+        target_workspace TEXT NOT NULL,
+        steal INTEGER NOT NULL,
+        created TEXT NOT NULL,
+        PRIMARY KEY (session, id)
+    );
+    INSERT INTO teleports_by_session
+        SELECT id, session, source, target_host, target_workspace, steal, created
+        FROM teleports;
+    DROP TABLE teleports;
+    ALTER TABLE teleports_by_session RENAME TO teleports;
+    """,
 ]
 
 # `recheck_conflict` compares two branches in pieces of this size.
@@ -1080,6 +1102,15 @@ class Store:
         ).fetchall()
         return [_gen_from_row(r) for r in rows]
 
+    def _gen_of_file(self, file: int, generation: str) -> _Gen | None:
+        """The generation `generation` of `file`, or None. A lookup in the
+        file only gives the same answer for a generation of another session
+        as for an id that does not exist."""
+        row = self._db.execute(
+            "SELECT * FROM generations WHERE file = ? AND id = ?", (file, generation)
+        ).fetchone()
+        return None if row is None else _gen_from_row(row)
+
     def _gen_in_session(self, key: SessionKey, generation: str) -> _Gen:
         session = self._require_session(key)
         gen = self._gen(generation)
@@ -1137,8 +1168,8 @@ class Store:
             else:
                 if cause not in ("rewrite", "diverge"):
                     raise StoreError("bad_request", "a fork is a rewrite or diverge")
-                parent_gen = self._gen(parent)
-                if parent_gen.file != file:
+                parent_gen = self._gen_of_file(file, parent)
+                if parent_gen is None:
                     raise NotFound("parent generation")
                 if not 0 <= fork_offset <= parent_gen.length:
                     raise StoreError("bad_request", "fork offset out of range")
@@ -1528,13 +1559,15 @@ class Store:
         with self._tx():
             session = self._require_session(key)
             if teleport_id is not None:
+                # A teleport id is unique in its session, not in the index.
+                # An id that another account used is thus an unused id here.
                 previous = self._db.execute(
-                    "SELECT * FROM teleports WHERE id = ?", (teleport_id,)
+                    "SELECT * FROM teleports WHERE session = ? AND id = ?",
+                    (session["id"], teleport_id),
                 ).fetchone()
                 if previous is not None:
                     if (
-                        previous["session"] != session["id"]
-                        or previous["target_host"] != writer.host
+                        previous["target_host"] != writer.host
                         or previous["target_workspace"] != writer.workspace
                     ):
                         raise StoreError("bad_request", "teleport id is already in use")
