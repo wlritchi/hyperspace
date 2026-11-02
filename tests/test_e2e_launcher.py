@@ -1163,10 +1163,10 @@ def test_the_fake_copies_a_session_that_has_a_job_record_for_options(
     monkeypatch.setenv("FAKE_CLAUDE_MODE", "resume")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake.root))
     argv = [sys.executable, FAKE, "--bg", "--resume", sid, "hi"]
-    assert run_bg(argv, WS, 30).returncode == 0
+    assert run_bg(argv, str(tmp_path), 30).returncode == 0
     assert job_ids(fake) == {sid[:8]: sid}
     argv[2:2] = ["--model", "opus"]
-    result = run_bg(argv, WS, 30)
+    result = run_bg(argv, str(tmp_path), 30)
     assert result.returncode == 0
     copy = next(own for short, own in job_ids(fake).items() if short != sid[:8])
     assert f"started a copy as {copy[:8]}" in result.output
