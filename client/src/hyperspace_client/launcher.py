@@ -700,9 +700,9 @@ class Launcher:
 
     def _session_options(self, sid: str) -> list[str]:
         """The launcher's Claude Code options, with the session's own effort
-        level in place of an effort level in them. Claude Code 2.1.301
-        `claude --resume` takes the model from the transcript, but not the
-        effort level."""
+        level in place of an effort level in them. If `ANTHROPIC_MODEL` is
+        not set, Claude Code 2.1.301 `claude --resume` takes the model from
+        the transcript. It never takes the effort level from it."""
         newest = self._newest_transcript(sid)
         effort = self.adapter.effort(newest) if newest else None
         if effort is None:

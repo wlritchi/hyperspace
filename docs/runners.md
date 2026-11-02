@@ -85,19 +85,20 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
    session does not resume. A job with a worktree stays, and resumes with no
    `<args>`, with its saved options. In `<args>`, the launcher replaces an
    `--effort` with the effort level of the session's last turn, because
-   `claude --resume` takes the model from the transcript but not the effort
-   level. In the saved options of a job with a worktree, it writes the model
-   and the effort level of the last turn. It holds the session's sync lock
-   from these checks until `claude --bg` returns, and it does not resume a
-   session while a sync or a restore of it runs. If the session changed during
-   the hold, the launcher then starts a checkpoint. It does not resume a
-   session that the server shows as `live` on any host, also on the runner
-   itself (for example from a different harness config directory). The message
-   tells the agent that the runner restarted, and that its crons, Monitors and
-   background tasks stopped. `claude --bg` returns before the job's process
-   starts, so the launcher then reads the job's `state.json` for at most 10
-   seconds. If the job failed at its start, the launcher logs the job's
-   `detail` and counts the resume as a failed resume.
+   `claude --resume` does not take the effort level from the transcript. It
+   takes the model from the transcript only if `ANTHROPIC_MODEL` is not set.
+   In the saved options of a job with a worktree, it writes the model and the
+   effort level of the last turn. It holds the session's sync lock from these
+   checks until `claude --bg` returns, and it does not resume a session while
+   a sync or a restore of it runs. If the session changed during the hold, the
+   launcher then starts a checkpoint. It does not resume a session that the
+   server shows as `live` on any host, also on the runner itself (for example
+   from a different harness config directory). The message tells the agent
+   that the runner restarted, and that its crons, Monitors and background
+   tasks stopped. `claude --bg` returns before the job's process starts, so
+   the launcher then reads the job's `state.json` for at most 10 seconds. If
+   the job failed at its start, the launcher logs the job's `detail` and
+   counts the resume as a failed resume.
 4. Does not resume a `done` session. Resumes a session that is `ready`,
    `waiting` with `wake: message`, or that has no status only for a pending
    wake request (see "Wakes"). Sessions from before the session status feature
