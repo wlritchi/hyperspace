@@ -1237,3 +1237,34 @@ def test_migration_3_on_a_version_2_index(tmp_path: Path) -> None:
         assert "status" not in migrated.session_state(KEY)
         assert set_status(migrated)["seq"] == 1
         assert beat(migrated, "laptop", KEY) == 1
+
+
+def test_the_teleport_key_migration_keeps_the_teleports(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    db = sqlite3.connect(data / "index.sqlite3")
+    version = next(
+        i for i, m in enumerate(_MIGRATIONS) if "CREATE TABLE teleports_by_session" in m
+    )
+    for migration in _MIGRATIONS[:version]:
+        db.executescript(migration)
+    db.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+    db.execute("INSERT INTO schema_version VALUES (?)", (version,))
+    db.execute(
+        "INSERT INTO sessions (id, account, harness, session_id, created) "
+        "VALUES (1, 'acct', 'claude-code', 's1', 't1')"
+    )
+    db.execute(
+        "INSERT INTO teleports VALUES ('t_1', 1, NULL, 'agent-1', '/w', 0, 't2')"
+    )
+    db.commit()
+    db.close()
+    with closing(Store(data)) as migrated:
+        teleports = migrated.manifest(KEY)["teleports"]
+        assert [(t["id"], t["target_host"]) for t in teleports] == [("t_1", "agent-1")]
+        # The same id in another session is an unused id there.
+        other = SessionKey("acct", "claude-code", "s2")
+        put(migrated, root(migrated, key=other), 0, b"x\n", key=other)
+        event, _ = migrated.teleport(other, LAPTOP, False, None, "t_1")
+        assert event["id"] == "t_1"
+        assert migrated.manifest(KEY)["teleports"] == teleports
