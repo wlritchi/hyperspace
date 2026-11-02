@@ -25,7 +25,7 @@ import pytest
 from _hs import FakeClaude, prompt, text_reply, tool_call
 from hyperspace_client import cli as cli_mod
 from hyperspace_client.adapters import LocalSession
-from hyperspace_client.adapters.claude_code import ClaudeCode
+from hyperspace_client.adapters.claude_code import ClaudeCode, merge_options
 from hyperspace_client.api import Api, StatusConflict
 from hyperspace_client.cli import SESSION_ENV, _request, set_status
 from hyperspace_client.state import _ADDED_COLUMNS, _SCHEMA, State
@@ -621,6 +621,22 @@ def test_model_is_the_requested_model_with_its_route(tmp_path: Path) -> None:
         {**text_reply("d"), "requestedModel": "claude-x", "isSidechain": True},
     )
     assert ClaudeCode.model(path) == "openai:gpt-6.1-sol"
+
+
+def test_merge_options_replaces_the_options_it_gets() -> None:
+    channels = "--dangerously-load-development-channels"
+    saved = [channels, "plugin:a@old", "plugin:b@m", "--model=opus", "--name", "w"]
+    wanted = [channels, "plugin:a@new", "--agent", "c", "--model", "x"]
+    # A list of values is one value; the options of `wanted` come last.
+    assert merge_options(saved, wanted) == ["--name", "w", *wanted]
+    # The same values in the other form are no change.
+    same = [channels, "plugin:a@old", "plugin:b@m", "--model", "opus"]
+    assert merge_options(saved, same) is saved
+    assert merge_options(saved, []) is saved
+    # A boolean option, and a repeated option, are options as well.
+    saved = ["--verbose", "--add-dir", "a", "--add-dir", "b"]
+    assert merge_options(saved, ["--add-dir", "a"]) == ["--verbose", "--add-dir", "a"]
+    assert merge_options(saved, ["--add-dir", "a", "--add-dir", "b"]) is saved
 
 
 def test_effort_reads_back_in_steps_to_a_limit(

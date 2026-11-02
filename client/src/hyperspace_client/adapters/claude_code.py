@@ -234,16 +234,38 @@ def without_option(args: list[str], option: str) -> list[str]:
     return out
 
 
-def option_value(args: list[str], option: str) -> str | None:
-    """The value of the last `<option> <value>` or `<option>=<value>` in
-    `args`, or None."""
-    value: str | None = None
-    for i, arg in enumerate(args):
-        if arg == option and i + 1 < len(args):
-            value = args[i + 1]
-        elif arg.startswith(f"{option}="):
-            value = arg.split("=", 1)[1]
-    return value
+def _option_groups(args: list[str]) -> list[tuple[str, tuple[str, ...]]]:
+    """`args` as options with their values. The values of an option are the
+    arguments after it up to the next option, because an option can take a
+    list of values. Arguments before the first option have the name ""."""
+    groups: list[tuple[str, list[str]]] = []
+    for arg in args:
+        if arg.startswith("-") and arg != "-":
+            name, eq, value = arg.partition("=")
+            groups.append((name, [value] if eq else []))
+        elif groups:
+            groups[-1][1].append(arg)
+        else:
+            groups.append(("", [arg]))
+    return [(name, tuple(values)) for name, values in groups]
+
+
+def merge_options(saved: list[str], wanted: list[str]) -> list[str]:
+    """Return `saved` with each option of `wanted` in place of the same
+    option in it. Options of `saved` that `wanted` does not give stay. If
+    nothing changes, return `saved` itself. Else the options of `wanted` come
+    last, in their order, because `check_claude_args` makes sure that their
+    last option takes no list of values."""
+    old = _option_groups(saved)
+    new = _option_groups(wanted)
+    names = {name for name, _ in new}
+    if all(
+        [g for g in old if g[0] == name] == [g for g in new if g[0] == name]
+        for name in names
+    ):
+        return saved
+    out = [g for g in old if g[0] not in names] + new
+    return [arg for name, values in out for arg in ((name,) if name else ()) + values]
 
 
 def _last_turn_value(
@@ -1215,11 +1237,9 @@ class ClaudeCode:
         that the backend gives, without the route."""
         return _last_turn_value(transcript, "requestedModel", _MODEL)
 
-    def set_saved_options(
-        self, short: str, model: str | None, effort: str | None
-    ) -> bool:
-        """Give `--model` and `--effort` in the saved options of the job
-        `short` the values `model` and `effort` (None: no change). A bare
+    def set_saved_options(self, short: str, options: list[str]) -> bool:
+        """Put each option of `options` in place of the same option in the
+        saved options of the job `short` (see `merge_options`). A bare
         `claude --bg --resume` uses the saved options, and Claude Code
         2.1.301 also uses changed ones. Return True if the state changed.
         Leave a state whose saved options are not a list of strings."""
@@ -1237,10 +1257,7 @@ class ClaudeCode:
         old: list[Any] = flags  # pyright: ignore[reportUnknownVariableType]
         if not all(isinstance(f, str) for f in old):
             return False
-        new = cast(list[str], old)
-        for option, value in (("--model", model), ("--effort", effort)):
-            if value is not None and option_value(new, option) != value:
-                new = [*without_option(new, option), option, value]
+        new = merge_options(cast(list[str], old), options)
         if new is old:
             return False
         record["respawnFlags"] = new

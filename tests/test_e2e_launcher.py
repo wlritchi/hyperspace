@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import signal
 import socket
 import sys
@@ -990,7 +991,11 @@ def test_own_live_from_before_a_restart_does_not_block_the_resume(
 
 
 def test_resume_limit(
-    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     sid = held_session(ctx, fake, tmp_path / "ws")
     set_status(ctx, sid, "working")
@@ -1001,9 +1006,14 @@ def test_resume_limit(
         run.tick()
         clock.t += 60
     assert len(bg.calls) == MAX_RESUMES
+    # One error at the limit, not one at each tick.
+    limit = [r for r in caplog.records if "times in an hour" in r.getMessage()]
+    assert [r.levelno for r in limit] == [logging.ERROR]
+    assert f"{sid}: resumed {MAX_RESUMES} times in an hour" in limit[0].getMessage()
     clock.t += 3600
     run.tick()
     assert len(bg.calls) == MAX_RESUMES + 1
+    assert sid not in run._limited  # pyright: ignore[reportPrivateUsage]
 
 
 def job_bg(
@@ -1275,7 +1285,11 @@ def test_a_job_with_a_worktree_resumes_with_its_saved_options(
         "effort": "low",
     }
     fake.write(host.find_transcripts(sid)[0], last_turn)
-    saved = ["--name", "w", "--effort", "high", "--model=opus", "--agent", "a"]
+    channels = "--dangerously-load-development-channels"
+    saved = [
+        *("--name", "w", channels, "plugin:s@old", "plugin:n@m"),
+        *("--effort", "high", "--model=opus", "--agent", "a"),
+    ]
     path = job(
         fake,
         sid[:8],
@@ -1284,7 +1298,10 @@ def test_a_job_with_a_worktree_resumes_with_its_saved_options(
         worktreePath=str(tmp_path / "ws"),
         respawnFlags=saved,
     )
-    run = runner(ctx, host, Bg(), Clock())
+    # The launcher's own options replace the saved ones too, for example a
+    # channel that changed since the job started.
+    args = [channels, "plugin:s@new", "--agent", "a"]
+    run = runner(ctx, host, Bg(), Clock(), claude_args=args)
     fake_jobs(fake, monkeypatch, run)
     calls: list[list[str]] = []
     bg, rm = run.run_claude, Rm(ctx)
@@ -1302,28 +1319,21 @@ def test_a_job_with_a_worktree_resumes_with_its_saved_options(
     assert f"the job {sid[:8]} has a worktree" in caplog.text
     assert "copied" not in caplog.text
     record = json.loads(path.read_text())
-    assert record["respawnFlags"] == [
-        "--name",
-        "w",
-        "--agent",
-        "a",
-        "--model",
-        "openai:gpt-6.1-sol",
-        "--effort",
-        "low",
-    ]
+    turn = ["--model", "openai:gpt-6.1-sol", "--effort", "low"]
+    assert record["respawnFlags"] == ["--name", "w", *args, *turn]
     assert record["worktreePath"] == str(tmp_path / "ws")
-    assert "with the model openai:gpt-6.1-sol and the effort low" in caplog.text
+    assert f"changed to {shlex.join([*args, *turn])}" in caplog.text
 
 
 def test_saved_options_change_only_for_a_new_value(fake: FakeClaude) -> None:
     flags = ["--effort", "low", "--model", "sonnet"]
     path = job(fake, "j1", "s", respawnFlags=flags)
     before = path.stat().st_mtime_ns
-    assert fake.adapter.set_saved_options("j1", "sonnet", "low") is False
-    assert fake.adapter.set_saved_options("j1", None, None) is False
+    set_saved = fake.adapter.set_saved_options
+    assert set_saved("j1", ["--model", "sonnet", "--effort", "low"]) is False
+    assert set_saved("j1", []) is False
     assert path.stat().st_mtime_ns == before
-    assert fake.adapter.set_saved_options("j1", None, "high") is True
+    assert set_saved("j1", ["--effort", "high"]) is True
     assert json.loads(path.read_text())["respawnFlags"] == [
         "--model",
         "sonnet",
@@ -1333,8 +1343,8 @@ def test_saved_options_change_only_for_a_new_value(fake: FakeClaude) -> None:
     # Saved options that are not a list of strings stay as they are.
     for odd in (None, "--model x", ["--model", 1]):
         job(fake, "j2", "s", respawnFlags=odd)
-        assert fake.adapter.set_saved_options("j2", "haiku", "max") is False
-    assert fake.adapter.set_saved_options("../j1", "haiku", "max") is False
+        assert set_saved("j2", ["--model", "haiku"]) is False
+    assert set_saved("../j1", ["--model", "haiku"]) is False
 
 
 def test_saved_options_keep_a_state_that_changed_after_the_read(
@@ -1352,7 +1362,7 @@ def test_saved_options_keep_a_state_that_changed_after_the_read(
         return record
 
     monkeypatch.setattr(claude_code_mod, "_read_state", read_then_start)
-    assert fake.adapter.set_saved_options("j1", "haiku", "max") is False
+    assert fake.adapter.set_saved_options("j1", ["--model", "haiku"]) is False
     assert json.loads(path.read_text()) == running
     assert [p.name for p in path.parent.iterdir()] == ["state.json"]
 

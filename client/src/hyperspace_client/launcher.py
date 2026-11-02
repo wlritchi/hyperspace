@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -529,6 +530,8 @@ class Launcher:
     )
     # Session id to the times of its recent resumes.
     _resumes: dict[str, deque[float]] = field(default_factory=dict[str, deque[float]])
+    # The sessions at the resume limit, logged once until the limit ends.
+    _limited: set[str] = field(default_factory=set[str])
     # The earliest time of the next restore of held sessions; None after a
     # restore with no failure.
     _restore_at: float | None = float("-inf")
@@ -607,8 +610,18 @@ class Launcher:
         while recent and now - recent[0] >= RESUME_WINDOW:
             recent.popleft()
         if len(recent) >= MAX_RESUMES:
-            log.info("%s: resumed %d times in an hour; not again", sid, len(recent))
+            # An error, because the session then stays stopped while the
+            # runner looks healthy.
+            if sid not in self._limited:
+                self._limited.add(sid)
+                log.error(
+                    "%s: resumed %d times in an hour; no resume for %.0f min",
+                    sid,
+                    len(recent),
+                    (recent[0] + RESUME_WINDOW - now) / 60,
+                )
             return False
+        self._limited.discard(sid)
         harness = self.adapter.harness
         # Hold the session's sync lock from the checks until `claude --bg`
         # returns, so that no restore or sync starts between them. The new
@@ -671,8 +684,8 @@ class Launcher:
         `claude rm` first. A job with a worktree stays, because `claude rm`
         can remove the worktree, which can be the session's workspace. Its
         resume has no options, and then continues the session with the
-        job's saved options. Thus the launcher first gives them the
-        session's own model and effort level."""
+        job's saved options. Thus the launcher first puts its own options,
+        and the session's own model and effort level, into them."""
         jobs = [j for j in self.adapter.jobs() if j.own_id == sid]
         if not jobs:
             return self._session_options(sid), None
@@ -710,28 +723,31 @@ class Launcher:
         return [*without_option(self.claude_args, "--effort"), "--effort", effort]
 
     def _keep_session_options(self, sid: str, kept: Job) -> Job:
-        """Give the saved options of the job `kept` the model and the effort
-        level of the session's last turn, and return the job as it is then.
-        The saved options come from the start of the job, and the resume
-        uses them in place of the model in the transcript."""
+        """Put the launcher's options, with the model and the effort level of
+        the session's last turn, into the saved options of the job `kept`,
+        and return the job as it is then. The saved options come from the
+        start of the job, so they can have an old channel or model, and the
+        resume uses them in place of the model in the transcript."""
+        options = self.claude_args
         newest = self._newest_transcript(sid)
-        if newest is None:
-            return kept
-        model, effort = self.adapter.model(newest), self.adapter.effort(newest)
+        if newest is not None:
+            turn = (("--model", self.adapter.model(newest)),)
+            turn += (("--effort", self.adapter.effort(newest)),)
+            for option, value in turn:
+                if value is not None:
+                    options = [*without_option(options, option), option, value]
         try:
-            changed = self.adapter.set_saved_options(kept.short, model, effort)
+            changed = self.adapter.set_saved_options(kept.short, options)
         except OSError as exc:
             log.warning("%s: the saved options of job %s: %s", sid, kept.short, exc)
             return kept
         if not changed:
             return kept
         log.info(
-            "%s: the job %s resumes with the model %s and the effort %s of its"
-            " last turn",
+            "%s: the job %s resumes with its saved options, changed to %s",
             sid,
             kept.short,
-            model or "it saved",
-            effort or "it saved",
+            shlex.join(options),
         )
         # Read the job again: `_start_failure` takes a change of the time of
         # its state as the new start, and the rewrite changed that time.
