@@ -341,6 +341,17 @@ class State:
             server=row["server"],
         )
 
+    def cursor_paths(
+        self, server: str, harness: str, session_id: str, rel_path: str
+    ) -> list[Path]:
+        """The local paths of the cursors of one file of a session."""
+        rows = self._db.execute(
+            "SELECT local_path FROM remote_cursors WHERE server = ? AND harness = ? "
+            "AND session_id = ? AND rel_path = ?",
+            (server, harness, session_id, rel_path),
+        ).fetchall()
+        return [Path(r["local_path"]) for r in rows]
+
     def save_cursor(self, cursor: Cursor) -> None:
         segments = json.dumps([[s.offset, s.length, s.sha256] for s in cursor.segments])
         with self._db:

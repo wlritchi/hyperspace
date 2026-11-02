@@ -174,6 +174,102 @@ def test_full_rewrite_with_new_inode(
     assert rewrite["fork_offset"] == len(first)
 
 
+def test_transcript_that_moves_back_keeps_its_branch(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    # A `/cd` moves the transcript from A to B and back to A. Each move
+    # writes a new file. The old files go to `held`, so that the new files
+    # cannot get their inode numbers.
+    ctx = context(server.api("laptop"), tmp_path / "state", fake, "laptop")
+    ws_b = "/home/wlritchi/hyperspace/.claude/worktrees/other"
+    a = fake.transcript(WS)
+    sid = a.stem
+    held = tmp_path / "held"
+    held.mkdir()
+
+    def move(old: Path, workspace: str) -> Path:
+        new = fake.transcript(workspace, sid)
+        new.write_bytes(old.read_bytes())
+        os.rename(old, held / f"{len(list(held.iterdir()))}.jsonl")
+        return new
+
+    fake.write(a, prompt("one"), tool_call())
+    sync(ctx, a)
+    b = move(a, ws_b)
+    fake.write(b, prompt("two"), tool_call())
+    sync(ctx, b, ws_b)
+    a = move(b, WS)
+    fake.write(a, prompt("three"), tool_call())
+    r = sync(ctx, a)
+    assert not r.diverged
+    entry, manifest = log_entry(server, sid)
+    assert [g["cause"] for g in entry["generations"]] == ["root"]
+    assert manifest["state"]["state"] == "normal"
+    assert active_bytes(server, sid) == a.read_bytes()
+
+
+def test_renamed_transcript_does_not_use_the_cursor_of_its_old_path(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    # A rename keeps the inode. Thus the cursor of A still matches the file
+    # when it comes back, but the file has changed at B in the meantime.
+    ctx = context(server.api("laptop"), tmp_path / "state", fake, "laptop")
+    ws_b = "/home/wlritchi/hyperspace/.claude/worktrees/other"
+    a = fake.transcript(WS)
+    sid = a.stem
+    fake.write(a, prompt("one"), tool_call())
+    sync(ctx, a)
+    b = fake.transcript(ws_b, sid)
+    os.rename(a, b)
+    fake.write(b, prompt("two"), tool_call())
+    sync(ctx, b, ws_b)
+    # Claude Code removes the last record at B and writes a different one.
+    data = b.read_bytes()
+    with open(b, "r+b") as f:
+        f.truncate(data.rstrip(b"\n").rfind(b"\n") + 1)
+    fake.write(b, prompt("instead"))
+    sync(ctx, b, ws_b)
+    os.rename(b, a)
+    fake.write(a, prompt("three"), tool_call())
+    r = sync(ctx, a)
+    assert not r.diverged
+    entry, manifest = log_entry(server, sid)
+    assert sorted(g["cause"] for g in entry["generations"]) == ["rewrite", "root"]
+    assert manifest["state"]["state"] == "normal"
+    assert active_bytes(server, sid) == a.read_bytes()
+
+
+def test_rewrite_of_a_second_copy_with_other_bytes_conflicts(
+    server: Server, fake: FakeClaude, tmp_path: Path
+) -> None:
+    # Two local copies of one session. The old copy at B gets different
+    # bytes, so it does not continue the active branch.
+    ctx = context(server.api("laptop"), tmp_path / "state", fake, "laptop")
+    ws_b = "/home/wlritchi/hyperspace/.claude/worktrees/other"
+    a = fake.transcript(WS)
+    sid = a.stem
+    fake.write(a, prompt("one"), tool_call())
+    sync(ctx, a)
+    b = fake.transcript(ws_b, sid)
+    b.write_bytes(a.read_bytes())
+    sync(ctx, b, ws_b)
+    # The copy at A gets a rewrite and new work.
+    keep = a.read_bytes().split(b"\n")[0] + b"\n"
+    with open(a, "r+b") as f:
+        f.truncate(len(keep))
+    fake.write(a, prompt("work at A"), tool_call())
+    sync(ctx, a)
+    old = b.read_bytes()
+    new = b.with_suffix(".tmp")
+    new.write_bytes(old)
+    fake.write(new, prompt("work at B"), tool_call())
+    os.replace(new, b)
+    sync(ctx, b, ws_b)
+    entry, manifest = log_entry(server, sid)
+    assert [g["cause"] for g in entry["generations"]] == ["root", "rewrite", "rewrite"]
+    assert manifest["state"]["state"] == "conflicted"
+
+
 def test_unreachable_server_then_recovery(
     server: Server, fake: FakeClaude, tmp_path: Path
 ) -> None:

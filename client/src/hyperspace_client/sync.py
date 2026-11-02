@@ -198,32 +198,32 @@ class Syncer:
             ino=st.st_ino,
         )
 
-    def _adopt_remote(
-        self, f: LocalFile, st: os.stat_result, local_size: int
-    ) -> Cursor:
-        """The server already has this file, but the client has no cursor
-        (for example, its state was lost). Find how much of the server's
-        active branch the local file holds, and continue from there."""
+    def _active_log(self, rel_path: str) -> tuple[str, int] | None:
+        """The leaf and the length of the server's active branch of a log,
+        or None if the server has no such log."""
         manifest = self.ctx.api.manifest(self._h, self._sid)
         entry = next(
             (
                 e
                 for e in manifest["files"]
-                if e["path"] == f.rel_path and e["kind"] == "log"
+                if e["path"] == rel_path and e["kind"] == "log"
             ),
             None,
         )
         if entry is None or entry["kind"] != "log":
-            raise ApiError(
-                409, "exists", "the server has the file but no active branch"
-            )
+            return None
         active = entry["active"]
-        length = next(g["length"] for g in entry["generations"] if g["id"] == active)
-        common = 0
-        limit = min(length, local_size)
+        return active, next(
+            g["length"] for g in entry["generations"] if g["id"] == active
+        )
+
+    def _common_end(self, f: LocalFile, generation: str, start: int, limit: int) -> int:
+        """The end of the bytes from `start` to `limit` that the local file
+        and the server's `generation` share."""
+        common = start
         while common < limit:
             end = min(common + CHUNK, limit)
-            remote = self.ctx.api.read_log(self._h, self._sid, active, common, end)
+            remote = self.ctx.api.read_log(self._h, self._sid, generation, common, end)
             local = _read(f.path, common, end)
             if remote == local:
                 common = end
@@ -235,6 +235,21 @@ class Syncer:
             else:
                 common += min(len(remote), len(local))
             break
+        return common
+
+    def _adopt_remote(
+        self, f: LocalFile, st: os.stat_result, local_size: int
+    ) -> Cursor:
+        """The server already has this file, but the client has no cursor
+        (for example, its state was lost). Find how much of the server's
+        active branch the local file holds, and continue from there."""
+        found = self._active_log(f.rel_path)
+        if found is None:
+            raise ApiError(
+                409, "exists", "the server has the file but no active branch"
+            )
+        active, length = found
+        common = self._common_end(f, active, 0, min(length, local_size))
         cursor = self._new_cursor(f, active, st)
         if common == length:
             cursor.length = length
@@ -265,7 +280,15 @@ class Syncer:
         match, and its generation is the one to fork from. It is not saved:
         `_fork_rewrite` saves it."""
         state = self.ctx.state
-        cursor = state.cursor(f.path, self.ctx.api.cache_identity)
+        server = self.ctx.api.cache_identity
+        # Claude Code moves a transcript to a different project directory at
+        # a `/cd`. A cursor at a path with no file is then stale. If the file
+        # comes back to that path later, a sync from that cursor would fork a
+        # false `rewrite` from an old generation.
+        for other in state.cursor_paths(server, self._h, self._sid, f.rel_path):
+            if other != f.path and not other.exists():
+                state.forget_cursor(other)
+        cursor = state.cursor(f.path, server)
         if cursor is None or (cursor.harness, cursor.session_id, cursor.rel_path) != (
             self._h,
             self._sid,
@@ -282,10 +305,47 @@ class Syncer:
         if not rewritten:
             return cursor, False
         end, kept = _matching_prefix(f.path, cursor.segments)
+        continued = self._continue_active(f, st, cursor, end == cursor.length)
+        if continued is not None:
+            return continued, False
         cursor.length = end
         cursor.segments = kept
         cursor.dev, cursor.ino = st.st_dev, st.st_ino
         return cursor, True
+
+    def _continue_active(
+        self, f: LocalFile, st: os.stat_result, cursor: Cursor, intact: bool
+    ) -> Cursor | None:
+        """If the changed local file starts with all bytes of the server's
+        active branch, return a new cursor at the end of that branch.
+
+        The cursor can be older than the file: for example, the file moved
+        to a different path and back. A `rewrite` from such a cursor would
+        make a false branch. `intact` is True if the file still holds all
+        segments of `cursor`. If the cursor is on the active generation,
+        these segments are a part of the branch, and only the rest needs a
+        read from the server.
+        """
+        found = self._active_log(f.rel_path)
+        if found is None:
+            return None
+        active, length = found
+        start = 0
+        if cursor.generation == active:
+            if not intact:
+                return None
+            start = cursor.length
+        if length > st.st_size or self._common_end(f, active, start, length) != length:
+            return None
+        log.info("%s changed on disk, but continues the active branch", f.path)
+        new = self._new_cursor(f, active, st)
+        new.length = length
+        new.segments = list(cursor.segments) if start else []
+        if length > start:
+            new.segments.append(
+                Segment(start, length - start, _sha(_read(f.path, start, length)))
+            )
+        return new
 
     def _fork_rewrite(self, f: LocalFile, cursor: Cursor) -> None:
         log.info("%s changed on disk; fork at %d", f.path, cursor.length)
