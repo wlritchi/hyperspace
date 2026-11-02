@@ -1062,7 +1062,9 @@ server is on the open internet from the first release.
 - **No existence oracle.** A session that the credential cannot read gives the
   same `404` as a session that does not exist. The wake endpoint is the
   exception: a `wake` credential learns whether a session id exists in its
-  account.
+  account. A generation id or a teleport id of another session gives the same
+  answer as an id that does not exist; a teleport id is unique in its session,
+  not in the index.
 - **Limits.** A body limit, a limit on the decompressed size (protection from
   zstd bombs), strict validation of session ids and file paths (no `..`, no
   absolute paths, no empty segments, bounded length), per-credential storage
@@ -1070,13 +1072,13 @@ server is on the open internet from the first release.
   client address.
 - **Small attack surface.** The server never parses transcript content. It has
   no browser UI, no CORS, and no admin API.
-- **Audit.** The server records each read of session content (credential,
-  host, session, time) in the index. `scripts/stats.py` can show it. Each
-  audit row keeps the session key (account, harness, session id), not only the
-  index row id, because a purge frees that row id for a new session. A row
-  from before schema version 2 gets the key of the session that has its row id
-  only if that session was created before the read, or at the same time with
-  no session purge at that time. Otherwise the key stays unknown, and
+- **Audit.** The server records each read of session content (account, host,
+  session, time) in the index. `scripts/stats.py` can show it. Each audit row
+  keeps the session key (account, harness, session id), not only the index row
+  id, because a purge frees that row id for a new session. A row from before
+  schema version 2 gets the key of the session that has its row id only if
+  that session was created before the read, or at the same time with no
+  session purge at that time. Otherwise the key stays unknown, and
   `scripts/stats.py` shows "(unknown)".
 - **Secrets on hosts.** On workstations, the token is in the system keyring,
   and on Linux also in a cache in kernel memory (see "Credentials"). A file

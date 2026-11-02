@@ -127,6 +127,27 @@ Use the account id of your other credentials, so that sessions can teleport
 between the hosts. To revoke a credential, remove it at the provisioner. See
 "Accounts files" in the spec for how the server merges the files.
 
+### Several accounts
+
+An account is the security boundary. A credential sees only the sessions,
+hosts and wakes of its account. A credential of account A gets the same answer
+for an id of account B as for an id that does not exist, and B's launchers
+never act on A's sessions, also when the two accounts use the same host names
+and the same session ids.
+
+The hosts of one account trust each other: a token can take the lease of any
+session that it can read in its account, with `--steal` also one that another
+host holds. Thus a role that must stay apart from your own sessions, for
+example a reviewer agent, needs its own account, not only its own host. To run
+several accounts:
+
+- Give each runner pod one credential, of one account.
+- Put the credentials of each account in their own file in `accounts.d` (the
+  chart's `accountsSecrets`), so that a provisioner can add and remove an
+  account with one Secret.
+- Give subspace a separate `wake` credential for each account. A `wake`
+  credential wakes only the sessions of its account.
+
 ## 3. Set up a workstation
 
 Install the client:
@@ -287,13 +308,20 @@ release will remove the legacy request forms.
 
 ### Rollback
 
-The server's index migrations only add to the schema, and an older server
-ignores the migrations that it does not know. Thus a rollback to an older
-server image works with the same data directory. An older server does not
-update the copies of the latest status and metadata in the session rows, which
-the session list uses. When the newer server starts again, it finds the events
-that the older server wrote, fills the copies of these sessions again, and
-logs `new copies for N sessions`. No admin step is necessary.
+The server's index migrations keep every table and column that an older server
+uses, and an older server ignores the migrations that it does not know. Thus a
+rollback to an older server image works with the same data directory. An older
+server does not update the copies of the latest status and metadata in the
+session rows, which the session list uses. When the newer server starts again,
+it finds the events that the older server wrote, fills the copies of these
+sessions again, and logs `new copies for N sessions`. No admin step is
+necessary.
+
+One exception: from the version that keys teleports by session, two sessions
+can have the same teleport id. An older server looks a teleport id up in the
+whole index, so after a rollback it can refuse a retry of a teleport whose id
+another session also has. A normal client never does that: it makes its
+teleport ids at random.
 
 ## 4. Teleport a session
 
