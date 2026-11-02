@@ -606,12 +606,29 @@ def test_effort_is_the_last_main_chain_value(tmp_path: Path) -> None:
     assert ClaudeCode.effort(tmp_path / "missing.jsonl") is None
 
 
+def test_model_is_the_requested_model_with_its_route(tmp_path: Path) -> None:
+    fake = FakeClaude(tmp_path)
+    path = fake.transcript("/w")
+    bare = text_reply("a")
+    bare["message"]["model"] = "gpt-6.1-sol"
+    fake.write(path, prompt("go"), bare)
+    # The backend's name has no route, thus it does not count.
+    assert ClaudeCode.model(path) is None
+    fake.write(
+        path,
+        {**text_reply("b"), "requestedModel": "openai:gpt-6.1-sol"},
+        {**text_reply("c"), "requestedModel": "-p"},
+        {**text_reply("d"), "requestedModel": "claude-x", "isSidechain": True},
+    )
+    assert ClaudeCode.model(path) == "openai:gpt-6.1-sol"
+
+
 def test_effort_reads_back_in_steps_to_a_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("hyperspace_client.adapters.claude_code._TAIL_STEP", 1024)
     monkeypatch.setattr(
-        "hyperspace_client.adapters.claude_code._EFFORT_WINDOW", 64 * 1024
+        "hyperspace_client.adapters.claude_code._TURN_WINDOW", 64 * 1024
     )
     fake = FakeClaude(tmp_path)
     path = fake.transcript("/w")

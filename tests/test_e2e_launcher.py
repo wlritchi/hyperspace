@@ -23,6 +23,7 @@ import pytest
 
 from _hs import FakeClaude, Server, make_server, prompt, text_reply
 from hyperspace_client import launcher as launcher_mod
+from hyperspace_client.adapters import claude_code as claude_code_mod
 from hyperspace_client.adapters.claude_code import ClaudeCode, ContinuedFrom
 from hyperspace_client.api import Api, ApiError
 from hyperspace_client.backfill import Runner, RunResult
@@ -1266,9 +1267,23 @@ def test_a_job_with_a_worktree_resumes_with_its_saved_options(
     sid = held_session(ctx, fake, tmp_path / "ws")
     set_status(ctx, sid, "working")
     # A job with a worktree resumes with no options, because options with its
-    # record make a copy. Thus the launcher also gives no --effort.
-    fake.write(host.find_transcripts(sid)[0], {**text_reply(), "effort": "low"})
-    job(fake, sid[:8], sid, state="stopped", worktreePath=str(tmp_path / "ws"))
+    # record make a copy. Thus the launcher puts the model and the effort
+    # level of the last turn into the saved options.
+    last_turn = {
+        **text_reply(),
+        "requestedModel": "openai:gpt-6.1-sol",
+        "effort": "low",
+    }
+    fake.write(host.find_transcripts(sid)[0], last_turn)
+    saved = ["--name", "w", "--effort", "high", "--model=opus", "--agent", "a"]
+    path = job(
+        fake,
+        sid[:8],
+        sid,
+        state="stopped",
+        worktreePath=str(tmp_path / "ws"),
+        respawnFlags=saved,
+    )
     run = runner(ctx, host, Bg(), Clock())
     fake_jobs(fake, monkeypatch, run)
     calls: list[list[str]] = []
@@ -1286,6 +1301,60 @@ def test_a_job_with_a_worktree_resumes_with_its_saved_options(
     assert job_ids(fake) == {sid[:8]: sid}
     assert f"the job {sid[:8]} has a worktree" in caplog.text
     assert "copied" not in caplog.text
+    record = json.loads(path.read_text())
+    assert record["respawnFlags"] == [
+        "--name",
+        "w",
+        "--agent",
+        "a",
+        "--model",
+        "openai:gpt-6.1-sol",
+        "--effort",
+        "low",
+    ]
+    assert record["worktreePath"] == str(tmp_path / "ws")
+    assert "with the model openai:gpt-6.1-sol and the effort low" in caplog.text
+
+
+def test_saved_options_change_only_for_a_new_value(fake: FakeClaude) -> None:
+    flags = ["--effort", "low", "--model", "sonnet"]
+    path = job(fake, "j1", "s", respawnFlags=flags)
+    before = path.stat().st_mtime_ns
+    assert fake.adapter.set_saved_options("j1", "sonnet", "low") is False
+    assert fake.adapter.set_saved_options("j1", None, None) is False
+    assert path.stat().st_mtime_ns == before
+    assert fake.adapter.set_saved_options("j1", None, "high") is True
+    assert json.loads(path.read_text())["respawnFlags"] == [
+        "--model",
+        "sonnet",
+        "--effort",
+        "high",
+    ]
+    # Saved options that are not a list of strings stay as they are.
+    for odd in (None, "--model x", ["--model", 1]):
+        job(fake, "j2", "s", respawnFlags=odd)
+        assert fake.adapter.set_saved_options("j2", "haiku", "max") is False
+    assert fake.adapter.set_saved_options("../j1", "haiku", "max") is False
+
+
+def test_saved_options_keep_a_state_that_changed_after_the_read(
+    fake: FakeClaude, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = job(fake, "j1", "s", state="stopped", respawnFlags=["--model", "x"])
+    read = claude_code_mod._read_state
+    running = {"sessionId": "s", "state": "working", "respawnFlags": ["--model", "x"]}
+
+    def read_then_start(p: Path) -> dict[str, Any] | None:
+        # Claude Code starts the job between the read and the write.
+        record = read(p)
+        p.write_text(json.dumps(running))
+        os.utime(p, ns=(1, 1))
+        return record
+
+    monkeypatch.setattr(claude_code_mod, "_read_state", read_then_start)
+    assert fake.adapter.set_saved_options("j1", "haiku", "max") is False
+    assert json.loads(path.read_text()) == running
+    assert [p.name for p in path.parent.iterdir()] == ["state.json"]
 
 
 def test_a_job_with_a_worktree_that_fails_at_its_start_is_a_failed_resume(

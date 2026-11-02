@@ -28,7 +28,7 @@ from typing import Any, cast
 
 import httpx
 
-from hyperspace_client.adapters.claude_code import ClaudeCode, Job
+from hyperspace_client.adapters.claude_code import ClaudeCode, Job, without_option
 from hyperspace_client.api import ApiError, NotFound
 from hyperspace_client.backfill import Runner, RunResult, child_env
 from hyperspace_client.state import State
@@ -258,20 +258,6 @@ def send_heartbeat(
     if final:
         request["final"] = True
     ctx.api.heartbeat(request)
-
-
-def _without_effort(args: list[str]) -> list[str]:
-    """`args` without `--effort <level>` and `--effort=<level>`."""
-    out: list[str] = []
-    skip = False
-    for arg in args:
-        if skip:
-            skip = False
-        elif arg == "--effort":
-            skip = True
-        elif not arg.startswith("--effort="):
-            out.append(arg)
-    return out
 
 
 def _reason(code: int, output: str) -> str:
@@ -685,7 +671,8 @@ class Launcher:
         `claude rm` first. A job with a worktree stays, because `claude rm`
         can remove the worktree, which can be the session's workspace. Its
         resume has no options, and then continues the session with the
-        job's saved options."""
+        job's saved options. Thus the launcher first gives them the
+        session's own model and effort level."""
         jobs = [j for j in self.adapter.jobs() if j.own_id == sid]
         if not jobs:
             return self._session_options(sid), None
@@ -696,7 +683,7 @@ class Launcher:
                 sid,
                 kept.short,
             )
-            return [], kept
+            return [], self._keep_session_options(sid, kept)
         for job in jobs:
             # Never with --discard-unpushed or --force-remove-worktree: a
             # refusal keeps the work, and the user decides.
@@ -715,7 +702,43 @@ class Launcher:
         """The launcher's Claude Code options, with the session's own effort
         level in place of an effort level in them. Claude Code 2.1.301
         `claude --resume` takes the model from the transcript, but not the
-        effort level. The newest transcript of the session gives it."""
+        effort level."""
+        newest = self._newest_transcript(sid)
+        effort = self.adapter.effort(newest) if newest else None
+        if effort is None:
+            return self.claude_args
+        return [*without_option(self.claude_args, "--effort"), "--effort", effort]
+
+    def _keep_session_options(self, sid: str, kept: Job) -> Job:
+        """Give the saved options of the job `kept` the model and the effort
+        level of the session's last turn, and return the job as it is then.
+        The saved options come from the start of the job, and the resume
+        uses them in place of the model in the transcript."""
+        newest = self._newest_transcript(sid)
+        if newest is None:
+            return kept
+        model, effort = self.adapter.model(newest), self.adapter.effort(newest)
+        try:
+            changed = self.adapter.set_saved_options(kept.short, model, effort)
+        except OSError as exc:
+            log.warning("%s: the saved options of job %s: %s", sid, kept.short, exc)
+            return kept
+        if not changed:
+            return kept
+        log.info(
+            "%s: the job %s resumes with the model %s and the effort %s of its"
+            " last turn",
+            sid,
+            kept.short,
+            model or "it saved",
+            effort or "it saved",
+        )
+        # Read the job again: `_start_failure` takes a change of the time of
+        # its state as the new start, and the rewrite changed that time.
+        return self.adapter.job(kept.short) or kept
+
+    def _newest_transcript(self, sid: str) -> Path | None:
+        """The session's local transcript that changed last, or None."""
         newest: tuple[float, Path] | None = None
         for path in self.adapter.find_transcripts(sid):
             try:
@@ -724,10 +747,7 @@ class Launcher:
                 continue
             if newest is None or mtime > newest[0]:
                 newest = (mtime, path)
-        effort = self.adapter.effort(newest[1]) if newest else None
-        if effort is None:
-            return self.claude_args
-        return [*_without_effort(self.claude_args), "--effort", effort]
+        return newest[1] if newest else None
 
     def _copy_id(self, sid: str, before: set[str], output: str) -> str | None:
         """The id of a copy that `claude --bg --resume` started in place of

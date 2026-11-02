@@ -15,11 +15,12 @@ import json
 import os
 import re
 import sys
+import tempfile
 from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, cast
 
 from hyperspace_client.adapters import (
     LocalFile,
@@ -106,11 +107,13 @@ _SERVER_KEYS = (
 _SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}")
 # The excerpt comes from the end of the transcript only.
 _EXCERPT_WINDOW = 256 * 1024
-# `effort` reads at most this much of the end of a transcript.
-_EFFORT_WINDOW = 16 * 1024 * 1024
-# An effort level, for example `high`. The value goes to `claude --effort`,
-# thus it must not look like an option.
+# `effort` and `model` read at most this much of the end of a transcript.
+_TURN_WINDOW = 16 * 1024 * 1024
+# An effort level, for example `high`, and a model with an optional route,
+# for example `openai:gpt-6.1-sol`. The values go to `claude --effort` and
+# `claude --model`, thus they must not look like options.
 _EFFORT = re.compile(r"[a-z]{1,16}")
+_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
 # One line of `format_tail` for a tool call shows at most this much input.
 _TOOL_SUMMARY = 100
 
@@ -188,6 +191,90 @@ def _read_state(path: Path) -> dict[str, Any] | None:
     except (OSError, ValueError):
         return None
     return state if isinstance(state, dict) else None  # pyright: ignore[reportUnknownVariableType]
+
+
+def _stamp(path: Path) -> tuple[int, int, int]:
+    """What changes when a file is written or replaced."""
+    st = path.stat()
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _replace(path: Path, data: bytes, seen: tuple[int, int, int]) -> bool:
+    """Write `path` in one step (by rename), with the mode it had, if its
+    `_stamp` is still `seen`. Return True if it wrote."""
+    mode = path.stat().st_mode & 0o7777
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".hyperspace-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        if _stamp(path) != seen:
+            Path(tmp).unlink()
+            return False
+        os.replace(tmp, path)
+        return True
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def without_option(args: list[str], option: str) -> list[str]:
+    """`args` without `<option> <value>` and `<option>=<value>`."""
+    out: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg == option:
+            skip = True
+        elif not arg.startswith(f"{option}="):
+            out.append(arg)
+    return out
+
+
+def option_value(args: list[str], option: str) -> str | None:
+    """The value of the last `<option> <value>` or `<option>=<value>` in
+    `args`, or None."""
+    value: str | None = None
+    for i, arg in enumerate(args):
+        if arg == option and i + 1 < len(args):
+            value = args[i + 1]
+        elif arg.startswith(f"{option}="):
+            value = arg.split("=", 1)[1]
+    return value
+
+
+def _last_turn_value(
+    transcript: Path, key: str, pattern: re.Pattern[str]
+) -> str | None:
+    """The value of `key` in the last main-chain assistant record where it
+    matches `pattern`, read back from the end of the transcript, at most
+    `_TURN_WINDOW` bytes, or None."""
+    try:
+        with open(transcript, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            step = _TAIL_STEP
+            while True:
+                start = max(0, size - step)
+                f.seek(start)
+                data = f.read()
+                if start:
+                    data = data[data.find(b"\n") + 1 :]
+                for record in reversed(_records(data)):
+                    value = record.get(key)
+                    if (
+                        _is_assistant(record)
+                        and isinstance(value, str)
+                        and pattern.fullmatch(value)
+                    ):
+                        return value
+                if start == 0 or step >= _TURN_WINDOW:
+                    return None
+                step = min(step * 4, _TURN_WINDOW)
+    except OSError:
+        return None
 
 
 def _walk(root: Path) -> list[Path]:
@@ -1116,32 +1203,49 @@ class ClaudeCode:
 
     @staticmethod
     def effort(transcript: Path) -> str | None:
-        """The effort level of the last main-chain assistant record that
-        has one, read from the end of the transcript, or None. Claude Code
+        """The effort level of the session's last turn, or None. Claude Code
         writes the effort of the turn into each assistant record."""
+        return _last_turn_value(transcript, "effort", _EFFORT)
+
+    @staticmethod
+    def model(transcript: Path) -> str | None:
+        """The model of the session's last turn, with its route, or None.
+        Claude Code writes the model that it asked for (`requestedModel`)
+        into each assistant record. The model in the message is the name
+        that the backend gives, without the route."""
+        return _last_turn_value(transcript, "requestedModel", _MODEL)
+
+    def set_saved_options(
+        self, short: str, model: str | None, effort: str | None
+    ) -> bool:
+        """Give `--model` and `--effort` in the saved options of the job
+        `short` the values `model` and `effort` (None: no change). A bare
+        `claude --bg --resume` uses the saved options, and Claude Code
+        2.1.301 also uses changed ones. Return True if the state changed.
+        Leave a state whose saved options are not a list of strings."""
+        if not _JOB_NAME.fullmatch(short):
+            return False
+        path = self.config_dir / "jobs" / short / "state.json"
         try:
-            with open(transcript, "rb") as f:
-                size = f.seek(0, os.SEEK_END)
-                step = _TAIL_STEP
-                while True:
-                    start = max(0, size - step)
-                    f.seek(start)
-                    data = f.read()
-                    if start:
-                        data = data[data.find(b"\n") + 1 :]
-                    for record in reversed(_records(data)):
-                        value = record.get("effort")
-                        if (
-                            _is_assistant(record)
-                            and isinstance(value, str)
-                            and _EFFORT.fullmatch(value)
-                        ):
-                            return value
-                    if start == 0 or step >= _EFFORT_WINDOW:
-                        return None
-                    step = min(step * 4, _EFFORT_WINDOW)
+            seen = _stamp(path)
         except OSError:
-            return None
+            return False
+        record = _read_state(path)
+        flags: Any = record.get("respawnFlags") if record else None
+        if record is None or not isinstance(flags, list):
+            return False
+        old: list[Any] = flags  # pyright: ignore[reportUnknownVariableType]
+        if not all(isinstance(f, str) for f in old):
+            return False
+        new = cast(list[str], old)
+        for option, value in (("--model", model), ("--effort", effort)):
+            if value is not None and option_value(new, option) != value:
+                new = [*without_option(new, option), option, value]
+        if new is old:
+            return False
+        record["respawnFlags"] = new
+        # If Claude Code wrote the state after the read, keep its state.
+        return _replace(path, json.dumps(record).encode(), seen)
 
     @staticmethod
     def excerpt(transcript: Path) -> str | None:
