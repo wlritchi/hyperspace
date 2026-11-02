@@ -21,6 +21,7 @@ from pathlib import Path
 from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import NotFound
+from hyperspace_client.config import SESSION_VARS
 from hyperspace_client.sync import Context
 
 log = logging.getLogger(__name__)
@@ -52,10 +53,6 @@ RESTRICTIONS = (
     "--permission-mode",
     "dontAsk",
 )
-# The variables of a Claude Code session that runs this command. The resumed
-# session must not get them, or `hyperspace status` would act on the wrong
-# session.
-_SESSION_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_JOB_DIR")
 # Set for a backfill turn: `hyperspace status`, `done` and `reopen` then act
 # only on the session of the turn, and not as the user. The allow rules
 # permit the commands with any arguments.
@@ -104,7 +101,7 @@ Runner = Callable[[list[str], str, float], RunResult]
 
 def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment for a `claude` that this client starts."""
-    env = {k: v for k, v in os.environ.items() if k not in _SESSION_VARS}
+    env = {k: v for k, v in os.environ.items() if k not in SESSION_VARS}
     env.update(extra or {})
     return env
 

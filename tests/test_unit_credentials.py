@@ -206,6 +206,28 @@ def test_a_backend_that_is_not_installed_says_how_to_install_it() -> None:
 # --- login, whoami, logout ----------------------------------------------------
 
 
+# --- The launcher's secrets ---------------------------------------------------
+
+SECRET = ("hyperspace", "env:RELAY_TOKEN")
+
+
+def test_a_keyring_read_of_the_token_also_reads_the_secrets(
+    tmp_path: Path, fake_keyring: MemoryKeyring, token_cache: MemoryCache
+) -> None:
+    fake_keyring.items[KEY] = "from-keyring"
+    fake_keyring.items[SECRET] = "s3cret"
+    secrets = ["RELAY_TOKEN", "NOT_STORED"]
+    cfg = cfg_with(tmp_path, keyring_use="once", launcher_secret_env=secrets)
+    assert cfg.require_server() == (URL, "from-keyring")
+    assert token_cache.items["env:RELAY_TOKEN"] == "s3cret"
+    assert "env:NOT_STORED" not in token_cache.items
+    # A token from the cache does not read the keyring for a secret.
+    reads = fake_keyring.reads
+    del token_cache.items["env:RELAY_TOKEN"]
+    cfg_with(tmp_path, keyring_use="once", launcher_secret_env=secrets).require_server()
+    assert fake_keyring.reads == reads
+
+
 @pytest.fixture
 def server(tmp_path: Path) -> Iterator[Server]:
     s = make_server(tmp_path / "data")
@@ -273,6 +295,39 @@ def test_login_whoami_logout(
     assert fake_keyring.items == {} and token_cache.items == {}
     assert run(monkeypatch, "whoami") == 2
     assert "hyperspace login" in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("cli_env")
+def test_secret_set_load_forget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fake_keyring: MemoryKeyring,
+    token_cache: MemoryCache,
+) -> None:
+    assert run(monkeypatch, "secret", "set", "RELAY_TOKEN", "--stdin", stdin="v\n") == 0
+    assert fake_keyring.items[SECRET] == "v"
+    assert token_cache.items["env:RELAY_TOKEN"] == "v"
+    out, err = capsys.readouterr()
+    assert "stored RELAY_TOKEN in the keyring" in out
+    assert "not in launcher_secret_env" in err
+    assert run(monkeypatch, "secret", "set", "HYPERSPACE_X", "--stdin", stdin="v") == 2
+    assert run(monkeypatch, "secret", "load") == 2
+    config = tmp_path / "config" / "hyperspace" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('launcher_secret_env = ["RELAY_TOKEN", "OTHER"]\n')
+    token_cache.items.clear()
+    capsys.readouterr()
+    assert run(monkeypatch, "secret", "load") == 1
+    out, err = capsys.readouterr()
+    assert "read RELAY_TOKEN into the token cache" in out
+    assert "not in the keyring: OTHER" in err
+    assert token_cache.items["env:RELAY_TOKEN"] == "v"
+    assert run(monkeypatch, "secret", "forget", "RELAY_TOKEN") == 0
+    assert "from the keyring and the cache" in capsys.readouterr().out
+    assert SECRET not in fake_keyring.items and token_cache.items == {}
+    assert run(monkeypatch, "secret", "forget", "RELAY_TOKEN") == 0
+    assert "RELAY_TOKEN is not stored" in capsys.readouterr().out
 
 
 @pytest.mark.usefixtures("cli_env")

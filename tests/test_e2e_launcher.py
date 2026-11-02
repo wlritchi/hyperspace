@@ -15,14 +15,14 @@ import socket
 import sys
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
-from _hs import FakeClaude, Server, make_server, prompt, text_reply
+from _hs import FakeClaude, MemoryCache, Server, make_server, prompt, text_reply
 from hyperspace_client import launcher as launcher_mod
 from hyperspace_client.adapters import claude_code as claude_code_mod
 from hyperspace_client.adapters.claude_code import ClaudeCode, ContinuedFrom
@@ -44,6 +44,7 @@ from hyperspace_client.launcher import (
     START_CHECK,
     START_RETRY,
     Launcher,
+    ResumeEnv,
     close_after_exit,
     close_job,
     host_lock,
@@ -759,9 +760,13 @@ class Bg:
     def __init__(self, code: int = 0) -> None:
         self.code = code
         self.calls: list[tuple[list[str], str]] = []
+        self.envs: list[Mapping[str, str]] = []
 
-    def __call__(self, argv: list[str], cwd: str, timeout: float) -> RunResult:
+    def __call__(
+        self, argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
         self.calls.append((argv, cwd))
+        self.envs.append(env)
         return RunResult(self.code, "" if self.code == 0 else "no such session")
 
 
@@ -1016,6 +1021,77 @@ def test_resume_limit(
     assert sid not in run._limited  # pyright: ignore[reportPrivateUsage]
 
 
+def test_a_resume_gets_the_launchers_environment(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    token_cache: MemoryCache,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    bg = Bg(code=1)
+    clock = Clock()
+    env = ResumeEnv({"RELAY_URL": "wss://relay.test"}, ["RELAY_TOKEN"], 600)
+    run = runner(ctx, host, bg, clock, resume_env=env)
+    # With no value for a secret, the session does not resume, and the
+    # held resumes do not count toward the limit.
+    for _ in range(MAX_RESUMES + 2):
+        run.tick()
+        clock.t += 60
+    assert bg.calls == []
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "no value for RELAY_TOKEN in the token cache" in errors[0].getMessage()
+    token_cache.items["env:RELAY_TOKEN"] = "s3cret"
+    run.tick()
+    assert bg.envs == [{"RELAY_URL": "wss://relay.test", "RELAY_TOKEN": "s3cret"}]
+    # The launcher keeps the value after its cache entry goes.
+    token_cache.items.clear()
+    clock.t += 60
+    run.tick()
+    assert bg.envs[-1]["RELAY_TOKEN"] == "s3cret"
+
+
+def test_run_bg_adds_the_environment(tmp_path: Path) -> None:
+    out = tmp_path / "env"
+    argv = [
+        sys.executable,
+        "-c",
+        f"import os; open({str(out)!r}, 'w').write(os.environ['X_TEST'])",
+    ]
+    assert run_bg(argv, str(tmp_path), 30, {"X_TEST": "v"}).returncode == 0
+    assert out.read_text() == "v"
+
+
+def test_launcher_env_config(tmp_path: Path) -> None:
+    toml = tmp_path / "config.toml"
+    toml.write_text(
+        'launcher_secret_env = ["RELAY_TOKEN", "RELAY_TOKEN"]\n'
+        '[launcher_env]\nRELAY_URL = "wss://relay.test"\n'
+    )
+    cfg = load({}, toml)
+    assert cfg.launcher_env == {"RELAY_URL": "wss://relay.test"}
+    assert cfg.launcher_secret_env == ["RELAY_TOKEN"]
+    assert load({}, tmp_path / "none.toml").launcher_env == {}
+    for bad, match in (
+        ('launcher_env = ["A"]\n', "table"),
+        ("[launcher_env]\nA = 1\n", "must be a string"),
+        ('[launcher_env]\n"1A" = "x"\n', "not an environment variable name"),
+        ('[launcher_env]\nHYPERSPACE_TOKEN = "x"\n', "cannot contain"),
+        ('launcher_secret_env = ["CLAUDE_JOB_DIR"]\n', "cannot contain"),
+        ('launcher_secret_env = "A"\n', "list of names"),
+        (
+            'launcher_secret_env = ["A"]\n[launcher_env]\nA = "x"\n',
+            "in launcher_env and",
+        ),
+    ):
+        toml.write_text(bad)
+        with pytest.raises(ConfigError, match=match):
+            load({}, toml)
+
+
 def job_bg(
     fake: FakeClaude, monkeypatch: pytest.MonkeyPatch, job_state: object
 ) -> Runner:
@@ -1026,8 +1102,10 @@ def job_bg(
     raw = job_state if isinstance(job_state, str) else json.dumps(job_state)
     monkeypatch.setenv("FAKE_CLAUDE_JOB_STATE", raw)
 
-    def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
-        return run_bg([sys.executable, FAKE, *argv[1:]], cwd, timeout)
+    def bg(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
+        return run_bg([sys.executable, FAKE, *argv[1:]], cwd, timeout, env)
 
     return bg
 
@@ -1150,8 +1228,10 @@ def fake_jobs(fake: FakeClaude, monkeypatch: pytest.MonkeyPatch, run: Launcher) 
     monkeypatch.setenv("FAKE_CLAUDE_MODE", "resume")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake.root))
 
-    def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
-        return run_bg([sys.executable, FAKE, *argv[1:]], cwd, timeout)
+    def bg(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
+        return run_bg([sys.executable, FAKE, *argv[1:]], cwd, timeout, env)
 
     def rm(argv: list[str]) -> tuple[int, str]:
         return run_rm([sys.executable, FAKE, *argv[1:]])
@@ -1306,9 +1386,11 @@ def test_a_job_with_a_worktree_resumes_with_its_saved_options(
     calls: list[list[str]] = []
     bg, rm = run.run_claude, Rm(ctx)
 
-    def counted(argv: list[str], cwd: str, timeout: float) -> RunResult:
+    def counted(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
         calls.append(argv)
-        return bg(argv, cwd, timeout)
+        return bg(argv, cwd, timeout, env)
 
     run.run_claude, run.run_rm = counted, rm
     assert run.resume(sid, RESUME_WORKING) is True
@@ -1381,8 +1463,10 @@ def test_a_job_with_a_worktree_that_fails_at_its_start_is_a_failed_resume(
     fake_jobs(fake, monkeypatch, run)
     bg = run.run_claude
 
-    def fails(argv: list[str], cwd: str, timeout: float) -> RunResult:
-        result = bg(argv, cwd, timeout)
+    def fails(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
+        result = bg(argv, cwd, timeout, env)
         state = json.loads(path.read_text())
         path.write_text(json.dumps({**state, "state": "failed", "detail": "exit 1"}))
         return result
@@ -1704,11 +1788,13 @@ def test_resume_holds_the_session_lock_only_through_the_launch(
     monkeypatch.setenv("FAKE_CLAUDE_PIDFILE", str(pidfile))
     held: list[bool] = []
 
-    def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
+    def bg(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
         with ctx.state.try_lock(HARNESS, sid) as free:
             held.append(not free)
         # The fake starts a daemon that continues to run, as `claude --bg` can.
-        return run_bg([sys.executable, FAKE, *argv[1:]], cwd, timeout)
+        return run_bg([sys.executable, FAKE, *argv[1:]], cwd, timeout, env)
 
     run = runner(ctx, host, Bg(), Clock())
     run.run_claude = bg
@@ -1778,7 +1864,9 @@ def test_a_checkpoint_that_the_launch_blocks_runs_after_it(
             hooked.append(args)
             assert main(args) == 0
 
-        def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
+        def bg(
+            argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+        ) -> RunResult:
             # Before `claude --bg` returns (or times out), the session runs a
             # short turn. Its Stop hook starts a checkpoint, which does not
             # get the session's lock.

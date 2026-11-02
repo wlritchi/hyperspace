@@ -286,6 +286,29 @@ launcher_claude_args = [
 Do not put `--model` in this list: the resume takes the model from the
 session's transcript, and `--model` replaces it.
 
+If the relay needs values from the environment, for example its server URL and
+its token, give them to the launcher's resumes in `config.toml` too. Put a
+secret in the keyring, not in the file:
+
+```toml
+launcher_secret_env = ["RELAY_TOKEN"]
+
+[launcher_env]
+RELAY_URL = "wss://relay.example.com"
+```
+
+```sh
+hyperspace secret set RELAY_TOKEN
+```
+
+The launcher reads secrets only from the token cache, because a service cannot
+answer a passphrase prompt. After a reboot, a command that reads the token
+from the keyring also reads the secrets, for example the first `hyperspace`
+command, or the sync at the first session start. While a secret has no value,
+the launcher does not resume a session and logs an error. If this happens, or
+if the token comes from a file, run `hyperspace secret load`. See "The
+environment of a resume" in the [spec](specs/2026-10-12-hyperspace.md).
+
 The launcher refuses some options in this list, and the last option must not
 take a list of values; see "At boot: the launcher" in
 [runners.md](runners.md). A launcher without `--stay` does not act on wakes:

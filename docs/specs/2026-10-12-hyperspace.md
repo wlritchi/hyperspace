@@ -1145,6 +1145,37 @@ the user is logged in. There is no cache, and all hooks read the Keychain
 directly, but only when it is unlocked, so that a hook never shows the unlock
 dialog.
 
+#### The environment of a resume
+
+A session that the launcher resumes can need values that the launcher's own
+environment does not have, for example the token of a message relay. Two
+settings give them to each `claude --bg` that the launcher runs:
+
+- `launcher_env`: a table of names and values.
+- `launcher_secret_env`: a list of names. The value of each name comes from
+  the system keyring (user name `env:<name>`), through the token cache.
+
+`hyperspace secret set <name>` stores a value in the keyring and the cache.
+`hyperspace secret forget <name>` removes it from both. When a process reads
+the token from the keyring, it also reads each secret that is not in the
+cache, so that after a reboot one prompt fills both. `hyperspace secret load`
+reads the secrets on request, for example when the token comes from a file.
+
+The launcher reads the secrets only from the cache (on macOS, from an unlocked
+Keychain), at each tick, so that the cache stays alive. It keeps the last
+value that it read. If a secret has no value, the launcher does not resume a
+session, because without its relay a session does not get its messages. It
+logs an error, and tries again at the next tick. Such a resume does not count
+toward the resume limit.
+
+A name must be a valid environment variable name. The client refuses names
+that start with `HYPERSPACE_`, the names that the client removes from the
+environment of a `claude` that it starts (`CLAUDE_CODE_SESSION_ID` and
+`CLAUDE_JOB_DIR`), and a name in both settings.
+
+Each value is in the environment of each session that the launcher resumes,
+and the agent can read it. Give only values that each session can hold.
+
 ### Sync engine
 
 - `hyperspace sync --transcript <path>` syncs one session.

@@ -357,6 +357,47 @@ def cmd_logout(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def cmd_secret(args: argparse.Namespace, cfg: Config) -> int:
+    configured = cfg.launcher_secret_env
+    if args.action == "load":
+        if not configured:
+            raise Exit(2, "no names in launcher_secret_env in config.toml")
+        absent = credentials.load_secrets(configured, cfg.token_cache_ttl)
+        found = [n for n in configured if n not in absent]
+        if found:
+            print(f"read {', '.join(found)} into the token cache")
+        if absent:
+            raise Exit(1, f"not in the keyring: {', '.join(absent)}")
+        return 0
+    name = config_mod.check_env_name(args.name, "the secret name")
+    if args.action == "forget":
+        in_keyring, in_cache = credentials.forget_secret(name)
+        places = [p for p, had in (("keyring", in_keyring), ("cache", in_cache)) if had]
+        print(
+            f"removed {name} from the {' and the '.join(places)}"
+            if places
+            else f"{name} is not stored"
+        )
+        return 0
+    if args.stdin:
+        value = sys.stdin.read().rstrip("\r\n")
+    elif sys.stdin.isatty():
+        value = getpass.getpass(f"{name}: ")
+    else:
+        raise Exit(2, "no terminal: give the value on stdin with --stdin")
+    if not value or "\0" in value:
+        raise Exit(2, "the value must be a non-empty string with no NUL")
+    backend = credentials.store_secret(name, value, cfg.token_cache_ttl)
+    print(f"stored {name} in the keyring ({backend})")
+    if name not in configured:
+        print(
+            f"hyperspace: {name} is not in launcher_secret_env in config.toml, "
+            "so the launcher does not use it",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def cmd_hook(args: argparse.Namespace, cfg: Config) -> int:
     """The entry point for harness hooks: the hook's JSON is on stdin. A hook
     must never fail the session, so this always exits 0."""
@@ -963,6 +1004,14 @@ def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
                 return 0
             ctx = _context(cfg, state)
             ctx.api.list_timeout = launcher.LIST_TIMEOUT
+            env = launcher.ResumeEnv(
+                cfg.launcher_env, cfg.launcher_secret_env, cfg.token_cache_ttl
+            )
+
+            def before_tick() -> None:
+                _refresh_token(cfg, ctx)
+                env.refresh()
+
             try:
                 # A runner's main process must not stop when the server is
                 # not available for a short time at its start.
@@ -977,10 +1026,11 @@ def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
                     cfg.claude_bin,
                     cfg.heartbeat_interval,
                     None if args.stay or args.runner else cfg.launcher_idle_exit,
-                    before_tick=lambda: _refresh_token(cfg, ctx),
+                    before_tick=before_tick,
                     runner=args.runner,
                     stay=args.stay,
                     claude_args=cfg.launcher_claude_args,
+                    resume_env=env,
                     workspace=str(Path.cwd().resolve()),
                 ).run()
             finally:
@@ -1149,6 +1199,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("logout", help="remove the token from the keyring and cache")
     p.set_defaults(func=cmd_logout)
+
+    p = sub.add_parser(
+        "secret", help="manage values for the environment of the launcher's resumes"
+    )
+    actions = p.add_subparsers(dest="action", required=True)
+    q = actions.add_parser("set", help="store a value in the keyring and the cache")
+    q.add_argument("name", help="the environment variable, from launcher_secret_env")
+    q.add_argument("--stdin", action="store_true", help="read the value from stdin")
+    q = actions.add_parser("forget", help="remove a value from the keyring and cache")
+    q.add_argument("name")
+    actions.add_parser(
+        "load", help="read the values of launcher_secret_env into the token cache"
+    )
+    p.set_defaults(func=cmd_secret)
 
     p = sub.add_parser("ls", help="list sessions on the server")
     p.add_argument("--harness")

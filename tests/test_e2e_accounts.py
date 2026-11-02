@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -418,7 +418,9 @@ def test_b_launcher_acts_only_on_b(env: Env, tmp_path: Path) -> None:
 
     calls: list[tuple[list[str], str]] = []
 
-    def run_claude(argv: list[str], cwd: str, timeout: float) -> RunResult:
+    def run_claude(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
         calls.append((argv, cwd))
         return RunResult(0, "")
 

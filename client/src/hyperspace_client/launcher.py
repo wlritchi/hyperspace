@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,9 +29,11 @@ from typing import Any, cast
 
 import httpx
 
+from hyperspace_client import credentials
 from hyperspace_client.adapters.claude_code import ClaudeCode, Job, without_option
 from hyperspace_client.api import ApiError, NotFound
-from hyperspace_client.backfill import Runner, RunResult, child_env
+from hyperspace_client.backfill import RunResult, child_env
+from hyperspace_client.credentials import CredentialError
 from hyperspace_client.state import State
 from hyperspace_client.status import clean_note, end_continued, printable
 from hyperspace_client.sync import Context, register_host
@@ -156,16 +158,23 @@ def source_id(config_dir: Path) -> str:
     return hashlib.sha256(str(config_dir.resolve()).encode()).hexdigest()[:16]
 
 
-def run_bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
-    """Run `claude --bg`. It can start the Claude Code daemon, which then
-    keeps the open files of the command and runs every background job. So
-    the output goes to a file, not a pipe that the daemon keeps open, and a
-    timeout stops only the command, not its process group."""
+# Runs `claude --bg`. The last argument is added to the command's environment.
+BgRunner = Callable[[list[str], str, float, Mapping[str, str]], RunResult]
+
+
+def run_bg(
+    argv: list[str], cwd: str, timeout: float, env: Mapping[str, str] | None = None
+) -> RunResult:
+    """Run `claude --bg`, with `env` added to its environment. It can start
+    the Claude Code daemon, which then keeps the open files of the command
+    and runs every background job. So the output goes to a file, not a pipe
+    that the daemon keeps open, and a timeout stops only the command, not its
+    process group."""
     with tempfile.TemporaryFile("w+", errors="replace") as out:
         proc = subprocess.Popen(
             argv,
             cwd=cwd,
-            env=child_env(),
+            env=child_env(env),
             stdin=subprocess.DEVNULL,
             stdout=out,
             stderr=subprocess.STDOUT,
@@ -472,6 +481,38 @@ def connect(
         delay = min(delay * 2, START_RETRY_MAX)
 
 
+@dataclass
+class ResumeEnv:
+    """The environment that the launcher adds to its resumes: `values`, and
+    the `secrets` from the token cache (see "The environment of a resume" in
+    the spec)."""
+
+    values: Mapping[str, str] = field(default_factory=dict[str, str])
+    secrets: Sequence[str] = ()
+    ttl: int = 86400
+    # The last value read of each secret, so that a value stays after its
+    # cache entry goes.
+    _last: dict[str, str] = field(default_factory=dict[str, str])
+
+    def refresh(self) -> None:
+        """Read the secrets from the cache. Each read keeps the cache alive."""
+        for name in self.secrets:
+            value = credentials.cached_secret(name, self.ttl)
+            if value:
+                self._last[name] = value
+
+    def __call__(self) -> dict[str, str]:
+        """The environment. Raise `CredentialError` if a secret has no value."""
+        self.refresh()
+        missing = [name for name in self.secrets if name not in self._last]
+        if missing:
+            raise CredentialError(
+                f"no value for {', '.join(missing)} in the token cache: run "
+                "`hyperspace secret load`, or `hyperspace secret set <name>`"
+            )
+        return {**self.values, **self._last}
+
+
 def needs_process(
     summary: SessionSummary, host: str, running: bool, runner: bool = True
 ) -> str | None:
@@ -519,7 +560,8 @@ class Launcher:
     claude_args: list[str] = field(default_factory=list[str])
     # The workspace for a held session that has no workspace of its own.
     workspace: str = ""
-    run_claude: Runner = run_bg
+    run_claude: BgRunner = run_bg
+    resume_env: Callable[[], Mapping[str, str]] = field(default_factory=ResumeEnv)
     # Starts a CLI command in the background, for a trailing checkpoint.
     start: Detach = detach
     sleep: Callable[[float], None] = time.sleep
@@ -532,6 +574,8 @@ class Launcher:
     _resumes: dict[str, deque[float]] = field(default_factory=dict[str, deque[float]])
     # The sessions at the resume limit, logged once until the limit ends.
     _limited: set[str] = field(default_factory=set[str])
+    # The last error of `resume_env`, logged once until it changes.
+    _env_error: str | None = None
     # The earliest time of the next restore of held sessions; None after a
     # restore with no failure.
     _restore_at: float | None = float("-inf")
@@ -622,6 +666,15 @@ class Launcher:
                 )
             return False
         self._limited.discard(sid)
+        try:
+            env = self.resume_env()
+        except CredentialError as exc:
+            # Without its relay, a session does not get its messages.
+            if str(exc) != self._env_error:
+                self._env_error = str(exc)
+                log.error("launcher: no resumes: %s", exc)
+            return False
+        self._env_error = None
         harness = self.adapter.harness
         # Hold the session's sync lock from the checks until `claude --bg`
         # returns, so that no restore or sync starts between them. The new
@@ -658,7 +711,7 @@ class Launcher:
             options, kept = prepared
             argv = [self.claude, *options, "--bg", "--resume", sid, prompt]
             before = self.adapter.job_names()
-            result = self.run_claude(argv, workspace, RESUME_TIMEOUT)
+            result = self.run_claude(argv, workspace, RESUME_TIMEOUT, env)
         if result.returncode != 0:
             first = next(iter(printable(result.output).splitlines()), "")
             log.warning("%s: resume failed (%s): %s", sid, result.returncode, first)

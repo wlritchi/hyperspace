@@ -17,7 +17,7 @@ import os
 import subprocess
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -520,7 +520,9 @@ def test_the_runner_does_not_resume_a_session_that_a_job_writes(
     register(fake, sessionId=j.stem, jobId=j.stem[:8])
     calls: list[list[str]] = []
 
-    def bg(argv: list[str], cwd: str, timeout: float) -> RunResult:
+    def bg(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
         calls.append(argv)
         return RunResult(0, "")
 

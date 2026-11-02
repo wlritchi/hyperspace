@@ -15,6 +15,8 @@ environment.
 | Launcher idle exit |                           | `launcher_idle_exit` |
 | Claude Code binary | `HYPERSPACE_CLAUDE`       | `claude_bin`         |
 | Runner resume args | `HYPERSPACE_LAUNCHER_CLAUDE_ARGS` (JSON) | `launcher_claude_args` |
+| Resume environment |                           | `launcher_env`       |
+| Resume secrets     |                           | `launcher_secret_env`|
 
 With no token in the environment or a file, the token comes from the token
 cache or the system keyring (see `credentials`).
@@ -106,6 +108,10 @@ class Config:
     claude_bin: str = "claude"
     # More Claude Code options for a runner's resumes, for example the model.
     launcher_claude_args: list[str] = field(default_factory=list[str])
+    # More environment for the launcher's resumes: values, and the names of
+    # values in the keyring (see `credentials`).
+    launcher_env: dict[str, str] = field(default_factory=dict[str, str])
+    launcher_secret_env: list[str] = field(default_factory=list[str])
     state_dir: Path = field(default_factory=state_dir)
 
     def require_server(self) -> tuple[str, str]:
@@ -118,7 +124,11 @@ class Config:
         if not self.token:
             try:
                 found = credentials.find(
-                    self.url, self.state_dir, self.token_cache_ttl, self.keyring_use
+                    self.url,
+                    self.state_dir,
+                    self.token_cache_ttl,
+                    self.keyring_use,
+                    self.launcher_secret_env,
                 )
             except CredentialError as exc:
                 raise ConfigError(f"no token: {exc}") from None
@@ -134,6 +144,12 @@ class Config:
             return self.url, token
         return self.url, self.token
 
+
+# The variables of a Claude Code session that runs this command. The resumed
+# session must not get them, or `hyperspace status` would act on the wrong
+# session.
+SESSION_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_JOB_DIR")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # The launcher sets these itself. Another value of one of them would resume
 # the wrong session, fork a copy, or start a headless turn.
@@ -199,6 +215,39 @@ def check_claude_args(value: object) -> list[str]:
             "option that takes no list of values after it"
         )
     return args
+
+
+def check_env_name(name: object, where: str) -> str:
+    """Return `name` if the launcher can set it in the environment of a
+    resume. It cannot set a variable of the client or of the session."""
+    if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
+        raise ConfigError(f"{where}: {name!r} is not an environment variable name")
+    if name.startswith("HYPERSPACE_") or name in SESSION_VARS:
+        raise ConfigError(f"{where} cannot contain {name}")
+    return name
+
+
+def check_launcher_env(
+    values: object, secrets: object
+) -> tuple[dict[str, str], list[str]]:
+    """The launcher's environment for its resumes: a table of names and
+    values, and a list of names of secrets. A name is in one of them only."""
+    if not isinstance(values, dict):
+        raise ConfigError("launcher_env must be a table of names and values")
+    env: dict[str, str] = {}
+    for name, value in cast(dict[object, object], values).items():
+        if not isinstance(value, str) or "\0" in value:
+            raise ConfigError(f"launcher_env: the value of {name} must be a string")
+        env[check_env_name(name, "launcher_env")] = value
+    if not isinstance(secrets, list):
+        raise ConfigError("launcher_secret_env must be a list of names")
+    names = [
+        check_env_name(n, "launcher_secret_env") for n in cast(list[object], secrets)
+    ]
+    both = sorted(set(names) & set(env))
+    if both:
+        raise ConfigError(f"{both[0]} is in launcher_env and in launcher_secret_env")
+    return env, list(dict.fromkeys(names))
 
 
 def check_token(token: str, where: str) -> str:
@@ -292,6 +341,9 @@ def load(env: dict[str, str] | None = None, path: Path | None = None) -> Config:
     else:
         claude_args = data.get("launcher_claude_args", [])
     cfg.launcher_claude_args = check_claude_args(claude_args)
+    cfg.launcher_env, cfg.launcher_secret_env = check_launcher_env(
+        data.get("launcher_env", {}), data.get("launcher_secret_env", [])
+    )
     ttl = data.get("token_cache_ttl", 86400)
     if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 60:
         raise ConfigError("token_cache_ttl must be a whole number of seconds >= 60")
