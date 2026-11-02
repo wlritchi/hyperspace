@@ -106,6 +106,11 @@ _SERVER_KEYS = (
 _SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,200}")
 # The excerpt comes from the end of the transcript only.
 _EXCERPT_WINDOW = 256 * 1024
+# `effort` reads at most this much of the end of a transcript.
+_EFFORT_WINDOW = 16 * 1024 * 1024
+# An effort level, for example `high`. The value goes to `claude --effort`,
+# thus it must not look like an option.
+_EFFORT = re.compile(r"[a-z]{1,16}")
 # One line of `format_tail` for a tool call shows at most this much input.
 _TOOL_SUMMARY = 100
 
@@ -1108,6 +1113,35 @@ class ClaudeCode:
             return 0
         tasks: Any = flight.get("tasks")  # pyright: ignore[reportUnknownMemberType]
         return tasks if type(tasks) is int and tasks > 0 else 0
+
+    @staticmethod
+    def effort(transcript: Path) -> str | None:
+        """The effort level of the last main-chain assistant record that
+        has one, read from the end of the transcript, or None. Claude Code
+        writes the effort of the turn into each assistant record."""
+        try:
+            with open(transcript, "rb") as f:
+                size = f.seek(0, os.SEEK_END)
+                step = _TAIL_STEP
+                while True:
+                    start = max(0, size - step)
+                    f.seek(start)
+                    data = f.read()
+                    if start:
+                        data = data[data.find(b"\n") + 1 :]
+                    for record in reversed(_records(data)):
+                        value = record.get("effort")
+                        if (
+                            _is_assistant(record)
+                            and isinstance(value, str)
+                            and _EFFORT.fullmatch(value)
+                        ):
+                            return value
+                    if start == 0 or step >= _EFFORT_WINDOW:
+                        return None
+                    step = min(step * 4, _EFFORT_WINDOW)
+        except OSError:
+            return None
 
     @staticmethod
     def excerpt(transcript: Path) -> str | None:

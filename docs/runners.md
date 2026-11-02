@@ -83,17 +83,20 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
    `claude rm` (the transcript stays), because with a record and `<args>`
    Claude Code continues the session under a new id. If `claude rm` fails, the
    session does not resume. A job with a worktree stays, and resumes with no
-   `<args>`, with its saved options. It holds the session's sync lock from
-   these checks until `claude --bg` returns, and it does not resume a session
-   while a sync or a restore of it runs. If the session changed during the
-   hold, the launcher then starts a checkpoint. It does not resume a session
-   that the server shows as `live` on any host, also on the runner itself (for
-   example from a different harness config directory). The message tells the
-   agent that the runner restarted, and that its crons, Monitors and
-   background tasks stopped. `claude --bg` returns before the job's process
-   starts, so the launcher then reads the job's `state.json` for at most 10
-   seconds. If the job failed at its start, the launcher logs the job's
-   `detail` and counts the resume as a failed resume.
+   `<args>`, with its saved options. In `<args>`, the launcher replaces an
+   `--effort` with the effort level of the session's last turn, because
+   `claude --resume` takes the model from the transcript but not the effort
+   level. It holds the session's sync lock from these checks until
+   `claude --bg` returns, and it does not resume a session while a sync or a
+   restore of it runs. If the session changed during the hold, the launcher
+   then starts a checkpoint. It does not resume a session that the server
+   shows as `live` on any host, also on the runner itself (for example from a
+   different harness config directory). The message tells the agent that the
+   runner restarted, and that its crons, Monitors and background tasks
+   stopped. `claude --bg` returns before the job's process starts, so the
+   launcher then reads the job's `state.json` for at most 10 seconds. If the
+   job failed at its start, the launcher logs the job's `detail` and counts
+   the resume as a failed resume.
 4. Does not resume a `done` session. Resumes a session that is `ready`,
    `waiting` with `wake: message`, or that has no status only for a pending
    wake request (see "Wakes"). Sessions from before the session status feature
@@ -123,15 +126,16 @@ The image must provide:
   `--mcp-config` or `--dangerously-load-development-channels`, also in the
   `--option=value` form: that option would take the message as a value. Put an
   option that takes no list of values after it. Do not put `--name` in the
-  list: the list applies to each session that the launcher resumes. For
-  example:
+  list: the list applies to each session that the launcher resumes. Do not put
+  `--model` in the list, and do not set `ANTHROPIC_MODEL`: each of them
+  replaces the model that the session's transcript gives. For example:
 
   ```yaml
   - name: HYPERSPACE_LAUNCHER_CLAUDE_ARGS
     value: >-
       ["--dangerously-load-development-channels",
        "plugin:subspace@subspace",
-       "--model", "opus", "--agent", "claude"]
+       "--agent", "claude"]
   ```
 
 - An entrypoint that starts in the workspace and then runs the launcher:

@@ -629,7 +629,7 @@ counts the resume as a failed resume. If it cannot find the job or read its
 state, or the job still starts at the end of the wait, it counts the resume as
 a resume that succeeded.
 
-The launcher reads the Claude Code options for a resume (model, agent, and
+The launcher reads the Claude Code options for a resume (for example agent and
 channels) from `launcher_claude_args`, or from
 `HYPERSPACE_LAUNCHER_CLAUDE_ARGS` as a JSON list. The runner image gives that
 configuration. The launcher refuses an option that it sets itself, for example

@@ -280,9 +280,11 @@ the Claude Code options for a resume in `config.toml`:
 ```toml
 launcher_claude_args = [
   "--dangerously-load-development-channels", "plugin:subspace@subspace",
-  "--model", "opus",
 ]
 ```
+
+Do not put `--model` in this list: the resume takes the model from the
+session's transcript, and `--model` replaces it.
 
 The launcher refuses some options in this list, and the last option must not
 take a list of values; see "At boot: the launcher" in

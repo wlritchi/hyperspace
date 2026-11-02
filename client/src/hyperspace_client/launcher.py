@@ -260,6 +260,20 @@ def send_heartbeat(
     ctx.api.heartbeat(request)
 
 
+def _without_effort(args: list[str]) -> list[str]:
+    """`args` without `--effort <level>` and `--effort=<level>`."""
+    out: list[str] = []
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif arg == "--effort":
+            skip = True
+        elif not arg.startswith("--effort="):
+            out.append(arg)
+    return out
+
+
 def _reason(code: int, output: str) -> str:
     for line in printable(output).splitlines():
         note = clean_note(line)
@@ -674,7 +688,7 @@ class Launcher:
         job's saved options."""
         jobs = [j for j in self.adapter.jobs() if j.own_id == sid]
         if not jobs:
-            return self.claude_args, None
+            return self._session_options(sid), None
         kept = next((j for j in jobs if j.worktree is not None), None)
         if kept is not None:
             log.info(
@@ -695,7 +709,25 @@ class Launcher:
         if not self.adapter.find_transcripts(sid):
             log.error("%s: not resumed: no transcript after claude rm", sid)
             return None
-        return self.claude_args, None
+        return self._session_options(sid), None
+
+    def _session_options(self, sid: str) -> list[str]:
+        """The launcher's Claude Code options, with the session's own effort
+        level in place of an effort level in them. Claude Code 2.1.301
+        `claude --resume` takes the model from the transcript, but not the
+        effort level. The newest transcript of the session gives it."""
+        newest: tuple[float, Path] | None = None
+        for path in self.adapter.find_transcripts(sid):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest[0]:
+                newest = (mtime, path)
+        effort = self.adapter.effort(newest[1]) if newest else None
+        if effort is None:
+            return self.claude_args
+        return [*_without_effort(self.claude_args), "--effort", effort]
 
     def _copy_id(self, sid: str, before: set[str], output: str) -> str | None:
         """The id of a copy that `claude --bg --resume` started in place of

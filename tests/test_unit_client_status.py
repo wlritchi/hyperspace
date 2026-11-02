@@ -581,6 +581,47 @@ def test_excerpt_of_a_prompt_only_is_none(tmp_path: Path) -> None:
     assert ClaudeCode.excerpt(tmp_path / "missing.jsonl") is None
 
 
+def with_effort(record: dict[str, Any], effort: object) -> dict[str, Any]:
+    return {**record, "effort": effort}
+
+
+def test_effort_is_the_last_main_chain_value(tmp_path: Path) -> None:
+    fake = FakeClaude(tmp_path)
+    path = fake.transcript("/w")
+    fake.write(path, prompt("go"))
+    assert ClaudeCode.effort(path) is None
+    fake.write(
+        path,
+        with_effort(text_reply("a"), "low"),
+        with_effort(text_reply("b"), "high"),
+        # A subagent's record, a value that is not a level, and a record
+        # with no effort do not change the result.
+        {**with_effort(text_reply("c"), "max"), "isSidechain": True},
+        with_effort(text_reply("d"), "--model=x"),
+        with_effort(text_reply("e"), None),
+        text_reply("f"),
+        prompt("next"),
+    )
+    assert ClaudeCode.effort(path) == "high"
+    assert ClaudeCode.effort(tmp_path / "missing.jsonl") is None
+
+
+def test_effort_reads_back_in_steps_to_a_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("hyperspace_client.adapters.claude_code._TAIL_STEP", 1024)
+    monkeypatch.setattr(
+        "hyperspace_client.adapters.claude_code._EFFORT_WINDOW", 64 * 1024
+    )
+    fake = FakeClaude(tmp_path)
+    path = fake.transcript("/w")
+    filler = [prompt("x" * 500) for _ in range(40)]
+    fake.write(path, with_effort(text_reply(), "xhigh"), *filler)
+    assert ClaudeCode.effort(path) == "xhigh"
+    fake.write(path, *filler, *filler, *filler)
+    assert ClaudeCode.effort(path) is None
+
+
 def test_format_tail() -> None:
     records = [
         prompt("one"),

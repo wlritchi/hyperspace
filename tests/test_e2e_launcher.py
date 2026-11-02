@@ -917,6 +917,29 @@ def test_boot_resumes_interrupted_only(
     assert unset not in calls
 
 
+def test_the_resume_keeps_the_sessions_effort(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    fake.write(host.find_transcripts(sid)[0], {**text_reply(), "effort": "low"})
+    bg = Bg()
+    args = ["--effort", "high", "--model", "opus", "--effort=max"]
+    run = runner(ctx, host, bg, Clock(), claude_args=args)
+    assert run.resume(sid, RESUME_WORKING) is True
+    assert bg.calls[0][0] == [
+        "claude",
+        "--model",
+        "opus",
+        "--effort",
+        "low",
+        "--bg",
+        "--resume",
+        sid,
+        RESUME_WORKING,
+    ]
+
+
 def test_running_session_is_not_resumed(
     ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
 ) -> None:
@@ -1242,6 +1265,9 @@ def test_a_job_with_a_worktree_resumes_with_its_saved_options(
     caplog.set_level(logging.INFO, logger="hyperspace")
     sid = held_session(ctx, fake, tmp_path / "ws")
     set_status(ctx, sid, "working")
+    # A job with a worktree resumes with no options, because options with its
+    # record make a copy. Thus the launcher also gives no --effort.
+    fake.write(host.find_transcripts(sid)[0], {**text_reply(), "effort": "low"})
     job(fake, sid[:8], sid, state="stopped", worktreePath=str(tmp_path / "ws"))
     run = runner(ctx, host, Bg(), Clock())
     fake_jobs(fake, monkeypatch, run)
