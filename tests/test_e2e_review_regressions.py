@@ -480,6 +480,9 @@ def test_pending_restore_blocks_every_prompt_without_credentials(hosts):
         assert response["decision"] == "block"
         assert "unfinished restore" in response["reason"]
         assert "hyperspace restore" in response["reason"]
+        assert f"`hyperspace show {t.stem}` lists the branches" in response["reason"]
+        assert "NEW id" in response["reason"]
+        assert "do not fork unless the user asks" in response["reason"]
 
 
 def test_log_cursors_do_not_cross_servers(hosts, tmp_path):

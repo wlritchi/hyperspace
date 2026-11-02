@@ -164,7 +164,14 @@ def _sync_one(
         return
     result = Syncer(ctx, session, workspace).run()
     if isinstance(ctx.adapter, ClaudeCode):
-        after_sync(ctx, ctx.adapter, session)
+        after_sync(
+            ctx,
+            ctx.adapter,
+            session,
+            [b["host"] for b in result.session.get("branches", [])]
+            if result.session is not None
+            else None,
+        )
         # The copy of a session in a background job can come after the sync
         # of the session's link to the job, or before it. Thus the syncs of
         # both check.

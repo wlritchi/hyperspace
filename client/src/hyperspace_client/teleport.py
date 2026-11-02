@@ -249,7 +249,10 @@ def _confirm_teleport(
             )
             if response["session"]["state"] == "conflicted":
                 raise _UnconfirmedRestore(
-                    "restore committed, but the session is conflicted; use hyperspace fork"
+                    f"restore committed, but the session is conflicted; `hyperspace show {sid}` "
+                    "lists the branches. An admin can check for a false conflict. "
+                    "A fork uses a NEW id, which other systems that use the session id "
+                    "do not follow; do not fork unless the user asks."
                 )
             return response
         except (httpx.HTTPError, ApiError) as exc:
@@ -262,7 +265,8 @@ def _confirm_teleport(
             if committed:
                 assert isinstance(exc, ApiError)
                 raise _UnconfirmedRestore(
-                    f"restore committed but cannot resume: {exc.detail}; use hyperspace show or fork"
+                    f"restore committed but cannot resume: {exc.detail}; "
+                    f"inspect it with `hyperspace show {sid}`; ask an admin for help"
                 ) from exc
             # These server-side transaction rejections establish that this
             # id did not commit. Authentication/rate-limit failures do not.
@@ -295,8 +299,12 @@ def _check_lease(manifest: Manifest, host: str, steal: bool) -> None:
             for b in state.get("branches", [])
         )
         raise TeleportError(
-            "the session is conflicted: two branches have activity. Fork one "
-            f"with `hyperspace fork {manifest['session_id']} --branch <generation>`. "
+            "the session is conflicted: two or more branches have activity; "
+            "restore or teleport is refused. "
+            "An admin can check for a false conflict. "
+            f"`hyperspace fork {manifest['session_id']} --branch <generation>` "
+            "continues one branch under a NEW id, which other systems that use the "
+            "session id do not follow; do not fork unless the user asks. "
             f"Branches: {branches}"
         )
     lease = state["lease"]
@@ -660,7 +668,12 @@ def fork(
         branches = manifest["state"].get("branches", [])
         if manifest["state"]["state"] == "conflicted" and len(branches) > 1:
             choices = ", ".join(f"{b['generation']} ({b['host']})" for b in branches)
-            raise TeleportError(f"choose a branch with --branch: {choices}")
+            raise TeleportError(
+                f"choose a branch with --branch: {choices}. "
+                "A fork uses a NEW id, which other systems that use the session id "
+                "do not follow; do not fork unless the user asks. "
+                "An admin can check for a false conflict."
+            )
         branch = entry["active"]
     if branch not in generations:
         raise TeleportError(f"no generation {branch} in the transcript")

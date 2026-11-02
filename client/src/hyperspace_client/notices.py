@@ -74,13 +74,28 @@ def session_start_notice(
     return "\n\n".join(parts)
 
 
-def _problem(record: SessionRecord, host: str) -> str | None:
+def _problem(
+    record: SessionRecord, host: str, branch_hosts: list[str] | None = None
+) -> str | None:
     if record.state == "conflicted":
+        origin = "two or more branches have work"
+        if branch_hosts:
+            hosts = sorted(set(branch_hosts))
+            origin = (
+                "branches from this host have work"
+                if hosts == [host]
+                else f"branches from {', '.join(hosts)} have work"
+            )
         return (
-            "[hyperspace] This session is conflicted: two copies of it continued "
-            "on different hosts. Continue this copy under a new id with "
-            f"`hyperspace fork {record.session_id}`, or choose a branch with "
-            f"`hyperspace show {record.session_id}`."
+            f"[hyperspace] This session is conflicted: {origin}. "
+            "It can continue here and its backup continues. "
+            "A restore or teleport of this id is refused. "
+            f"`hyperspace show {record.session_id}` lists the branches. "
+            f"`hyperspace fork {record.session_id} --branch <generation>` continues "
+            "one branch under a NEW id. "
+            "Systems that use the session id do not follow the new id. "
+            "Do not fork unless the user asks. "
+            "An admin can check for a false conflict with `scripts/recheck-conflict.py`."
         )
     if (
         record.lease_host
@@ -112,7 +127,10 @@ def pending_restore_decision(
             "[hyperspace] This session has an unfinished restore. Backup and resume "
             "are blocked until its lease and files are reconciled. Stop this session, "
             f"then run `hyperspace restore {session.session_id}` in the target workspace. "
-            "If it reports a conflict, use `hyperspace fork` to recover a branch."
+            f"If it reports a conflict, `hyperspace show {session.session_id}` lists "
+            "the branches; ask an admin to check for a false conflict. "
+            "A fork uses a NEW id, which other systems that use the session id do not "
+            "follow; do not fork unless the user asks."
         ),
     }
 
@@ -134,6 +152,7 @@ def check_resume(ctx: Context, session: LocalSession) -> dict[str, str] | None:
     if not resumed:
         return None
     record = ctx.state.session(session.harness, session.session_id)
+    branch_hosts: list[str] | None = None
     if record.state_updated is None or record.state_updated < float(resumed):
         try:
             body = ctx.api.state(session.harness, session.session_id)
@@ -143,16 +162,22 @@ def check_resume(ctx: Context, session: LocalSession) -> dict[str, str] | None:
         record.lease_state = body["lease"]["state"]
         record.lease_host = body["lease"].get("host")
         record.state = body["state"]
+        branch_hosts = [branch["host"] for branch in body.get("branches", [])]
         record.state_updated = time.time()
         # This hook does not hold the session lock.
         ctx.state.save_session(record, LEASE_FIELDS)
-    problem = _problem(record, ctx.host)
+    problem = _problem(record, ctx.host, branch_hosts)
     if problem is None:
         return None
     return {"decision": "block", "reason": problem}
 
 
-def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None:
+def after_sync(
+    ctx: Context,
+    adapter: ClaudeCode,
+    session: LocalSession,
+    branch_hosts: list[str] | None = None,
+) -> None:
     """Act on the lease state that the last sync saw, with the session lock held.
 
     A host that held the lease and lost it (another host now holds it)
@@ -164,7 +189,7 @@ def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None
     is safe on the server.
     """
     record = ctx.state.session(session.harness, session.session_id)
-    problem = _problem(record, ctx.host)
+    problem = _problem(record, ctx.host, branch_hosts)
     if problem is None:
         return
     movable = (
@@ -176,7 +201,13 @@ def after_sync(ctx: Context, adapter: ClaudeCode, session: LocalSession) -> None
         and _fully_synced(ctx, adapter, session)
     )
     if not movable:
-        ctx.state.add_notice(session.harness, session.session_id, "lease", problem)
+        ctx.state.add_notice(
+            session.harness,
+            session.session_id,
+            "lease",
+            problem,
+            key="conflicted" if record.state == "conflicted" else None,
+        )
         return
     if Path(session.transcript).exists():
         moved = move_aside(session.transcript, ctx.state)
@@ -262,5 +293,10 @@ def refresh_states(ctx: Context, adapter: ClaudeCode) -> int:
             for transcript in index.get(sid, []):
                 session = adapter.session_for_transcript(transcript)
                 if session is not None:
-                    after_sync(ctx, adapter, session)
+                    after_sync(
+                        ctx,
+                        adapter,
+                        session,
+                        [b["host"] for b in summary["state"].get("branches", [])],
+                    )
     return changed

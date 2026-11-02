@@ -27,11 +27,13 @@ from _hs import (
 from hyperspace_client.adapters.claude_code import ClaudeCode
 from hyperspace_client.api import Api
 from hyperspace_client.notices import (
+    _problem,
     after_sync,
     check_resume,
     refresh_states,
     session_start_notice,
 )
+from hyperspace_client.state import SessionRecord
 from hyperspace_client.sync import Context, Syncer, register_host
 from hyperspace_client.teleport import (
     SURRENDERED,
@@ -44,6 +46,30 @@ from store import SessionKey
 
 LAPTOP_WS = "/home/wlritchi/hyperspace"
 AGENT_WS = "/home/agent/workspace"
+
+
+@pytest.mark.parametrize(
+    ("hosts", "origin"),
+    [
+        (None, "two or more branches have work"),
+        ([], "two or more branches have work"),
+        (["laptop", "laptop"], "branches from this host have work"),
+        (["laptop", "agent"], "branches from agent, laptop have work"),
+    ],
+)
+def test_conflict_notice(hosts: list[str] | None, origin: str) -> None:
+    record = SessionRecord("claude-code", "session", state="conflicted")
+    assert _problem(record, "laptop", hosts) == (
+        f"[hyperspace] This session is conflicted: {origin}. "
+        "It can continue here and its backup continues. "
+        "A restore or teleport of this id is refused. "
+        "`hyperspace show session` lists the branches. "
+        "`hyperspace fork session --branch <generation>` continues "
+        "one branch under a NEW id. "
+        "Systems that use the session id do not follow the new id. "
+        "Do not fork unless the user asks. "
+        "An admin can check for a false conflict with `scripts/recheck-conflict.py`."
+    )
 
 
 @dataclass
@@ -300,10 +326,22 @@ def test_conflict_then_fork(
     assert session is not None
     Syncer(laptop.ctx, session, LAPTOP_WS).run()
     assert manifest(server, sid)["state"]["state"] == "conflicted"
-    with pytest.raises(TeleportError, match="conflicted"):
+    refresh_states(laptop.ctx, laptop.adapter)
+    after_sync(laptop.ctx, laptop.adapter, session, None)
+    notices = laptop.ctx.state.take_notices("claude-code", sid)
+    assert len(notices) == 1
+    assert "branches from agent-1, laptop have work" in notices[0]
+    after_sync(laptop.ctx, laptop.adapter, session, None)
+    assert laptop.ctx.state.take_notices("claude-code", sid) == []
+    with pytest.raises(TeleportError, match="conflicted") as error:
         restore(agent.ctx, agent.adapter, sid, "/tmp/elsewhere", force=True)
-    with pytest.raises(TeleportError, match="choose a branch"):
+    assert "Branches:" in str(error.value)
+    assert "do not fork unless the user asks" in str(error.value)
+    assert "An admin can check for a false conflict" in str(error.value)
+    with pytest.raises(TeleportError, match="choose a branch") as error:
         fork(laptop.ctx, laptop.adapter, sid, LAPTOP_WS)
+    assert "NEW id" in str(error.value)
+    assert "do not fork unless the user asks" in str(error.value)
     branches = manifest(server, sid)["state"]["branches"]
     mine = next(b for b in branches if b["host"] == "laptop")
     result = fork(
