@@ -32,8 +32,13 @@ _KEYCTL_INVALIDATE = 21
 # possess a key that a terminal added, so the user permission must allow the
 # read.
 _PERM = 0x3F3F0000
-# A missing, expired, or revoked key is a cache miss, not an error.
-_MISS = {errno.ENOKEY, errno.EKEYEXPIRED, errno.EKEYREVOKED}
+# A missing, expired, or revoked key is a cache miss, not an error. Only Linux
+# defines these names.
+_MISS = {
+    getattr(errno, name)
+    for name in ("ENOKEY", "EKEYEXPIRED", "EKEYREVOKED")
+    if hasattr(errno, name)
+}
 
 
 class TokenCache(Protocol):
