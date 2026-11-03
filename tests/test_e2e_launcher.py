@@ -54,6 +54,7 @@ from hyperspace_client.launcher import (
     run_bg,
     run_rm,
 )
+from hyperspace_client.notices import session_start_notice
 from hyperspace_client.state import State
 from hyperspace_client.sync import Context, Syncer
 from hyperspace_client.teleport import HeldRestore, TeleportError, restore
@@ -1448,6 +1449,36 @@ def test_a_job_with_a_worktree_resumes_with_its_saved_options(
     assert record["respawnFlags"] == ["--name", "w", *args, *turn]
     assert record["worktreePath"] == str(tmp_path / "ws")
     assert f"changed to {shlex.join([*args, *turn])}" in caplog.text
+
+
+def test_a_resume_back_into_the_jobs_worktree_is_not_a_move(
+    ctx: Context, fake: FakeClaude, tmp_path: Path
+) -> None:
+    launch = tmp_path / "ws"
+    sid = held_session(ctx, fake, launch)
+    worktree = launch / ".claude" / "worktrees" / "w"
+    # The session last ran in the worktree of its job, from another
+    # transcript path.
+    record = ctx.state.session(HARNESS, sid)
+    record.workspace, record.transcript = str(worktree), str(tmp_path / "old.jsonl")
+    ctx.state.save_session(record)
+    session = ctx.adapter.session_for_transcript(ctx.adapter.find_transcripts(sid)[0])
+    assert session is not None
+
+    def notice() -> str:
+        return session_start_notice(
+            ctx.state, ctx.adapter, session, "agent-1", str(launch), "resume"
+        )
+
+    # A job that owns no worktree: the hooks see a move.
+    job(fake, sid[:8], sid, worktreePath=None)
+    assert "resumed in a different place" in notice()
+    # Claude Code starts the job in its first directory, then goes back to
+    # the worktree.
+    job(fake, sid[:8], sid, worktreePath=str(worktree))
+    assert "different place" not in notice()
+    job(fake, sid[:8], sid, worktreePath=str(worktree / "sub"))
+    assert "resumed in a different place" in notice()
 
 
 def test_saved_options_change_only_for_a_new_value(fake: FakeClaude) -> None:
