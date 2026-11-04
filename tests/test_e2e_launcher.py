@@ -1623,8 +1623,27 @@ def test_the_resume_logs_a_copy(
     (copy,) = job_ids(fake).values()
     errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
     assert errors == [
-        f"{sid}: the resume copied the session under the new id {copy[:8]}"
+        f"{sid}: the resume copied the session under the new id {copy[:8]}",
+        (
+            f"{sid}: claude --bg: note: session {sid[:8]} is already running in the"
+            f" background, so this started a copy as {copy[:8]}."
+        ),
     ]
+    # No more resumes: each would start another copy.
+    calls = len(job_ids(fake))
+    assert run.resume(sid, RESUME_WORKING) is False
+    assert run.resume(sid, RESUME_WORKING) is False
+    assert len(job_ids(fake)) == calls
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert errors[2:] == [
+        (
+            f"{sid}: not resumed: an earlier resume copied it as {copy[:8]}; stop"
+            " the copies, then resume it by hand"
+        )
+    ]
+    # Once the session runs again, the launcher can resume it later.
+    run.resume_held([sid])
+    assert ctx.state.get(f"resume_copied:claude-code:{sid}") is None
 
 
 def test_the_resume_finds_a_copy_from_the_job_state(

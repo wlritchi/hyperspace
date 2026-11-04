@@ -515,6 +515,11 @@ class ResumeEnv:
         return {**self.values, **self._last}
 
 
+def _copied_key(harness: str, sid: str) -> str:
+    """The local state key of a session that a resume copied."""
+    return f"resume_copied:{harness}:{sid}"
+
+
 def needs_process(
     summary: SessionSummary, host: str, running: bool, runner: bool = True
 ) -> str | None:
@@ -579,6 +584,8 @@ class Launcher:
     _resumes: dict[str, deque[float]] = field(default_factory=dict[str, deque[float]])
     # The sessions at the resume limit, logged once until the limit ends.
     _limited: set[str] = field(default_factory=set[str])
+    # The sessions that a resume copied, logged once by this launcher.
+    _copy_logged: set[str] = field(default_factory=set[str])
     # The last error of `resume_env`, logged once until it changes.
     _env_error: str | None = None
     # True while the cap on processes holds resumes, so that it logs once.
@@ -652,6 +659,9 @@ class Launcher:
         waiting = 0
         for summary in held:
             sid = summary["session_id"]
+            if sid in live:
+                # The session runs again, for example after a resume by hand.
+                self.ctx.state.delete(_copied_key(self.adapter.harness, sid))
             prompt = needs_process(summary, self.ctx.host, sid in live, self.runner)
             if prompt is None:
                 continue
@@ -705,6 +715,19 @@ class Launcher:
             return False
         self._env_error = None
         harness = self.adapter.harness
+        copy = self.ctx.state.get(_copied_key(harness, sid))
+        if copy is not None:
+            # Each resume would start one more copy, because only a run of
+            # the session under its own id ends its wake request.
+            if sid not in self._copy_logged:
+                self._copy_logged.add(sid)
+                log.error(
+                    "%s: not resumed: an earlier resume copied it as %s; stop the"
+                    " copies, then resume it by hand",
+                    sid,
+                    copy,
+                )
+            return False
         # Hold the session's sync lock from the checks until `claude --bg`
         # returns, so that no restore or sync starts between them. The new
         # process does not inherit the lock, and its hooks wait for the lock
@@ -754,6 +777,11 @@ class Launcher:
             log.error(
                 "%s: the resume copied the session under the new id %s", sid, copy
             )
+            # Claude Code gives its reason in the same note.
+            for line in printable(result.output).splitlines():
+                if "copy" in line:
+                    log.error("%s: claude --bg: %s", sid, line.strip())
+            self.ctx.state.put(_copied_key(harness, sid), copy)
         if failure is not None:
             log.warning("%s: resume failed: %s", sid, failure)
             return False

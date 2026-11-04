@@ -769,3 +769,7 @@ class State:
     def put(self, key: str, value: str) -> None:
         with self._db:
             self._db.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", (key, value))
+
+    def delete(self, key: str) -> None:
+        with self._db:
+            self._db.execute("DELETE FROM kv WHERE key = ?", (key,))
