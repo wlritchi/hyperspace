@@ -948,6 +948,41 @@ def test_the_resume_keeps_the_sessions_effort(
     ]
 
 
+def test_a_plain_resume_leaves_the_model_to_the_transcript(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    fake.write(host.find_transcripts(sid)[0], {**text_reply(), "requestedModel": "x"})
+    bg = Bg()
+    run = runner(ctx, host, bg, Clock(), claude_args=["--agent", "a"])
+    assert run.resume(sid, RESUME_WORKING) is True
+    assert "--model" not in bg.calls[-1][0]
+
+
+def test_a_resume_starts_in_the_lease_workspace(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    launch = tmp_path / "ws"
+    sid = held_session(ctx, fake, launch)
+    set_status(ctx, sid, "working")
+    # The session was last resumed in a worktree that it entered by path,
+    # which the runner does not trust.
+    worktree = launch / "repo" / ".claude" / "worktrees" / "w"
+    worktree.mkdir(parents=True)
+    record = ctx.state.session(HARNESS, sid)
+    record.workspace = str(worktree)
+    ctx.state.save_session(record)
+    bg = Bg()
+    clock = Clock()
+    run = runner(ctx, host, bg, clock)
+    run.tick()
+    assert [cwd for _, cwd in bg.calls] == [str(launch)]
+    # Without the lease workspace on this host, the recorded workspace.
+    assert run.resume(sid, RESUME_WORKING, str(tmp_path / "gone")) is True
+    assert bg.calls[-1][1] == str(worktree)
+
+
 def test_running_session_is_not_resumed(
     ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
 ) -> None:

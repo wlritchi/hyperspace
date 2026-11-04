@@ -77,17 +77,20 @@ runner's workspace, in place of its own supervisor. See "Launcher" in the
 3. Resumes each held session that needs a process: a session that was
    `working` when the runner stopped, and a session that is `waiting` for an
    event that only its process can receive (`wake: local`). It runs
-   `claude <args> --bg --resume <session id> <message>` in the session's
-   workspace, after it checks that the session does not run. Then, before
-   `claude --bg`, it removes a stopped job record of the session with
-   `claude rm` (the transcript stays), because with a record and `<args>`
-   Claude Code continues the session under a new id. If `claude rm` fails, the
-   session does not resume. A job with a worktree stays, and resumes with no
-   `<args>`, with its saved options. In `<args>`, the launcher replaces an
-   `--effort` with the effort level of the session's last turn, because
-   `claude --resume` does not take the effort level from the transcript. It
-   takes the model from the transcript only if `ANTHROPIC_MODEL` is not set.
-   In the saved options of a job with a worktree, it writes `<args>` (for
+   `claude <args> --bg --resume <session id> <message>` in the session's lease
+   workspace (where it started on the runner), after it checks that the
+   session does not run. Claude Code refuses to start in a directory that the
+   runner does not trust, and the resume then puts the session back in its own
+   last directory, for example a worktree. Then, before `claude --bg`, it
+   removes a stopped job record of the session with `claude rm` (the
+   transcript stays), because with a record and `<args>` Claude Code continues
+   the session under a new id. If `claude rm` fails, the session does not
+   resume. A job with a worktree stays, and resumes with no `<args>`, with its
+   saved options. In `<args>`, the launcher replaces an `--effort` with the
+   effort level of the session's last turn, because `claude --resume` does not
+   take the effort level from the transcript. It takes the model from the
+   transcript, unless `ANTHROPIC_MODEL` or a `--model` in `<args>` replaces
+   it. In the saved options of a job with a worktree, it writes `<args>` (for
    example, a changed channel), and the model and the effort level of the last
    turn. It holds the session's sync lock from these checks until
    `claude --bg` returns, and it does not resume a session while a sync or a
@@ -135,7 +138,9 @@ The image must provide:
   option that takes no list of values after it. Do not put `--name` in the
   list: the list applies to each session that the launcher resumes. Do not put
   `--model` in the list, and do not set `ANTHROPIC_MODEL`: each of them
-  replaces the model that the session's transcript gives. For example:
+  replaces the model that the session's transcript gives. Give a fresh session
+  its model with `--model` at its start, or with `model` in the settings. For
+  example:
 
   ```yaml
   - name: HYPERSPACE_LAUNCHER_CLAUDE_ARGS

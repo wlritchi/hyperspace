@@ -603,22 +603,27 @@ all the memory of the host. Such a resume waits for a later tick, and it does
 not count toward the limit of 5. A runner with no session to resume runs only
 the launcher.
 
-The resume runs in the workspace that the runner recorded for the session in
-its local state, and only for a session with a local transcript and no
-pending-restore marker (main spec, "Restore"). A session with an unfinished
-restore resumes after a restore retry completes it. The launcher holds the
-session's sync lock from its checks until `claude --bg` returns, so that no
-restore or sync starts between the checks and the start. If another process
-holds the lock, the launcher tries again at the next tick. The session's
-process does not get the lock, and its hooks do not wait for it without a
-limit, so the hold cannot block the new session. A checkpoint that a hook
-starts during the hold does not sync. Thus, when the launcher releases the
-lock, also after a failure or a timeout of `claude --bg`, it starts a
-checkpoint if the session is dirty (main spec, "Checkpoint scheduling"). For a
-resume that the status needs, the first message tells the agent that the
-runner restarted, and, for a `waiting` session, that its crons, Monitors and
-background tasks stopped. For a resume that a wake request needs, see "The
-first message" in the [wake spec](2026-10-28-wake.md).
+The resume runs in the session's lease workspace, where it started on the
+runner. If that directory is not on the runner, it runs in the workspace that
+the runner recorded last for the session in its local state. Claude Code
+2.1.301 refuses to start in a directory that the user did not trust, and
+`claude --resume` puts the session back in its own last directory, for example
+a worktree that the runner does not trust (measured on 2026-11-03). The resume
+runs only for a session with a local transcript and no pending-restore marker
+(main spec, "Restore"). A session with an unfinished restore resumes after a
+restore retry completes it. The launcher holds the session's sync lock from
+its checks until `claude --bg` returns, so that no restore or sync starts
+between the checks and the start. If another process holds the lock, the
+launcher tries again at the next tick. The session's process does not get the
+lock, and its hooks do not wait for it without a limit, so the hold cannot
+block the new session. A checkpoint that a hook starts during the hold does
+not sync. Thus, when the launcher releases the lock, also after a failure or a
+timeout of `claude --bg`, it starts a checkpoint if the session is dirty (main
+spec, "Checkpoint scheduling"). For a resume that the status needs, the first
+message tells the agent that the runner restarted, and, for a `waiting`
+session, that its crons, Monitors and background tasks stopped. For a resume
+that a wake request needs, see "The first message" in the
+[wake spec](2026-10-28-wake.md).
 
 `claude --bg` returns 0 when the daemon has the job, before the job's process
 starts. Thus the exit status does not show a process that fails before it
@@ -816,9 +821,9 @@ A heartbeat applies only to the credential's own host.
   never closes such a job automatically (see "Closing a done session"): the
   user closes it by hand.
 - A launcher resumes a session as a background job with
-  `claude --bg --resume <sid>`, in the session's workspace. Claude Code then
-  continues the session under the same id. If the session already runs, or if
-  a job record for the id exists and the resume has options, Claude Code
+  `claude --bg --resume <sid>`, in the session's lease workspace. Claude Code
+  then continues the session under the same id. If the session already runs,
+  or if a job record for the id exists and the resume has options, Claude Code
   starts a copy under a new id. So the launcher first checks that the session
   does not run on the host, also in a job under the job's own id, and removes
   the job records of the id, or for a job with a worktree resumes with no

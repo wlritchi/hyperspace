@@ -657,7 +657,7 @@ class Launcher:
                 continue
             if running >= self.max_sessions:
                 waiting += 1
-            elif self.resume(sid, prompt):
+            elif self.resume(sid, prompt, summary["state"]["lease"].get("workspace")):
                 running += 1
         if waiting and not self._capped:
             log.warning(
@@ -669,12 +669,15 @@ class Launcher:
             )
         self._capped = bool(waiting)
 
-    def resume(self, sid: str, prompt: str) -> bool:
-        """Resume a session as a background job, in the workspace that this
-        host recorded for it. Do not resume while its restore is pending, or
-        while another process holds its sync lock. First remove the job
-        records under its id (see `_resume_options`). Return True if
-        `claude --bg` succeeded and the job did not fail at its start."""
+    def resume(self, sid: str, prompt: str, home: str | None = None) -> bool:
+        """Resume a session as a background job. Start `claude` in `home` (the
+        lease workspace) if it is here, else in the recorded workspace.
+        Claude Code 2.1.301 refuses to start in a directory that the user did
+        not trust, and `--resume` then moves the session to its last
+        directory, which can be an untrusted worktree. Do not resume while
+        another process holds its sync lock. First remove the job records
+        under its id (see `_resume_options`). Return True if `claude --bg`
+        succeeded and the job did not fail at its start."""
         now = self.clock()
         recent = self._resumes.setdefault(sid, deque[float]())
         while recent and now - recent[0] >= RESUME_WINDOW:
@@ -714,15 +717,18 @@ class Launcher:
                 # The restore retry must complete the restore first.
                 log.info("%s: not resumed: its restore is not complete", sid)
                 return False
-            workspace = self.ctx.state.session(harness, sid).workspace
+            recorded = self.ctx.state.session(harness, sid).workspace
+            workspace = next(
+                (
+                    w
+                    for w in (home, recorded)
+                    if w and os.path.isabs(w) and os.path.isdir(w)
+                ),
+                None,
+            )
             # Only a session with a local transcript under this id, so that
             # the id is a valid file name and `claude --resume` finds it.
-            if (
-                not workspace
-                or not os.path.isabs(workspace)
-                or not os.path.isdir(workspace)
-                or not self.adapter.find_transcripts(sid)
-            ):
+            if workspace is None or not self.adapter.find_transcripts(sid):
                 log.warning("%s: not resumed: no local copy or no workspace", sid)
                 return False
             # Claude Code starts a copy under a new id if the session runs.
@@ -767,7 +773,7 @@ class Launcher:
         and the session's own model and effort level, into them."""
         jobs = [j for j in self.adapter.jobs() if j.own_id == sid]
         if not jobs:
-            return self._session_options(sid), None
+            return self._session_options(sid, model=False), None
         kept = next((j for j in jobs if j.worktree is not None), None)
         if kept is not None:
             log.info(
@@ -788,18 +794,23 @@ class Launcher:
         if not self.adapter.find_transcripts(sid):
             log.error("%s: not resumed: no transcript after claude rm", sid)
             return None
-        return self._session_options(sid), None
+        return self._session_options(sid, model=False), None
 
-    def _session_options(self, sid: str) -> list[str]:
-        """The launcher's Claude Code options, with the session's own effort
-        level in place of an effort level in them. If `ANTHROPIC_MODEL` is
-        not set, Claude Code 2.1.301 `claude --resume` takes the model from
-        the transcript. It never takes the effort level from it."""
+    def _session_options(self, sid: str, model: bool) -> list[str]:
+        """The launcher's Claude Code options, with the effort level of the
+        session's last turn in place of an effort level in them, and with
+        `model` its model too. Claude Code 2.1.301 `claude --resume` takes the
+        model from the transcript, but never the effort level."""
+        options = self.claude_args
         newest = self._newest_transcript(sid)
-        effort = self.adapter.effort(newest) if newest else None
-        if effort is None:
-            return self.claude_args
-        return [*without_option(self.claude_args, "--effort"), "--effort", effort]
+        if newest is not None:
+            turn = (("--effort", self.adapter.effort(newest)),)
+            if model:
+                turn = (("--model", self.adapter.model(newest)), *turn)
+            for option, value in turn:
+                if value is not None:
+                    options = [*without_option(options, option), option, value]
+        return options
 
     def _keep_session_options(self, sid: str, kept: Job) -> Job:
         """Put the launcher's options, with the model and the effort level of
@@ -807,14 +818,8 @@ class Launcher:
         and return the job as it is then. The saved options come from the
         start of the job, so they can have an old channel or model, and the
         resume uses them in place of the model in the transcript."""
-        options = self.claude_args
-        newest = self._newest_transcript(sid)
-        if newest is not None:
-            turn = (("--model", self.adapter.model(newest)),)
-            turn += (("--effort", self.adapter.effort(newest)),)
-            for option, value in turn:
-                if value is not None:
-                    options = [*without_option(options, option), option, value]
+        # Claude Code saves a `--model` in the options of each job.
+        options = self._session_options(sid, model=True)
         try:
             changed = self.adapter.set_saved_options(kept.short, options)
         except OSError as exc:
