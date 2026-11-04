@@ -1397,11 +1397,15 @@ class ClaudeCode:
         )
         return "\n".join(lines)
 
-    def in_own_worktree(self, session_id: str, path: str) -> bool:
-        """True if `path` is in the worktree of the session's own background
-        job. Claude Code 2.1.301 starts such a job again in the directory
-        where it first started, and then puts the session back in its
-        worktree, so the hooks see that directory first."""
+    def returns_to(self, session_id: str, path: str, cwd: str) -> bool:
+        """True if Claude Code puts a session that resumes in `cwd` back in
+        `path`, its last directory. Claude Code 2.1.301 starts the resume in
+        `cwd`, so the hooks see it first, and then moves the session back to
+        its last directory if that still exists: for example a worktree below
+        the lease workspace, where the launcher starts a resume, or the
+        worktree of the session's own background job."""
+        if os.path.isdir(path) and path.startswith(cwd.rstrip("/") + "/"):
+            return True
         for job in self.jobs():
             root = (job.worktree or "").rstrip("/")
             inside = path == root or path.startswith(root + "/")

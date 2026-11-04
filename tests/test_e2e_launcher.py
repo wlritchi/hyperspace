@@ -1514,6 +1514,15 @@ def test_a_resume_back_into_the_jobs_worktree_is_not_a_move(
     assert "different place" not in notice()
     job(fake, sid[:8], sid, worktreePath=str(worktree / "sub"))
     assert "resumed in a different place" in notice()
+    # A worktree that the session entered by path: its job owns none, but
+    # Claude Code goes back to it while it exists below the start directory.
+    worktree.mkdir(parents=True)
+    assert "different place" not in notice()
+    elsewhere = tmp_path / "other"
+    elsewhere.mkdir()
+    record.workspace = str(elsewhere)
+    ctx.state.save_session(record)
+    assert "resumed in a different place" in notice()
 
 
 def test_saved_options_change_only_for_a_new_value(fake: FakeClaude) -> None:

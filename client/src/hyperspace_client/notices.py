@@ -54,7 +54,7 @@ def session_start_notice(
         and record.workspace
         and record.workspace != cwd
         and record.transcript != str(session.transcript)
-        and not adapter.in_own_worktree(session.session_id, record.workspace)
+        and not adapter.returns_to(session.session_id, record.workspace, cwd)
     ):
         parts.append(adapter.move_notice(host, record.workspace, host, cwd))
     if source == "resume":
