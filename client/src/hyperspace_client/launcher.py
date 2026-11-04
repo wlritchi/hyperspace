@@ -586,6 +586,9 @@ class Launcher:
     _limited: set[str] = field(default_factory=set[str])
     # The sessions that a resume copied, logged once by this launcher.
     _copy_logged: set[str] = field(default_factory=set[str])
+    # The sessions with registry records from another pid domain, logged once
+    # until the records go away.
+    _foreign_logged: set[str] = field(default_factory=set[str])
     # The last error of `resume_env`, logged once until it changes.
     _env_error: str | None = None
     # True while the cap on processes holds resumes, so that it logs once.
@@ -757,6 +760,19 @@ class Launcher:
             # Claude Code starts a copy under a new id if the session runs.
             if self.adapter.is_running(sid):
                 return False
+            stale = self.adapter.foreign_registrations(sid)
+            if stale:
+                if sid not in self._foreign_logged:
+                    self._foreign_logged.add(sid)
+                    log.error(
+                        "%s: not resumed: Claude Code counts it as running in"
+                        " another pid domain (%s); if no process there runs it,"
+                        " remove these files",
+                        sid,
+                        ", ".join(str(p) for p in stale),
+                    )
+                return False
+            self._foreign_logged.discard(sid)
             # Before the removal of job records, so that the limit also
             # applies to a `claude rm` that fails at each tick.
             recent.append(now)

@@ -154,8 +154,17 @@ The image must provide:
 
   ```sh
   cd "$WORKSPACE_DIR"
+  rm -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/sessions/*.json
   exec hyperspace launcher --runner
   ```
+
+  The `rm` removes the live-session registry of Claude Code. The registry
+  stays on a persistent config directory after the container stops. Claude
+  Code 2.1.301 counts a record from an earlier container as a live process, so
+  `claude --bg --resume` of its session starts a copy. No process of an
+  earlier container runs in a new container, so the removal is safe. The
+  launcher does not resume a session that has such a record. It logs an error
+  with the file names.
 
 ### Wakes
 

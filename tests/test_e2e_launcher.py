@@ -1646,6 +1646,62 @@ def test_the_resume_logs_a_copy(
     assert ctx.state.get(f"resume_copied:claude-code:{sid}") is None
 
 
+def registration(
+    fake: FakeClaude, pid: int, sid: str, domain: str | None, kind: str = "bg"
+) -> Path:
+    """Write a live-session registry record of Claude Code."""
+    record: dict[str, Any] = {"pid": pid, "kind": kind, "sessionId": sid}
+    if domain is not None:
+        record["pidDomain"] = domain
+    path = fake.root / "sessions" / f"{pid}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record))
+    return path
+
+
+def test_foreign_registrations_are_bg_records_from_another_pid_domain(
+    fake: FakeClaude,
+) -> None:
+    sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    here = claude_code_mod._pid_domain()  # pyright: ignore[reportPrivateUsage]
+    foreign = registration(fake, 261, sid, "linux::pid:[6]")
+    registration(fake, 262, sid, "linux::pid:[6]", kind="interactive")
+    registration(fake, 263, sid, here)
+    registration(fake, 264, sid, None)
+    registration(fake, 265, other, "linux::pid:[6]")
+    assert ClaudeCode(fake.root).foreign_registrations(sid) == [foreign]
+
+
+def test_the_resume_skips_a_session_registered_in_another_pid_namespace(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    run = runner(ctx, host, Bg(), Clock())
+    fake_jobs(fake, monkeypatch, run)
+    # From the process of an earlier container: Claude Code would copy it.
+    stale = registration(fake, 261, sid, "linux::pid:[6]")
+    assert run.resume(sid, RESUME_WORKING) is False
+    assert run.resume(sid, RESUME_WORKING) is False
+    assert job_ids(fake) == {}
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert errors == [
+        (
+            f"{sid}: not resumed: Claude Code counts it as running in another"
+            f" pid domain ({stale}); if no process there runs it, remove these"
+            " files"
+        )
+    ]
+    stale.unlink()
+    assert run.resume(sid, RESUME_WORKING) is True
+    assert list(job_ids(fake).values()) == [sid]
+
+
 def test_the_resume_finds_a_copy_from_the_job_state(
     ctx: Context,
     fake: FakeClaude,

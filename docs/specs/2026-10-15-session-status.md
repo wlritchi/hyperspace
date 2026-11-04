@@ -823,13 +823,15 @@ A heartbeat applies only to the credential's own host.
 - A launcher resumes a session as a background job with
   `claude --bg --resume <sid>`, in the session's lease workspace. Claude Code
   then continues the session under the same id. If the session already runs,
-  or if a job record for the id exists and the resume has options, Claude Code
+  if a live-session registry record from another pid namespace names it, or if
+  a job record for the id exists and the resume has options, Claude Code
   starts a copy under a new id. So the launcher first checks that the session
-  does not run on the host, also in a job under the job's own id, and removes
-  the job records of the id, or for a job with a worktree resumes with no
-  options (wake spec, "Session identity"). Hyperspace never writes Claude
-  Code's job state. If the job gets its own id, it closes only by hand (see
-  "Closing a done session").
+  does not run on the host, also in a job under the job's own id, that no
+  registry record from another pid namespace names it, and removes the job
+  records of the id, or for a job with a worktree resumes with no options
+  (wake spec, "Session identity"). Hyperspace never writes Claude Code's job
+  state. If the job gets its own id, it closes only by hand (see "Closing a
+  done session").
 - Tests will show whether the SessionEnd hook runs when the Claude Code daemon
   stops an idle job. The sweep makes the design correct without it.
 - The heartbeat interval is 60 seconds, so a heartbeat expires after 3

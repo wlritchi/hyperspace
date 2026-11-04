@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 from collections.abc import Collection, Iterable, Iterator, Mapping
@@ -418,6 +419,29 @@ def _alive(record: dict[str, Any], proven: bool = False) -> bool:
     if proven:
         return start is not None and record.get("procStart") == start
     return record.get("procStart") in (None, start)
+
+
+# The kinds of registry records that make `claude --bg --resume` start a copy.
+_BG_KINDS = frozenset({"bg", "daemon-worker"})
+
+
+def _pid_domain() -> str:
+    """The pid domain of this process, as Claude Code 2.1.301 computes it for
+    the records of its live-session registry. A pid domain is a machine and a
+    pid namespace on it."""
+    if sys.platform == "win32":
+        return f"linux:{socket.gethostname().lower()}"
+    if sys.platform != "linux":
+        return "linux"
+    try:
+        machine = Path("/etc/machine-id").read_text().strip()
+    except OSError:
+        machine = ""
+    try:
+        namespace = os.readlink("/proc/self/ns/pid")
+    except OSError:
+        namespace = ""
+    return f"linux:{machine}:{namespace}"
 
 
 def _ancestors() -> set[int]:
@@ -960,6 +984,34 @@ class ClaudeCode:
         of the session into the transcript of its own id does not make the
         session run."""
         return self._runs(session_id, links=False)
+
+    def foreign_registrations(self, session_id: str) -> list[Path]:
+        """The registry records of the session's background processes from
+        another pid domain (another container or another machine). This host
+        cannot check those processes. Claude Code 2.1.301 counts each such
+        record as live and never removes it. So `claude --bg --resume` of the
+        session starts a copy."""
+        sessions = self.config_dir / "sessions"
+        if not sessions.is_dir():
+            return []
+        domain = _pid_domain()
+        found: list[Path] = []
+        for path in sorted(sessions.glob("*.json")):
+            try:
+                record: dict[str, Any] = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(record, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+                continue
+            other = record.get("pidDomain")
+            if (
+                record.get("sessionId") == session_id
+                and record.get("kind") in _BG_KINDS
+                and isinstance(other, str)
+                and other != domain
+            ):
+                found.append(path)
+        return found
 
     def _runs(self, session_id: str, links: bool) -> bool:
         sessions = self.config_dir / "sessions"
