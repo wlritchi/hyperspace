@@ -37,7 +37,9 @@ from hyperspace_client.cli import (
 from hyperspace_client.config import Config, ConfigError, check_claude_args, load
 from hyperspace_client.hooks import handle
 from hyperspace_client.launcher import (
+    IDLE_STOP,
     MAX_RESUMES,
+    RECHECK,
     RESUME_WAITING,
     RESUME_WAKE,
     RESUME_WORKING,
@@ -72,6 +74,11 @@ class Host(ClaudeCode):
     def __init__(self, root: Path) -> None:
         super().__init__(root)
         self.live: list[str] = []
+        # Session id to (job name, end of its turn) of an idle process.
+        self.idle: dict[str, tuple[str, float]] = {}
+
+    def idle_since(self, session_id: str) -> tuple[str, float] | None:
+        return self.idle.get(session_id)
 
     def live_processes(
         self, continued_from: ContinuedFrom | None = None
@@ -322,6 +329,85 @@ def test_close_skips_a_queued_reopen(
     rm = Rm(ctx)
     launcher(ctx, host, rm, Clock()).tick()
     assert rm.calls == []
+
+
+def test_the_sweep_stops_the_idle_job_of_a_done_session(
+    ctx: Context, fake: FakeClaude, host: Host
+) -> None:
+    sid = session(ctx, fake)
+    mark(ctx, sid, "done")
+    job(fake, "aa", sid)
+    host.live = [sid]
+    host.idle[sid] = ("aa", 1000.0)
+    now = [1000.0 + IDLE_STOP - 1]
+    rm = Rm(ctx)
+    run = launcher(ctx, host, rm, Clock(), runner=True, wall=lambda: now[0])
+    # The turn ended too recently.
+    run.sweep(host.live)
+    assert rm.calls == []
+    now[0] += 1
+    run.sweep(host.live)
+    assert rm.calls == [["claude", "stop", "aa"]]
+    # The process stopped: the sweep closes the job as usual.
+    host.live, host.idle = [], {}
+    run.sweep(host.live)
+    assert rm.calls[1:] == [["claude", "rm", "aa"]]
+
+
+def test_a_workstation_does_not_stop_an_idle_done_job(
+    ctx: Context, fake: FakeClaude, host: Host
+) -> None:
+    sid = session(ctx, fake)
+    mark(ctx, sid, "done")
+    job(fake, "aa", sid)
+    host.live = [sid]
+    host.idle[sid] = ("aa", 0.0)
+    rm = Rm(ctx)
+    launcher(ctx, host, rm, Clock(), wall=lambda: IDLE_STOP).sweep(host.live)
+    assert rm.calls == []
+
+
+def test_the_sweep_does_not_stop_an_open_or_busy_session(
+    ctx: Context, fake: FakeClaude, host: Host
+) -> None:
+    ready, busy, other = (session(ctx, fake) for _ in range(3))
+    mark(ctx, ready, "ready")
+    for sid in (busy, other):
+        mark(ctx, sid, "done")
+    for short, sid in (("aa", ready), ("bb", busy), ("cc", other)):
+        job(fake, short, sid)
+    host.live = [ready, busy, other]
+    # The idle process of `other` is not the job of the session.
+    host.idle = {ready: ("aa", 0.0), other: ("dd", 0.0)}
+    clock = Clock()
+    rm = Rm(ctx)
+    run = launcher(ctx, host, rm, clock, runner=True, wall=lambda: IDLE_STOP)
+    run.sweep(host.live)
+    assert rm.calls == []
+    # A `done` from another host: the next check is after RECHECK.
+    mark(ctx, ready, "done")
+    clock.t += RECHECK - 1
+    run.sweep(host.live)
+    assert rm.calls == []
+    clock.t += 1
+    run.sweep(host.live)
+    assert rm.calls == [["claude", "stop", "aa"]]
+
+
+def test_the_stop_of_an_idle_job_logs_a_failure(
+    ctx: Context, fake: FakeClaude, host: Host, caplog: pytest.LogCaptureFixture
+) -> None:
+    sid = session(ctx, fake)
+    mark(ctx, sid, "done")
+    job(fake, "aa", sid)
+    host.live = [sid]
+    host.idle[sid] = ("aa", 0.0)
+    rm = Rm(ctx, code=1, output="no such job")
+    run = launcher(ctx, host, rm, Clock(), runner=True, wall=lambda: IDLE_STOP)
+    run.sweep(host.live)
+    assert rm.calls == [["claude", "stop", "aa"]]
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == [f"{sid}: claude stop aa exited with status 1: no such job"]
 
 
 def test_close_asks_again_after_the_backup(
@@ -1657,6 +1743,44 @@ def registration(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record))
     return path
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs /proc")
+def test_idle_since_reads_the_idle_bg_record_of_a_live_process(
+    fake: FakeClaude,
+) -> None:
+    sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+    stat = Path("/proc/self/stat").read_text()
+    start = stat[stat.rfind(")") + 2 :].split()[19]
+    sessions = fake.root / "sessions"
+    sessions.mkdir(parents=True)
+
+    def write(pid: int, **fields: Any) -> None:
+        record = {
+            "pid": pid,
+            "procStart": start,
+            "kind": "bg",
+            "sessionId": sid,
+            "jobId": "aa11",
+            "status": "idle",
+            "statusUpdatedAt": 1_793_954_905_482,
+            **fields,
+        }
+        (sessions / f"{pid}.json").write_text(json.dumps(record))
+
+    adapter = ClaudeCode(fake.root)
+    write(os.getpid())
+    assert adapter.idle_since(sid) == ("aa11", 1_793_954_905.482)
+    assert adapter.idle_since(other) is None
+    for fields in (
+        {"status": "busy"},
+        {"kind": "interactive"},
+        {"procStart": "1"},
+        {"jobId": "-x"},
+        {"statusUpdatedAt": "soon"},
+    ):
+        write(os.getpid(), **fields)
+        assert adapter.idle_since(sid) is None, fields
 
 
 def test_foreign_registrations_are_bg_records_from_another_pid_domain(

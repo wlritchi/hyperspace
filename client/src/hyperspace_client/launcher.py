@@ -59,6 +59,8 @@ RM_TIMEOUT = 120.0
 RECHECK = 900.0
 # `--close-job` waits at most this long for the session's process to stop.
 CLOSE_WAIT = 300.0
+# The process of a `done` session stops when its turn ended this long ago.
+IDLE_STOP = 120.0
 _POLL = 1.0
 # The first message of a session that a runner resumes, by its status.
 RESUME_WORKING = (
@@ -576,8 +578,15 @@ class Launcher:
     start: Detach = detach
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.monotonic
+    # The time since the epoch, to compare with the times of Claude Code.
+    wall: Callable[[], float] = time.time
     # Job name to (state.json mtime, time of the last check).
     _checked: dict[str, tuple[float, float]] = field(
+        default_factory=dict[str, tuple[float, float]]
+    )
+    # Job name to (end of its idle turn, time of the last check), for the
+    # live jobs that `stop_idle` checked.
+    _idle_checked: dict[str, tuple[float, float]] = field(
         default_factory=dict[str, tuple[float, float]]
     )
     # Session id to the times of its recent resumes.
@@ -621,6 +630,9 @@ class Launcher:
         if kept != entries:
             save_unclosed(state, adapter, kept)
         self._checked = {k: v for k, v in self._checked.items() if k in by_name}
+        self._idle_checked = {
+            k: v for k, v in self._idle_checked.items() if k in by_name
+        }
         for job in jobs:
             if job.session_id is None:
                 if job.own_id in live:
@@ -632,6 +644,8 @@ class Launcher:
                 continue
             if job.session_id in live:
                 forget_recheck(state, adapter, job.short)
+                if self.runner:
+                    self.stop_idle(job, job.session_id)
                 continue
             if job.short in kept and not kept[job.short].get("recheck"):
                 continue
@@ -644,6 +658,46 @@ class Launcher:
                 forget_recheck(state, adapter, job.short)
             else:
                 record(state, adapter, job, result)
+
+    def stop_idle(self, job: Job, sid: str) -> None:
+        """In runner mode, stop the process of a `done` session when its turn
+        ended at least `IDLE_STOP` ago. A message to the session then takes
+        the wake path, and the server refuses it, so that the sender gets a
+        bounce. The sweep closes the job after its process stops. Not on a
+        workstation, where a user can be attached to the job."""
+        idle = self.adapter.idle_since(sid)
+        if idle is None or idle[0] != job.short:
+            return
+        if self.wall() - idle[1] < IDLE_STOP:
+            return
+        # One check of the server for each idle period, and again after
+        # RECHECK, because a `done` can come later from another host.
+        now = self.clock()
+        seen = self._idle_checked.get(job.short)
+        if seen is not None and seen[0] == idle[1] and now - seen[1] < RECHECK:
+            return
+        self._idle_checked[job.short] = (idle[1], now)
+        harness = self.adapter.harness
+        with self.ctx.state.try_lock(harness, sid) as locked:
+            try:
+                if not locked or not _done(self.ctx, harness, sid):
+                    return
+            except NotFound:
+                return
+            # A new turn can start while the server answers.
+            if self.adapter.idle_since(sid) != idle:
+                return
+            code, output = self.run_rm([self.claude, "stop", job.short])
+        if code == 0:
+            log.info("%s: stopped the idle job %s of a done session", sid, job.short)
+        else:
+            log.warning(
+                "%s: claude stop %s exited with status %d: %s",
+                sid,
+                job.short,
+                code,
+                clean_note(output) or "no output",
+            )
 
     def resume_held(self, live: list[str]) -> None:
         """Resume the sessions whose lease this host holds and that need a

@@ -1025,6 +1025,37 @@ class ClaudeCode:
                 found.append(path)
         return found
 
+    def idle_since(self, session_id: str) -> tuple[str, float] | None:
+        """The job name of the session's own live background process, and the
+        time (seconds since the epoch) when its turn ended. None if no such
+        process is idle. Claude Code 2.1.301 sets `status` in the registry
+        record to "busy" during a turn and to "idle" after it, with
+        `statusUpdatedAt` in milliseconds."""
+        sessions = self.config_dir / "sessions"
+        if not sessions.is_dir():
+            return None
+        for path in sorted(sessions.glob("*.json")):
+            try:
+                record: dict[str, Any] = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(record, dict):  # pyright: ignore[reportUnnecessaryIsInstance]
+                continue
+            job = record.get("jobId")
+            since = record.get("statusUpdatedAt")
+            if (
+                record.get("sessionId") == session_id
+                and record.get("kind") in _BG_KINDS
+                and record.get("status") == "idle"
+                and isinstance(job, str)
+                and _JOB_NAME.fullmatch(job)
+                and isinstance(since, int | float)
+                and not isinstance(since, bool)
+                and _alive(record, proven=True)
+            ):
+                return job, since / 1000
+        return None
+
     def _runs(self, session_id: str, links: bool) -> bool:
         sessions = self.config_dir / "sessions"
         if not sessions.is_dir():
