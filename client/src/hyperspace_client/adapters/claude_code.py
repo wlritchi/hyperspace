@@ -424,6 +424,18 @@ def _alive(record: dict[str, Any], proven: bool = False) -> bool:
 # The kinds of registry records that make `claude --bg --resume` start a copy.
 _BG_KINDS = frozenset({"bg", "daemon-worker"})
 
+# The prompt of a turn that channel events start: one or more `<channel>`
+# blocks and nothing else.
+_CHANNEL_PROMPT = re.compile(r"\s*<channel\s[^>]*>.*</channel>\s*", re.DOTALL)
+
+
+def channel_prompt(prompt: object) -> bool:
+    """True if the prompt of a UserPromptSubmit hook is a channel event, for
+    example a message from another agent, and not a prompt from the user. In
+    Claude Code 2.1.301, the hook payload does not give the origin of the
+    prompt. The transcript record of the prompt has `origin.kind` "channel"."""
+    return isinstance(prompt, str) and _CHANNEL_PROMPT.fullmatch(prompt) is not None
+
 
 def _pid_domain() -> str:
     """The pid domain of this process, as Claude Code 2.1.301 computes it for

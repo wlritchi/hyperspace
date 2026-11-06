@@ -203,6 +203,29 @@ def test_done_then_prompt_reopens(
     assert ctx.state.take_notices(HARNESS, sid) == []
 
 
+def test_done_then_a_channel_event_stays_done(
+    server: Server, ctx: Context, fake: FakeClaude
+) -> None:
+    sid, path = started_session(ctx, fake)
+    request = {**_request("done", sid, reason=None, wake=None, note="x", by_user=True)}
+    assert set_status(ctx, sid, request) is not None
+    # A message from another agent starts a turn, and the agent replies.
+    event = '<channel source="plugin:relay:relay">#7 [dm] a: hi</channel>'
+    fake.write(path, prompt(event))
+    hook(ctx, fake, sid, "UserPromptSubmit", prompt=event)
+    hook(ctx, fake, sid, "PreToolUse", tool_name="Bash")
+    fake.write(path, tool_call(), text_reply("Noted."))
+    hook(ctx, fake, sid, "Stop")
+    sync(ctx, path)
+    assert ctx.state.wanted_status(HARNESS, sid) is None
+    assert server_status(ctx.api, sid)["status"] == "done"
+    # A prompt from the user still reopens it.
+    fake.write(path, prompt("one more thing"))
+    hook(ctx, fake, sid, "UserPromptSubmit", prompt="one more thing")
+    sync(ctx, path)
+    assert server_status(ctx.api, sid)["status"] == "working"
+
+
 def test_prompt_that_reopens_drops_the_done_notice(
     server: Server, ctx: Context, fake: FakeClaude
 ) -> None:

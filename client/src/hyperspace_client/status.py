@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx
 
 from hyperspace_client.adapters import LocalSession
-from hyperspace_client.adapters.claude_code import ClaudeCode, Job
+from hyperspace_client.adapters.claude_code import ClaudeCode, Job, channel_prompt
 from hyperspace_client.api import ApiError, NotFound, StatusConflict
 from hyperspace_client.state import SessionRecord, State
 from hyperspace_protocol import (
@@ -143,13 +143,17 @@ def transition(
     function only: a turn that a cron starts fires UserPromptSubmit or at
     least PreToolUse; a permission prompt fires Notification with
     `notification_type` "permission_prompt"; AskUserQuestion fires
-    PreToolUse, and PostToolUse after the user answers."""
+    PreToolUse, and PostToolUse after the user answers; a turn that a channel
+    event starts fires UserPromptSubmit with the event as the prompt."""
     if payload.get("agent_id"):
         # A subagent's tool calls do not change the main agent's status.
         return None
     current = known.status
     if event == "UserPromptSubmit":
         if current == "done":
+            if channel_prompt(payload.get("prompt")):
+                # A message does not reopen a `done` session.
+                return None
             return _want(
                 "working",
                 note="reopened by a prompt",

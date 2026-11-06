@@ -231,6 +231,7 @@ The adapter maps harness events to status writes. For Claude Code:
 | Event                                                                       | Write                                                                                       |
 | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | UserPromptSubmit                                                            | `working`. If the current status is `done`, this write reopens the session and is explicit. |
+| UserPromptSubmit for a channel event (a prompt of only `<channel>` blocks)  | As UserPromptSubmit, but no write if the status is `done`: a message does not reopen it.    |
 | A cron or other trigger starts a turn with no prompt                        | As UserPromptSubmit.                                                                        |
 | PreToolUse, with no known status and no declaration in this turn            | `working`. For example, the first turn of a new background job (see below).                 |
 | PreToolUse for AskUserQuestion, or a Notification for a permission prompt   | `ready`, reason `asked`.                                                                    |

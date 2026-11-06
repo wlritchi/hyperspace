@@ -25,7 +25,11 @@ import pytest
 from _hs import FakeClaude, prompt, text_reply, tool_call
 from hyperspace_client import cli as cli_mod
 from hyperspace_client.adapters import LocalSession
-from hyperspace_client.adapters.claude_code import ClaudeCode, merge_options
+from hyperspace_client.adapters.claude_code import (
+    ClaudeCode,
+    channel_prompt,
+    merge_options,
+)
 from hyperspace_client.api import Api, StatusConflict
 from hyperspace_client.cli import SESSION_ENV, _request, set_status
 from hyperspace_client.state import _ADDED_COLUMNS, _SCHEMA, State
@@ -65,6 +69,10 @@ def _wants(result: dict[str, Any] | None) -> tuple[Any, ...] | None:
 
 ASK = {"tool_name": "AskUserQuestion"}
 BASH = {"tool_name": "Bash"}
+CHANNEL = {
+    "prompt": '<channel source="plugin:relay:relay" kind="message">#1 [dm] a: hi'
+    "</channel>"
+}
 DECLARED = {
     "status": "waiting",
     "wake": "local",
@@ -80,6 +88,16 @@ DECLARED = {
         ("UserPromptSubmit", {}, ("ready", "idle"), False, 0, ("working", None, False)),
         ("UserPromptSubmit", {}, (None, None), False, 0, ("working", None, False)),
         ("UserPromptSubmit", {}, ("working", None), False, 0, None),
+        # A message does not reopen a done session, but it starts a turn.
+        ("UserPromptSubmit", CHANNEL, ("done", None), False, 0, None),
+        (
+            "UserPromptSubmit",
+            CHANNEL,
+            ("ready", "idle"),
+            False,
+            0,
+            ("working", None, False),
+        ),
         ("PreToolUse", ASK, ("working", None), False, 0, ("ready", "asked", False)),
         ("PreToolUse", BASH, ("working", None), False, 0, None),
         # A turn that started with no prompt (for example from a cron).
@@ -152,6 +170,16 @@ def test_transition_table(
     if result is not None and result["explicit"]:
         assert result["source_kind"] == "user"
         assert result["note"] == "reopened by a prompt"
+
+
+def test_channel_prompt() -> None:
+    one = '<channel source="s" kind="message">\n#1 [dm] a: hi\n</channel>'
+    assert channel_prompt(one)
+    assert channel_prompt(f"\n{one}\n{one}\n")
+    assert not channel_prompt(f"{one}\nalso do Y")
+    assert not channel_prompt("please read <channel source=x>a</channel>")
+    assert not channel_prompt("<channels>")
+    assert not channel_prompt(None)
 
 
 def test_stop_keeps_the_declaration() -> None:
