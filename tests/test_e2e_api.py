@@ -60,6 +60,7 @@ def env(tmp_path: Path) -> Iterator[Env]:
         "agent": ("agent-1", {"append", "read", "grant"}, "granted"),
         "reader": ("reader", {"read"}, "all"),
         "waker": ("subspace", {"wake"}, "own"),
+        "reopener": ("subspace", {"wake", "reopen"}, "own"),
     }
     tokens: dict[str, str] = {}
     creds: dict[str, Credential] = {}
@@ -753,7 +754,80 @@ def test_wake_refusals(env: Env) -> None:
     assert r.status_code == 200, r.text
     r = wake(env, "other")
     assert r.status_code == 409
-    assert r.json() == {"error": "session_done", "detail": "session done: merged"}
+    assert r.json() == {
+        "error": "session_done",
+        "detail": "session done: merged",
+        "verdict": "done",
+        "note": "merged",
+    }
+
+
+OTHER_SID = "7d0c4e57-2b8e-4c43-9a51-1f0e8c3c2a10"
+REOPEN = {"reason": "the review found a bug", "by": OTHER_SID}
+
+
+def test_wake_reopens_a_done_session(env: Env) -> None:
+    g = new_gen(env, "laptop", WS_LAPTOP)
+    append(env, "laptop", WS_LAPTOP, g, 0, b"one\n", activity=1)
+    # Without the reopen scope, a reopen is refused, and nothing changes.
+    r = wake(env, reopen=REOPEN)
+    assert r.status_code == 403
+    assert r.json() == {"error": "forbidden", "detail": "missing scope: reopen"}
+    # On a session that is not done, a reopen is a plain wake.
+    assert wake(env, who="reopener", reopen=REOPEN).json() == {"verdict": "queued"}
+    state = env.client.get(f"{S}/state", headers=env.h("laptop")).json()
+    assert "status" not in state
+    r = env.client.post(
+        f"{S}/status",
+        headers=env.h("laptop"),
+        json=status_body(status="done", reason=None),
+    )
+    assert r.status_code == 200, r.text
+    r = wake(env)
+    assert r.status_code == 409
+    assert r.json() == {
+        "error": "session_done",
+        "detail": "session done",
+        "verdict": "done",
+    }
+    r = wake(env, who="reopener", reopen=REOPEN)
+    assert r.json() == {"verdict": "queued"}, r.text
+    state = env.client.get(f"{S}/state", headers=env.h("laptop")).json()
+    status = state["status"]
+    assert (status["status"], status["reason"], status["explicit"]) == (
+        "ready",
+        "idle",
+        True,
+    )
+    assert status["note"] == "reopened: the review found a bug"
+    assert status["source"] == {
+        "kind": "agent",
+        "host": "subspace",
+        "session_id": OTHER_SID,
+    }
+    assert state["wake_request"]["count"] == 2
+
+
+def test_a_refused_reopen_writes_nothing(env: Env) -> None:
+    r = env.client.post(
+        "/v1/sessions/claude-code/other/meta",
+        headers=env.h("laptop", WS_LAPTOP),
+        json={"title": "no lease yet"},
+    )
+    assert r.status_code == 200, r.text
+    r = env.client.post(
+        "/v1/sessions/claude-code/other/status",
+        headers=env.h("laptop"),
+        json=status_body(status="done", reason=None, note="merged"),
+    )
+    assert r.status_code == 200, r.text
+    r = wake(env, "other", who="reopener", reopen=REOPEN)
+    assert r.status_code == 409
+    assert r.json()["error"] == "lease_free"
+    state = env.client.get(
+        "/v1/sessions/claude-code/other/state", headers=env.h("laptop")
+    ).json()
+    assert state["status"]["status"] == "done"
 
 
 @pytest.mark.parametrize(

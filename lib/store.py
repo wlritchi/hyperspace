@@ -34,6 +34,7 @@ from typing import Any, Concatenate
 from framelog import FrameLog
 from hyperspace_protocol import (
     MAX_BODY,
+    REOPEN_NOTE_PREFIX,
     BlobManifest,
     BlobVersion,
     Branch,
@@ -59,6 +60,7 @@ from hyperspace_protocol import (
     TeleportEvent,
     UnclosedSession,
     ValidationError,
+    WakeReopen,
     WakeRequest,
     WakeVerdict,
     validate_metadata,
@@ -553,6 +555,17 @@ class StoreError(Exception):
 class NotFound(StoreError):
     def __init__(self, detail: str = "") -> None:
         super().__init__("not_found", detail)
+
+
+class SessionDone(StoreError):
+    """A wake for a `done` session. `note` is the outcome note of the
+    `done`, if it has one."""
+
+    def __init__(self, note: str | None) -> None:
+        super().__init__(
+            "session_done", f"session done: {note}" if note else "session done"
+        )
+        self.note = note
 
 
 class Conflict(StoreError):
@@ -2068,36 +2081,43 @@ class Store:
             current = latest[0]["seq"] if latest is not None else 0
             if request["base_seq"] != current:
                 raise StaleStatus(latest[0] if latest is not None else None)
-            written = self._db.execute(
-                """
-                INSERT INTO status_events
-                (session, seq, status, reason, wake, note, excerpt, source_kind,
-                 source_host, source_session, explicit, received)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    session,
-                    current + 1,
-                    request["status"],
-                    request.get("reason"),
-                    request.get("wake"),
-                    request.get("note"),
-                    request.get("excerpt"),
-                    request["source_kind"],
-                    host,
-                    request.get("source_session"),
-                    int(request["explicit"]),
-                    self.now(),
-                ),
-            ).lastrowid
-            self._db.execute(
-                "UPDATE sessions SET status = ? WHERE id = ?",
-                (request["status"], session),
-            )
-            self._advance_copies("status_events", written)
-            added = self._latest_status(session)
-            assert added is not None
-            return added[0]
+            return self._insert_status(session, current + 1, host, request)
+
+    def _insert_status(
+        self, session: int, seq: int, host: str, request: StatusRequest
+    ) -> StatusEvent:
+        """Add status event `seq` of a session. The caller holds the
+        transaction and checked that `seq` comes next."""
+        written = self._db.execute(
+            """
+            INSERT INTO status_events
+            (session, seq, status, reason, wake, note, excerpt, source_kind,
+             source_host, source_session, explicit, received)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session,
+                seq,
+                request["status"],
+                request.get("reason"),
+                request.get("wake"),
+                request.get("note"),
+                request.get("excerpt"),
+                request["source_kind"],
+                host,
+                request.get("source_session"),
+                int(request["explicit"]),
+                self.now(),
+            ),
+        ).lastrowid
+        self._db.execute(
+            "UPDATE sessions SET status = ? WHERE id = ?",
+            (request["status"], session),
+        )
+        self._advance_copies("status_events", written)
+        added = self._latest_status(session)
+        assert added is not None
+        return added[0]
 
     def heartbeat(
         self, account: str, host: str, scope: ReadScope, request: HeartbeatRequest
@@ -2310,21 +2330,41 @@ class Store:
             for r in rows
         )
 
-    def wake(self, key: SessionKey, count: int) -> WakeVerdict:
+    def wake(
+        self,
+        key: SessionKey,
+        count: int,
+        reopen: WakeReopen | None = None,
+        host: str = "",
+    ) -> WakeVerdict:
         """Record a wake request for the session, and return the verdict.
 
-        Raise `NotFound` if the session does not exist. Raise `StoreError`
-        with `session_done` or `lease_free` if its state refuses the wake.
-        This method does not check read access. A wake credential can wake
-        each session of its account.
+        With `reopen`, a `done` session first gets an explicit `ready` from
+        the session `reopen["by"]`, written as `host`; the caller checks the
+        `reopen` scope. Raise `NotFound` if the session does not exist. Raise
+        `SessionDone`, or `StoreError` with `lease_free`, if its state refuses
+        the wake; a refused wake writes nothing. This method does not check
+        read access. A wake credential can wake each session of its account.
         """
         with self._tx():
             session = self._require_session(key)
             latest = self._latest_status(session["id"])
             if latest is not None and latest[0]["status"] == "done":
-                note = latest[0].get("note")
-                raise StoreError(
-                    "session_done", f"session done: {note}" if note else "session done"
+                if reopen is None:
+                    raise SessionDone(latest[0].get("note"))
+                self._insert_status(
+                    session["id"],
+                    latest[0]["seq"] + 1,
+                    host,
+                    {
+                        "status": "ready",
+                        "reason": "idle",
+                        "note": REOPEN_NOTE_PREFIX + reopen["reason"],
+                        "source_kind": "agent",
+                        "source_session": reopen["by"],
+                        "explicit": True,
+                        "base_seq": latest[0]["seq"],
+                    },
                 )
             lease = self._lease(session)
             if lease["state"] == "free":

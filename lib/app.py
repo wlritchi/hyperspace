@@ -68,6 +68,7 @@ from store import (
     READ_CONNECTIONS,
     Conflict,
     ListPosition,
+    SessionDone,
     SessionKey,
     StaleStatus,
     Store,
@@ -551,6 +552,13 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
                 except StaleStatus as exc:
                     body = {"status": exc.current} if exc.current is not None else None
                     return error(exc.code, exc.detail, body)
+                except SessionDone as exc:
+                    # A field, so that a sender can bounce the message without
+                    # parsing the detail.
+                    done: dict[str, Any] = {"verdict": "done"}
+                    if exc.note:
+                        done["note"] = exc.note
+                    return error(exc.code, exc.detail, done)
                 except StoreError as exc:
                     return error(exc.code, exc.detail)
                 except ApiError as exc:
@@ -996,20 +1004,26 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         body = validate_wake_request(await read_json(request))
         key = SessionKey(principal.account, harness, body["session"])
         pending = body.get("pending", 0)
+        reopen = body.get("reopen")
+        if reopen is not None and "reopen" not in principal.scopes:
+            return error("forbidden", "missing scope: reopen")
 
         def log_wake(verdict: str) -> None:
             log.info(
-                "wake %s/%s/%s handle=%s pending=%d verdict=%s",
+                "wake %s/%s/%s handle=%s pending=%d reopen_by=%s verdict=%s",
                 key.account,
                 key.harness,
                 key.session_id,
                 body.get("handle", "-"),
                 pending,
+                reopen["by"] if reopen is not None else "-",
                 verdict,
             )
 
         try:
-            verdict = await run_in_threadpool(store.wake, key, pending)
+            verdict = await run_in_threadpool(
+                store.wake, key, pending, reopen, principal.host
+            )
         except StoreError as exc:
             log_wake(exc.code)
             raise

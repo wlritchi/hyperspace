@@ -13,7 +13,7 @@ The accounts file is TOML:
     id = "abcdefghijkl"            # 12 base32 characters
     secret_sha256 = "..."          # sha256 of the secret, hex
     host = "laptop"                # the one host that this credential acts as
-    scopes = ["append", "read", "grant"]   # or only ["wake"]
+    scopes = ["append", "read", "grant"]   # or ["wake"], or ["wake", "reopen"]
     read = "all"                   # own | granted | all
     expires_at = 2027-01-01T00:00:00Z   # optional
     label = "laptop, made 2026-10-13"   # optional
@@ -42,7 +42,9 @@ from pathlib import Path
 
 log = logging.getLogger("hyperspace.accounts")
 
-SCOPES = ("append", "read", "grant", "wake")
+SCOPES = ("append", "read", "grant", "wake", "reopen")
+# The scopes of a wake credential.
+WAKE_SCOPES = frozenset({"wake", "reopen"})
 READ_SCOPES = ("own", "granted", "all")
 
 _ACCOUNT_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?")
@@ -148,8 +150,10 @@ def _credential(raw: object, where: str) -> Credential:
     scopes = frozenset(str(s) for s in scopes_raw)
     # A wake credential goes to a message service. It must not also be able
     # to read transcripts or act as a host.
-    if "wake" in scopes and len(scopes) > 1:
-        raise AccountsError(f"{where}: the wake scope must be the only scope")
+    if "wake" in scopes and not scopes <= WAKE_SCOPES:
+        raise AccountsError(f"{where}: the wake scope permits only the reopen scope")
+    if "reopen" in scopes and "wake" not in scopes:
+        raise AccountsError(f"{where}: the reopen scope needs the wake scope")
     read = _str(table, "read", where, "own")
     if read not in READ_SCOPES:
         raise AccountsError(f"{where}: read must be one of {list(READ_SCOPES)}")

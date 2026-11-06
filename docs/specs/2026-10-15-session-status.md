@@ -463,6 +463,18 @@ stop. The Claude Code daemon stops an idle job after a grace period if no
 terminal is attached and no task runs. The client must not stop its own job at
 the end of a turn, because the user can be attached.
 
+A runner is different: a user is almost never attached, and a `done` job can
+keep its process for a long time, for example while a task or a channel plugin
+runs. While the process runs, messages reach the session and do not bounce.
+Thus the launcher in runner mode runs `claude stop <job>` for a live job whose
+session is `done` and beyond doubt, when Claude Code shows the job's process
+as idle for `IDLE_STOP` (2 minutes). The live-session registry record of the
+process gives this: `status` is `idle`, and `statusUpdatedAt` is the end of
+the turn (Claude Code 2.1.301). The launcher asks the server for the status
+once for each idle period, and again every 15 minutes, because a `done` can
+come from another host. It holds the session's sync lock, and it reads the
+record again just before the stop. Then the sweep closes the job as usual.
+
 Two triggers do step 4:
 
 - The SessionEnd hook of a background job (`CLAUDE_JOB_DIR` is set) whose
@@ -657,9 +669,12 @@ next tick. The [wake spec](2026-10-28-wake.md) gives the endpoint, the `wake`
 scope, the verdicts, and the launcher rules. The launcher is not a webhook: it
 makes only outbound requests, and the server is the meeting point.
 
-The server refuses a wake for a `done` session with `409` and a message such
-as "session done: <outcome note>" (M1). A `reopen` with a reason (M2), and the
-notices to the sender (M1, M3), are later work (see "Later").
+The server refuses a wake for a `done` session with `409`, the verdict `done`
+and the outcome note. Subspace then tells the sender that the message was not
+delivered, with the note (M1). A wake with a `reopen` reason first reopens the
+`done` session, and the session then wakes with the message (M2). The wake
+spec gives the details. The notice that a message is queued (M3) is later work
+(see "Later").
 
 A resume must continue the session under the same id. Subspace keys its state
 by session id, and the relay connects as that id. Hyperspace owns this rule
@@ -667,9 +682,11 @@ for each resume that it does, on each host kind and in each launcher mode
 (wake spec, "Session identity").
 
 A `done` session that is still live (its process did not stop yet) gets
-messages directly, through its relay. The message is new activity, so it
-reopens the session (U5). The process still runs, so the session can still be
-in use.
+messages directly, through its relay, and no bounce. A message does not reopen
+the session (U5): the turn that the message starts does not change the status.
+On a runner, the launcher stops the process when the session is `done` and its
+turn ended `IDLE_STOP` (2 minutes) ago (see "Closing a done session"). Later
+messages then take the wake path and bounce.
 
 ## Overview
 
@@ -795,9 +812,7 @@ A heartbeat applies only to the credential's own host.
 
 ## Later
 
-- **Reopen and notices.** A `reopen` with a reason for a `done` session (M2),
-  and the notices to the sender that a message was not delivered or is queued
-  (M1, M3).
+- **Queued notice.** The notice to the sender that a message is queued (M3).
 - **Scale to zero.** An operator stops a runner when no session on it is
   `working` or `waiting` with wake `local`, and starts it when a wake request
   comes for a session whose lease the runner holds.

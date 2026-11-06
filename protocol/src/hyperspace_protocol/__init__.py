@@ -61,6 +61,9 @@ MAX_HEARTBEAT_SESSIONS = 1000
 MIN_HEARTBEAT_INTERVAL = 10
 MAX_HEARTBEAT_INTERVAL = 3600
 MAX_WAKE_HANDLE = 128
+# The note of the status event that a wake with `reopen` writes starts with
+# this text, and the reason follows.
+REOPEN_NOTE_PREFIX = "reopened: "
 # The largest `pending` of a wake that the server keeps. A larger value is
 # cut to this one. SQLite cannot store integers above 2**63 - 1.
 MAX_WAKE_PENDING = 2**31 - 1
@@ -68,7 +71,7 @@ MAX_WAKE_PENDING = 2**31 - 1
 FileKind = Literal["log", "blob"]
 HostKind = Literal["workstation", "runner"]
 ReadScope = Literal["own", "granted", "all"]
-Scope = Literal["append", "read", "grant", "wake"]
+Scope = Literal["append", "read", "grant", "wake", "reopen"]
 GenerationCause = Literal["root", "rewrite", "diverge", "fork"]
 PlacementCause = Literal["start", "move", "teleport", "steal", "diverge"]
 SessionState = Literal["normal", "conflicted"]
@@ -350,11 +353,13 @@ def validate_heartbeat(value: dict[str, Any]) -> HeartbeatRequest:
 
 
 def validate_wake_request(value: dict[str, Any]) -> WakeRequestBody:
-    """Check a wake, and return it with only `session`, `pending` and
-    `handle`. Other fields are not refused: the sender can add fields.
+    """Check a wake, and return it with only `session`, `pending`, `handle`
+    and `reopen`. Other fields are not refused: the sender can add fields.
 
     `pending` and `handle` are only for information. A value that is too
-    large or not clean is cut, or dropped, so that the wake is not lost."""
+    large or not clean is cut, or dropped, so that the wake is not lost. The
+    same applies to the reason of `reopen`, but a reopen with no reason, or
+    whose `by` is not a session id, is refused."""
     session = value.get("session")
     if not isinstance(session, str):
         raise ValidationError("session must be a string")
@@ -369,7 +374,28 @@ def validate_wake_request(value: dict[str, Any]) -> WakeRequestBody:
         clean = "".join("?" if _is_control(c) else c for c in handle)
         if clean:
             request["handle"] = clean[:MAX_WAKE_HANDLE]
+    reopen = value.get("reopen")
+    if reopen is not None:
+        request["reopen"] = _wake_reopen(reopen)
     return cast(WakeRequestBody, request)
+
+
+def _wake_reopen(value: object) -> WakeReopen:
+    if not isinstance(value, dict):
+        raise ValidationError("reopen must be an object")
+    fields = cast(dict[str, Any], value)
+    reason = fields.get("reason")
+    if not isinstance(reason, str):
+        raise ValidationError("reopen.reason must be a string")
+    # The reason becomes the note of the reopen, after REOPEN_NOTE_PREFIX.
+    clean = " ".join("".join(" " if _is_control(c) else c for c in reason).split())
+    if not clean:
+        raise ValidationError("reopen.reason must not be empty")
+    by = fields.get("by")
+    if not isinstance(by, str):
+        raise ValidationError("reopen.by must be a string")
+    limit = MAX_STATUS_NOTE - len(REOPEN_NOTE_PREFIX)
+    return {"reason": clean[:limit], "by": validate_session_id(by)}
 
 
 # --- Bodies -----------------------------------------------------------------
@@ -695,6 +721,15 @@ class WakeRequestBody(TypedDict):
     # The number of messages that wait. Absent: 0.
     pending: NotRequired[int]
     items: NotRequired[list[Any]]
+    # Reopen the session if it is `done`. Needs the `reopen` scope.
+    reopen: NotRequired[WakeReopen]
+
+
+class WakeReopen(TypedDict):
+    # One line: why the sender reopens the session.
+    reason: str
+    # The session that sent the message.
+    by: str
 
 
 class WakeResponse(TypedDict):

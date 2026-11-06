@@ -86,12 +86,14 @@ scope and no other scope. Its host name is only a name for logs:
 ```sh
 kubectl -n hyperspace exec deploy/hyperspace -- \
   python /app/hyperspace/scripts/new-credential.py \
-  --host subspace --scopes wake
+  --host subspace --scopes wake,reopen
 ```
 
 Put the token and the URL `https://hyperspace.example.com/v1/wake/claude-code`
 in the wake configuration of subspace. A `wake` credential can call only the
-wake endpoint, so a leak of it exposes no transcript.
+wake endpoint, so a leak of it exposes no transcript. With `reopen`, its
+senders can also reopen a `done` session on purpose; leave `reopen` out to
+refuse that.
 
 ### Credentials from a provisioner
 

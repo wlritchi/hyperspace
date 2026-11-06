@@ -11,6 +11,7 @@ from hyperspace_protocol import (
     MAX_STATUS_NOTE,
     MAX_WAKE_HANDLE,
     MAX_WAKE_PENDING,
+    REOPEN_NOTE_PREFIX,
     ValidationError,
     validate_file_path,
     validate_harness,
@@ -256,6 +257,27 @@ def test_wake_request_validation() -> None:
     ):
         checked = validate_wake_request({"session": "s1", "handle": handle})
         assert checked.get("handle") == kept
+    # The reason of a reopen is cleaned and cut to fit the note of the reopen.
+    by = "7d0c4e57-2b8e-4c43-9a51-1f0e8c3c2a10"
+    for reason, kept in (
+        ("fix the bug", "fix the bug"),
+        (" a\nb\x1b ", "a b"),
+        ("x" * 400, "x" * (MAX_STATUS_NOTE - len(REOPEN_NOTE_PREFIX))),
+    ):
+        checked = validate_wake_request(
+            {"session": "s1", "reopen": {"reason": reason, "by": by}}
+        )
+        assert checked.get("reopen") == {"reason": kept, "by": by}
+    for reopen in (
+        "fix it",
+        {"by": by},
+        {"reason": " \n", "by": by},
+        {"reason": 7, "by": by},
+        {"reason": "fix it"},
+        {"reason": "fix it", "by": "../x"},
+    ):
+        with pytest.raises(ValidationError):
+            validate_wake_request({"session": "s1", "reopen": reopen})
     for bad in (
         {},
         {"session": 7},

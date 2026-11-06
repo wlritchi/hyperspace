@@ -79,6 +79,12 @@ def test_dump_and_parse(tmp_path: Path) -> None:
         '[[accounts.default.credentials]]\nid = "abcdefghijkl"\n'
         'secret_sha256 = "' + "0" * 64 + '"\nhost = "subspace"\n'
         'scopes = ["wake", "read"]',
+        '[[accounts.default.credentials]]\nid = "abcdefghijkl"\n'
+        'secret_sha256 = "' + "0" * 64 + '"\nhost = "subspace"\n'
+        'scopes = ["wake", "reopen", "read"]',
+        '[[accounts.default.credentials]]\nid = "abcdefghijkl"\n'
+        'secret_sha256 = "' + "0" * 64 + '"\nhost = "subspace"\n'
+        'scopes = ["reopen"]',
         "not toml [",
     ],
 )
@@ -470,7 +476,12 @@ def test_new_credential_avoids_directory_ids(
 
 @pytest.mark.parametrize(
     ("scopes", "code", "written"),
-    [("wake", 0, frozenset({"wake"})), ("wake,read", 1, None)],
+    [
+        ("wake", 0, frozenset({"wake"})),
+        ("wake,reopen", 0, frozenset({"wake", "reopen"})),
+        ("wake,read", 1, None),
+        ("reopen", 1, None),
+    ],
 )
 def test_new_credential_wake_scope(
     tmp_path: Path,
