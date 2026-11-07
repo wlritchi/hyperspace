@@ -702,6 +702,31 @@ def test_tail_reads_active_branch(ctx: Context, fake: FakeClaude) -> None:
     assert "answer two" not in tail(ctx.api, sid, 5)
 
 
+def test_tail_reads_the_end_past_the_read_limit(
+    ctx: Context, fake: FakeClaude, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = fake.transcript(WS)
+    sid = path.stem
+    records: list[dict[str, Any]] = []
+    for i in range(40):
+        records += [prompt(f"question {i:02}"), text_reply(f"answer {i:02} " * 20)]
+    fake.write(path, *records)
+    sync(ctx, path)
+    read_log = ctx.api.read_log
+
+    def capped(harness: str, sid: str, generation: str, start: int, end: int) -> bytes:
+        # As the server does with its body limit: the start of the range.
+        return read_log(harness, sid, generation, start, min(end, start + 1000))
+
+    monkeypatch.setattr(ctx.api, "read_log", capped)
+    # More turns than the transcript has: the whole transcript, in many reads.
+    out = tail(ctx.api, sid, 60)
+    assert "question 00" in out and "answer 39" in out
+    out = tail(ctx.api, sid, 2)
+    assert "question 38" in out and "answer 39" in out
+    assert "question 37" not in out
+
+
 def test_state_dir_is_shared_with_the_notice_hook(tmp_path: Path) -> None:
     # The plugin's notice.sh looks for flags in $XDG_STATE_HOME/hyperspace.
     state = State(tmp_path / "hyperspace")

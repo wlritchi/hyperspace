@@ -40,7 +40,7 @@ from hyperspace_client.status import (
     seq,
     write,
 )
-from hyperspace_client.sync import Context, Syncer, register_host
+from hyperspace_client.sync import CHUNK, Context, Syncer, register_host
 from hyperspace_client.teleport import (
     TeleportError,
     fork,
@@ -889,6 +889,23 @@ def cmd_reopen(args: argparse.Namespace, cfg: Config) -> int:
     return _write_all(cfg, [sid], request, args)
 
 
+def _read_range(api: Api, sid: str, generation: str, start: int, end: int) -> bytes:
+    """Bytes `start` to `end` of a transcript generation. The server returns
+    at most its body limit for one read, from the start of the range, so read
+    in chunks until the range is complete."""
+    parts: list[bytes] = []
+    offset = start
+    while offset < end:
+        part = api.read_log(
+            ClaudeCode.harness, sid, generation, offset, min(offset + CHUNK, end)
+        )
+        if not part:
+            raise Exit(1, f"{sid}: the server returned no bytes at offset {offset}")
+        parts.append(part)
+        offset += len(part)
+    return b"".join(parts)
+
+
 def tail(api: Api, sid: str, turns: int) -> str:
     """The last `turns` turns of the active branch of a session's
     transcript. Read only the end of the transcript, in growing windows."""
@@ -908,7 +925,7 @@ def tail(api: Api, sid: str, turns: int) -> str:
     window = TAIL_WINDOW
     while True:
         start = max(0, length - window)
-        data = api.read_log(ClaudeCode.harness, sid, active, start, length)
+        data = _read_range(api, sid, active, start, length)
         # The first record of a window is incomplete, so a window must hold
         # one prompt more than the turns to show.
         if start == 0 or ClaudeCode.prompts(data) > turns:
