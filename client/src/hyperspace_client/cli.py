@@ -592,7 +592,16 @@ def cmd_show(args: argparse.Namespace, cfg: Config) -> int:
     if automation:
         print(f"automation {printable(automation)}")
     print(f"state     {state['state']}")
+    status = state.get("status")
+    if status is not None:
+        print(f"status    {_status_line(status)}")
     print(f"lease     {lease['state']} {lease.get('host', '')} since {lease['since']}")
+    liveness = state.get("liveness")
+    if liveness is not None:
+        print(
+            f"liveness  {liveness['state']} {liveness.get('host', '')}"
+            f" since {liveness['since']}"
+        )
     print("placements:")
     for p in manifest["placements"]:
         print(f"  {p['first_seen'][:16]}  {p['cause']:<8} {p['host']}:{p['workspace']}")

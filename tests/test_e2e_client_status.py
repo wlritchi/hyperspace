@@ -226,6 +226,29 @@ def test_done_then_a_channel_event_stays_done(
     assert server_status(ctx.api, sid)["status"] == "working"
 
 
+def test_show_prints_the_status(
+    server: Server,
+    ctx: Context,
+    fake: FakeClaude,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    sid, _ = started_session(ctx, fake)
+    request = {**_request("done", sid, reason=None, wake=None, note="x", by_user=True)}
+    event = set_status(ctx, sid, request)
+    assert event is not None
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("HYPERSPACE_CONFIG", str(tmp_path / "none.toml"))
+    monkeypatch.setenv("HYPERSPACE_URL", "http://127.0.0.1")
+    monkeypatch.setenv("HYPERSPACE_TOKEN", "token")
+    monkeypatch.setattr(cli_mod, "Api", lambda *args, **kwargs: server.api("laptop"))
+    assert cli_mod.main(["show", sid]) == 0
+    out = capsys.readouterr().out
+    received = event["received"][:16]
+    assert f"\nstatus    done: x [user on laptop, {received}]\n" in out
+
+
 def test_prompt_that_reopens_drops_the_done_notice(
     server: Server, ctx: Context, fake: FakeClaude
 ) -> None:
