@@ -224,23 +224,32 @@ is dropped, and the status stays as it is until the next status write. An
 automatic write still does not overwrite a `done` or an explicit status from a
 different writer.
 
+A hook decides its write from the queued write, else from the latest event
+that the client saw. There is one exception: if the client saw an explicit
+`done` after the base of a queued automatic write, the hook decides from the
+`done`, because the server refuses the queued write. Example: a hook write of
+the turn is queued. Then a sync gets a `done` from a different writer, and the
+record holds it. The Stop hook of the turn makes no write. If it decided from
+the queued write, it would write `ready` with the `done` as its base, and the
+server would accept it.
+
 ### Transitions
 
 The adapter maps harness events to status writes. For Claude Code:
 
-| Event                                                                       | Write                                                                                       |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| UserPromptSubmit                                                            | `working`. If the current status is `done`, this write reopens the session and is explicit. |
-| UserPromptSubmit for a channel event (a prompt of only `<channel>` blocks)  | As UserPromptSubmit, but no write if the status is `done`: a message does not reopen it.    |
-| A cron or other trigger starts a turn with no prompt                        | As UserPromptSubmit.                                                                        |
-| PreToolUse, with no known status and no declaration in this turn            | `working`. For example, the first turn of a new background job (see below).                 |
-| PreToolUse for AskUserQuestion, or a Notification for a permission prompt   | `ready`, reason `asked`.                                                                    |
-| PostToolUse for AskUserQuestion, or the tool call after a permission prompt | `working`.                                                                                  |
-| Stop, with an explicit status from the agent in this turn                   | No write. The agent's declaration stays (see below).                                        |
-| Stop, with running tasks in the job's `inFlight` (see below)                | `waiting`, wake `local`.                                                                    |
-| Stop, otherwise                                                             | `ready`, reason `idle`.                                                                     |
-| SessionStart with `source: resume`                                          | No write. A resume alone does not reopen a `done` session (U5).                             |
-| SessionEnd                                                                  | No write. Liveness records that the process stopped.                                        |
+| Event                                                                                                                  | Write                                                                                                                                                                                               |
+| ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| UserPromptSubmit                                                                                                       | `working`. If the current status is `done`, this write reopens the session and is explicit.                                                                                                         |
+| UserPromptSubmit for a harness event (a prompt of only `<channel>`, `<task-notification>` or `<agent-message>` blocks) | As UserPromptSubmit, but no write if the status is `done`: a message or a task notification does not reopen it. Claude Code also fires the hook for such an event that it adds to a turn that runs. |
+| A cron or other trigger starts a turn with no prompt                                                                   | As UserPromptSubmit.                                                                                                                                                                                |
+| PreToolUse, with no known status and no declaration in this turn                                                       | `working`. For example, the first turn of a new background job (see below).                                                                                                                         |
+| PreToolUse for AskUserQuestion, or a Notification for a permission prompt                                              | `ready`, reason `asked`.                                                                                                                                                                            |
+| PostToolUse for AskUserQuestion, or the tool call after a permission prompt                                            | `working`.                                                                                                                                                                                          |
+| Stop, with an explicit status from the agent in this turn                                                              | No write. The agent's declaration stays (see below).                                                                                                                                                |
+| Stop, with running tasks in the job's `inFlight` (see below)                                                           | `waiting`, wake `local`.                                                                                                                                                                            |
+| Stop, otherwise                                                                                                        | `ready`, reason `idle`.                                                                                                                                                                             |
+| SessionStart with `source: resume`                                                                                     | No write. A resume alone does not reopen a `done` session (U5).                                                                                                                                     |
+| SessionEnd                                                                                                             | No write. Liveness records that the process stopped.                                                                                                                                                |
 
 A question or a permission prompt after a declaration still writes `ready`,
 reason `asked`, because the session needs the user while the prompt shows. The

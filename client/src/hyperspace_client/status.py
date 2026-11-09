@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx
 
 from hyperspace_client.adapters import LocalSession
-from hyperspace_client.adapters.claude_code import ClaudeCode, Job, channel_prompt
+from hyperspace_client.adapters.claude_code import ClaudeCode, Job, event_prompt
 from hyperspace_client.api import ApiError, NotFound, StatusConflict
 from hyperspace_client.state import SessionRecord, State
 from hyperspace_protocol import (
@@ -98,6 +98,8 @@ def known(state: State, record: SessionRecord) -> Known:
 
 def _known(record: SessionRecord, queued: tuple[dict[str, Any], float] | None) -> Known:
     latest: dict[str, Any] | None = queued[0] if queued else record.status
+    if queued and _closed_after(record.status, queued[0]):
+        latest = record.status
     if latest is None:
         return Known(None, None, record.declared)
     return Known(
@@ -105,6 +107,20 @@ def _known(record: SessionRecord, queued: tuple[dict[str, Any], float] | None) -
         latest.get("reason"),
         record.declared,
         bool(latest.get("explicit")),
+    )
+
+
+def _closed_after(saved: dict[str, Any] | None, queued: dict[str, Any]) -> bool:
+    """Whether the server refuses the queued automatic write: the saved event
+    is an explicit `done` after the base of the write (see `_may_retry`)."""
+    base = queued.get("base_seq")
+    return (
+        saved is not None
+        and not queued.get("explicit")
+        and isinstance(base, int)
+        and saved["status"] == "done"
+        and bool(saved.get("explicit"))
+        and seq(saved) > base
     )
 
 
@@ -143,16 +159,18 @@ def transition(
     function only: a turn that a cron starts fires UserPromptSubmit or at
     least PreToolUse; a permission prompt fires Notification with
     `notification_type` "permission_prompt"; AskUserQuestion fires
-    PreToolUse, and PostToolUse after the user answers; a turn that a channel
-    event starts fires UserPromptSubmit with the event as the prompt."""
+    PreToolUse, and PostToolUse after the user answers; a channel event or a
+    task notification fires UserPromptSubmit with the event as the prompt,
+    also when it is added to a turn that runs."""
     if payload.get("agent_id"):
         # A subagent's tool calls do not change the main agent's status.
         return None
     current = known.status
     if event == "UserPromptSubmit":
         if current == "done":
-            if channel_prompt(payload.get("prompt")):
-                # A message does not reopen a `done` session.
+            if event_prompt(payload.get("prompt")):
+                # A message or a task notification does not reopen a `done`
+                # session.
                 return None
             return _want(
                 "working",

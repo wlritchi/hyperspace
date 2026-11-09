@@ -27,7 +27,7 @@ from hyperspace_client import cli as cli_mod
 from hyperspace_client.adapters import LocalSession
 from hyperspace_client.adapters.claude_code import (
     ClaudeCode,
-    channel_prompt,
+    event_prompt,
     merge_options,
 )
 from hyperspace_client.api import Api, StatusConflict
@@ -73,6 +73,10 @@ CHANNEL = {
     "prompt": '<channel source="plugin:relay:relay" kind="message">#1 [dm] a: hi'
     "</channel>"
 }
+TASK_DONE = {
+    "prompt": "<task-notification>\n<task-id>a1</task-id>\n<status>completed</status>"
+    "\n</task-notification>"
+}
 DECLARED = {
     "status": "waiting",
     "wake": "local",
@@ -88,8 +92,10 @@ DECLARED = {
         ("UserPromptSubmit", {}, ("ready", "idle"), False, 0, ("working", None, False)),
         ("UserPromptSubmit", {}, (None, None), False, 0, ("working", None, False)),
         ("UserPromptSubmit", {}, ("working", None), False, 0, None),
-        # A message does not reopen a done session, but it starts a turn.
+        # A message or a task notification does not reopen a done session,
+        # but it starts a turn.
         ("UserPromptSubmit", CHANNEL, ("done", None), False, 0, None),
+        ("UserPromptSubmit", TASK_DONE, ("done", None), False, 0, None),
         (
             "UserPromptSubmit",
             CHANNEL,
@@ -172,14 +178,24 @@ def test_transition_table(
         assert result["note"] == "reopened by a prompt"
 
 
-def test_channel_prompt() -> None:
+def test_event_prompt() -> None:
     one = '<channel source="s" kind="message">\n#1 [dm] a: hi\n</channel>'
-    assert channel_prompt(one)
-    assert channel_prompt(f"\n{one}\n{one}\n")
-    assert not channel_prompt(f"{one}\nalso do Y")
-    assert not channel_prompt("please read <channel source=x>a</channel>")
-    assert not channel_prompt("<channels>")
-    assert not channel_prompt(None)
+    task = TASK_DONE["prompt"]
+    agent = '<agent-message from="a1">\nreport\n</agent-message>'
+    assert event_prompt(one)
+    assert event_prompt(f"\n{one}\n{one}\n")
+    assert event_prompt(task)
+    assert event_prompt(f"{agent}\n{task}")
+    # A message can quote a closing tag.
+    assert event_prompt('<channel source="s">see </channel> here</channel>')
+    # Many blocks with text after them: no catastrophic backtracking.
+    assert not event_prompt(task * 40 + "also do Y")
+    assert not event_prompt(f"{one}\nalso do Y")
+    assert not event_prompt(f"{task}\nalso do Y")
+    assert not event_prompt("please read <channel source=x>a</channel>")
+    assert not event_prompt("<channels>")
+    assert not event_prompt("<task-notification>")
+    assert not event_prompt(None)
 
 
 def test_stop_keeps_the_declaration() -> None:
@@ -1115,6 +1131,41 @@ def test_a_prompt_during_the_send_of_a_done_is_written(
     assert _latest(server) == (2, "done", None, True, "user")
     send_wanted(ctx, session)
     assert _latest(server) == (3, "working", None, True, "user")
+
+
+def test_a_stop_does_not_write_over_a_done_after_a_queued_hook_write(
+    ctx: Context, server: StatusServer
+) -> None:
+    # A hook write of the turn is still queued when the client sees a done
+    # from a different writer. The Stop hook of the turn must not write over
+    # the done.
+    session = _session(ctx)
+    _seen(ctx, server.mark("ready", "laptop", kind="hook", reason="idle"))
+    _hook(ctx, "UserPromptSubmit")()
+    _seen(ctx, server.mark("done", "desk", kind="agent"))
+    _hook(ctx, "Stop")()
+    send_wanted(ctx, session)
+    assert _latest(server) == (2, "done", None, True, "agent")
+    assert ctx.state.wanted_status(H, SID) is None
+
+
+def test_a_task_notification_in_the_turn_does_not_reopen_its_done(
+    ctx: Context, server: StatusServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The agent marks its session done. Then a task notification is added to
+    # the turn, and fires UserPromptSubmit. The Stop hook of the turn keeps
+    # the done.
+    monkeypatch.setenv(SESSION_ENV, SID)
+    session = _session(ctx)
+    _seen(ctx, server.mark("working", "laptop", kind="hook"))
+    done = _request("done", SID, reason=None, wake=None, note=None, by_user=False)
+    assert set_status(ctx, SID, done) is not None
+    adapter = cast(ClaudeCode, ctx.adapter)
+    on_hook(ctx.state, adapter, H, SID, "UserPromptSubmit", TASK_DONE)
+    _hook(ctx, "Stop")()
+    send_wanted(ctx, session)
+    assert _latest(server) == (2, "done", None, True, "agent")
+    assert ctx.state.wanted_status(H, SID) is None
 
 
 def test_a_cli_write_during_the_send_of_a_queued_cli_write_is_written(
