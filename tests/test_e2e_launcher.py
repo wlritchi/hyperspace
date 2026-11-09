@@ -1826,6 +1826,40 @@ def test_the_resume_skips_a_session_registered_in_another_pid_namespace(
     assert list(job_ids(fake).values()) == [sid]
 
 
+def test_the_resume_skips_a_session_with_an_unreadable_job_state(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "working")
+    run = runner(ctx, host, Bg(), Clock())
+    fake_jobs(fake, monkeypatch, run)
+    # A write that a crash stopped: the launcher cannot remove the job, and
+    # Claude Code would copy the session.
+    job = fake.root / "jobs" / sid[:8]
+    job.mkdir(parents=True)
+    state = job / "state.json"
+    state.write_bytes(b"\0" * 64)
+    assert run.resume(sid, RESUME_WORKING) is False
+    assert run.resume(sid, RESUME_WORKING) is False
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert errors == [
+        (
+            f"{sid}: not resumed: the job state {state} has no valid session id,"
+            " so a resume would start a copy; if no process runs the job, remove"
+            " its directory"
+        )
+    ]
+    state.unlink()
+    job.rmdir()
+    assert run.resume(sid, RESUME_WORKING) is True
+    assert list(job_ids(fake).values()) == [sid]
+
+
 def test_the_resume_finds_a_copy_from_the_job_state(
     ctx: Context,
     fake: FakeClaude,

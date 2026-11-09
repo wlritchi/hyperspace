@@ -1005,6 +1005,21 @@ class ClaudeCode:
         session run."""
         return self._runs(session_id, links=False)
 
+    def unreadable_job(self, session_id: str) -> Path | None:
+        """The state file of the job directory of the session's own id, if
+        the file has no valid session id, else None. A write that a crash
+        stopped can leave the file full of NUL bytes. The launcher then
+        cannot remove the job, and Claude Code 2.1.301 `claude --bg --resume`
+        of the session starts a copy because it cannot read the saved
+        state."""
+        path = self.config_dir / "jobs" / session_id[:8] / "state.json"
+        if not path.is_file():
+            return None
+        record = _read_state(path)
+        if record is not None and _session_id(record.get("sessionId")) is not None:
+            return None
+        return path
+
     def foreign_registrations(self, session_id: str) -> list[Path]:
         """The registry records of the session's background processes from
         another pid domain (another container or another machine). This host

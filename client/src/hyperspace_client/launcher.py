@@ -598,6 +598,9 @@ class Launcher:
     # The sessions with registry records from another pid domain, logged once
     # until the records go away.
     _foreign_logged: set[str] = field(default_factory=set[str])
+    # The sessions with an unreadable job state, logged once until it goes
+    # away.
+    _unreadable_logged: set[str] = field(default_factory=set[str])
     # The last error of `resume_env`, logged once until it changes.
     _env_error: str | None = None
     # True while the cap on processes holds resumes, so that it logs once.
@@ -827,6 +830,19 @@ class Launcher:
                     )
                 return False
             self._foreign_logged.discard(sid)
+            unreadable = self.adapter.unreadable_job(sid)
+            if unreadable is not None:
+                if sid not in self._unreadable_logged:
+                    self._unreadable_logged.add(sid)
+                    log.error(
+                        "%s: not resumed: the job state %s has no valid session"
+                        " id, so a resume would start a copy; if no process"
+                        " runs the job, remove its directory",
+                        sid,
+                        unreadable,
+                    )
+                return False
+            self._unreadable_logged.discard(sid)
             # Before the removal of job records, so that the limit also
             # applies to a `claude rm` that fails at each tick.
             recent.append(now)
