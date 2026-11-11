@@ -212,3 +212,16 @@ A workstation or another runner sends a session with
 runner. On the runner, `hyperspace restore <session id>` in the target
 workspace takes the lease. To send a session from a runner, run
 `hyperspace teleport` there after the session stops.
+
+## Start a session
+
+From a client with the `launch` scope, run:
+
+```sh
+hyperspace launch --host runner-1 --workspace /workspace --wait "Review the changes"
+```
+
+Use this command instead of a command inside the runner container. The
+launcher claims the request and starts one new session. `--wait` prints its
+session id. In a Claude Code session, the new session records the current
+session as its parent.

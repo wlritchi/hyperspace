@@ -114,6 +114,7 @@ class Config:
     launcher_env: dict[str, str] = field(default_factory=dict[str, str])
     launcher_secret_env: list[str] = field(default_factory=list[str])
     # No resume while this many Claude Code processes run on the host.
+    launches: bool = True
     launcher_max_sessions: int = 10
     state_dir: Path = field(default_factory=state_dir)
 
@@ -158,6 +159,9 @@ _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # the wrong session, fork a copy, or start a headless turn.
 _LAUNCHER_OWNS = frozenset(
     {
+        "--model",
+        "--effort",
+        "--name",
         "--bg",
         "--background",
         "--resume",
@@ -325,6 +329,10 @@ def load(env: dict[str, str] | None = None, path: Path | None = None) -> Config:
             f"heartbeat_interval must be a whole number of seconds from "
             f"{MIN_HEARTBEAT_INTERVAL} to {MAX_HEARTBEAT_INTERVAL}"
         )
+    launches = data.get("launches", True)
+    if not isinstance(launches, bool):
+        raise ConfigError("launches must be a boolean")
+    cfg.launches = launches
     cfg.heartbeat_interval = beat
     idle = data.get("launcher_idle_exit", 600.0)
     if not isinstance(idle, int | float) or isinstance(idle, bool) or idle < 60:

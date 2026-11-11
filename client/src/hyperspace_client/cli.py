@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -50,10 +51,12 @@ from hyperspace_client.teleport import (
 )
 from hyperspace_protocol import (
     CAP_CHILD_SESSIONS,
+    CAP_LAUNCH,
     CAP_LIST_CURSOR,
     CAP_LIVENESS,
     CAP_SESSION_STATUS,
     STATUSES,
+    LaunchRequest,
     SessionStateBody,
     SessionSummary,
     StatusEvent,
@@ -1010,6 +1013,68 @@ def cmd_grant(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def cmd_launch(args: argparse.Namespace, cfg: Config) -> int:
+    state = State(cfg.state_dir)
+    ctx = _context(cfg, state)
+    harness = "claude-code"
+    try:
+        ctx.api.require_capability(CAP_LAUNCH)
+        if args.cancel:
+            item = ctx.api.cancel_launch(harness, args.cancel)
+        else:
+            if args.prompt is None:
+                raise Exit(1, "a prompt is required")
+            body: LaunchRequest = {
+                "host": args.host or cfg.host,
+                "prompt": args.prompt,
+                "request": uuid.uuid4().hex,
+            }
+            for key in ("workspace", "model", "effort", "name"):
+                value = getattr(args, key)
+                if value is not None:
+                    body[key] = value
+            if os.environ.get(SESSION_ENV):
+                body["parent"] = os.environ[SESSION_ENV]
+            try:
+                response = ctx.api.launch(harness, body)
+            except httpx.TransportError:
+                response = ctx.api.launch(harness, body)
+            lid = response["launch"]
+            if (
+                body["host"] == cfg.host
+                and response["verdict"] == "queued"
+                and cfg.launches
+            ):
+                env = launcher.ResumeEnv(
+                    cfg.launcher_env, cfg.launcher_secret_env, cfg.token_cache_ttl
+                )
+                launcher.Launcher(
+                    ctx,
+                    cast(ClaudeCode, ctx.adapter),
+                    cfg.claude_bin,
+                    cfg.heartbeat_interval,
+                    None,
+                    claude_args=cfg.launcher_claude_args,
+                    max_sessions=cfg.launcher_max_sessions,
+                    workspace=str(Path.cwd().resolve()),
+                    resume_env=env,
+                ).launch_pending()
+            item = ctx.api.get_launch(harness, lid)
+            while args.wait and item["state"] not in ("started", "failed", "cancelled"):
+                time.sleep(1)
+                item = ctx.api.get_launch(harness, lid)
+        if args.json:
+            print(json.dumps(item))
+        elif args.wait and item["state"] in ("started", "failed", "cancelled"):
+            print(item.get("session") or item.get("reason") or "cancelled")
+        else:
+            print(item["launch"])
+        return 1 if item["state"] in ("failed", "cancelled") and not args.cancel else 0
+    finally:
+        ctx.api.close()
+        state.close()
+
+
 def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
     if launcher.off():
         return 0
@@ -1055,6 +1120,7 @@ def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
                     before_tick=before_tick,
                     runner=args.runner,
                     stay=args.stay,
+                    launches=cfg.launches,
                     claude_args=cfg.launcher_claude_args,
                     max_sessions=cfg.launcher_max_sessions,
                     resume_env=env,
@@ -1187,6 +1253,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="hook mode: log errors to the state directory and exit 0",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("launch", help="start a new session on a host")
+    p.add_argument("prompt", nargs="?")
+    for option in ("host", "workspace", "model", "effort", "name", "cancel"):
+        p.add_argument("--" + option)
+    p.add_argument("--wait", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_launch)
 
     p = sub.add_parser("whoami", help="show the credential's account and host")
     p.set_defaults(func=cmd_whoami)

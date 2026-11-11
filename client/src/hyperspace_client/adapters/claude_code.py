@@ -1483,6 +1483,14 @@ class ClaudeCode:
         return b"".join(out)
 
     @staticmethod
+    def launch_marker(
+        source: str | None, env: Mapping[str, str]
+    ) -> tuple[str, str | None] | None:
+        if source != "startup" or not env.get("HYPERSPACE_LAUNCH"):
+            return None
+        return env["HYPERSPACE_LAUNCH"], env.get("HYPERSPACE_LAUNCH_PARENT")
+
+    @staticmethod
     def arrival_notice(arrival: dict[str, Any]) -> str:
         """The text that the SessionStart hook prints after a teleport."""
         source: dict[str, Any] = arrival.get("source") or {}

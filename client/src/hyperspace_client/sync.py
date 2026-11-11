@@ -596,6 +596,19 @@ class Syncer:
                 continue
             if self._as_log(f) or not self.sync_blob(f):
                 metadata = self.sync_log(LocalFile(f.rel_path, "log", f.path), metadata)
+        saved_links = state.get(f"launch_links:{self._h}:{self._sid}")
+        if saved_links:
+            metadata["links"] = {**metadata.get("links", {}), **json.loads(saved_links)}
+        lid = metadata.get("links", {}).get("launch")
+        linked_key = f"launch_linked:{self._h}:{self._sid}:{lid}"
+        if lid and not state.get(linked_key):
+            try:
+                self.ctx.api.link_launch(self._h, lid, self._sid)
+            except ApiError as exc:
+                if exc.status != 409:
+                    raise
+                log.error("launch %s: conflicting session link: %s", lid, exc)
+            state.put(linked_key, "1")
         server_meta = server_metadata(self.workspace, metadata)
         if server_meta != record.sent_metadata and self.result.files:
             self.ctx.api.add_metadata(

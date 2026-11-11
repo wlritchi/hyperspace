@@ -101,7 +101,11 @@ Runner = Callable[[list[str], str, float], RunResult]
 
 def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment for a `claude` that this client starts."""
-    env = {k: v for k, v in os.environ.items() if k not in SESSION_VARS}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in (*SESSION_VARS, "HYPERSPACE_LAUNCH", "HYPERSPACE_LAUNCH_PARENT")
+    }
     env.update(extra or {})
     return env
 

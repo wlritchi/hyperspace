@@ -39,12 +39,16 @@ from hyperspace_client.status import clean_note, end_continued, printable
 from hyperspace_client.sync import Context, register_host
 from hyperspace_client.teleport import TeleportError, back_up, restore_held
 from hyperspace_protocol import (
+    CAP_LAUNCH,
     CAP_LIVENESS,
     CAP_WAKE,
     MAX_HEARTBEAT_SESSIONS,
     HeartbeatRequest,
+    Launch,
     SessionSummary,
     UnclosedSession,
+    ValidationError,
+    validate_session_id,
 )
 
 log = logging.getLogger("hyperspace")
@@ -247,6 +251,7 @@ def send_heartbeat(
     interval: int,
     final: bool = False,
     wakes: bool = False,
+    launches: bool = False,
 ) -> None:
     """Send the heartbeat of `adapter`'s config directory. It includes the
     refused jobs that the launcher recorded, because each heartbeat replaces
@@ -269,6 +274,8 @@ def send_heartbeat(
         request["unclosed"] = unclosed[:MAX_HEARTBEAT_SESSIONS]
     if wakes:
         request["wakes"] = True
+    if launches:
+        request["launches"] = True
     if final:
         request["final"] = True
     ctx.api.heartbeat(request)
@@ -551,6 +558,46 @@ def needs_process(
     return message
 
 
+def launch_argv(claude: str, options: list[str], item: Launch) -> list[str]:
+    argv = [claude, *options]
+    for key in ("model", "effort", "name"):
+        value = item.get(key)
+        if value is not None:
+            argv.extend(["--" + key, str(value)])
+    return [*argv, "--bg", "--", item.get("prompt", "")]
+
+
+def launch_job_id(output: str) -> str | None:
+    match = re.search(r"backgrounded\s*·\s*([A-Za-z0-9_-]+)", output)
+    return match[1] if match else None
+
+
+def launch_session(config: Path, job: str, workspace: str) -> str | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", job):
+        return None
+    try:
+        body = json.loads((config / "jobs" / job / "state.json").read_text())
+        if not isinstance(body, dict) or body.get("cwd") != workspace:
+            return None
+        sid = body.get("sessionId")
+        return validate_session_id(sid) if isinstance(sid, str) else None
+    except (OSError, ValueError, ValidationError):
+        return None
+
+
+def save_launch_links(
+    state: State, harness: str, sid: str, launch: str, parent: str | None
+) -> None:
+    record = state.session(harness, sid)
+    links = dict(record.metadata.get("links") or {})
+    links["launch"] = launch
+    if parent:
+        links["parent"] = parent
+    record.metadata["links"] = links
+    state.save_session(record, ("metadata",))
+    state.put(f"launch_links:{harness}:{sid}", json.dumps(links))
+
+
 @dataclass
 class Launcher:
     ctx: Context
@@ -565,6 +612,7 @@ class Launcher:
     # Runner mode: restore and resume the sessions whose lease the host holds.
     runner: bool = False
     stay: bool = False
+    launches: bool = True
     # More Claude Code options for each resume, from the configuration.
     claude_args: list[str] = field(default_factory=list[str])
     # No resume while this many Claude Code processes run on the host, so
@@ -738,6 +786,73 @@ class Launcher:
                 waiting,
             )
         self._capped = bool(waiting)
+
+    def launch_pending(self) -> None:
+        if not self.launches or not self.ctx.api.has_capability(CAP_LAUNCH):
+            return
+        running = len(
+            self.adapter.live_processes(
+                self.ctx.state.continued_from(self.adapter.harness)
+            )
+        )
+        for pending in self.ctx.api.pending_launches(self.adapter.harness):
+            if running >= self.max_sessions:
+                break
+            lid = pending["launch"]
+            try:
+                item = self.ctx.api.claim_launch(self.adapter.harness, lid)
+            except ApiError as exc:
+                if exc.status == 409:
+                    continue
+                raise
+            workspace = item.get("workspace") or self.workspace
+            if not Path(workspace).is_absolute() or not Path(workspace).is_dir():
+                self.ctx.api.fail_launch(
+                    self.adapter.harness,
+                    lid,
+                    "workspace must be an absolute existing directory",
+                )
+                continue
+            env = dict(self.resume_env())
+            env["HYPERSPACE_LAUNCH"] = lid
+            env.pop("HYPERSPACE_LAUNCH_PARENT", None)
+            if item.get("parent"):
+                env["HYPERSPACE_LAUNCH_PARENT"] = item.get("parent", "")
+            try:
+                result = self.run_claude(
+                    launch_argv(self.claude, self.claude_args, item),
+                    workspace,
+                    120.0,
+                    env,
+                )
+            except OSError as exc:
+                self.ctx.api.fail_launch(
+                    self.adapter.harness, lid, str(exc).splitlines()[0]
+                )
+                continue
+            running += 1
+            job = launch_job_id(result.output)
+            sid = (
+                launch_session(self.adapter.config_dir, job, workspace) if job else None
+            )
+            if sid:
+                save_launch_links(
+                    self.ctx.state, self.adapter.harness, sid, lid, item.get("parent")
+                )
+                try:
+                    self.ctx.api.link_launch(self.adapter.harness, lid, sid)
+                except ApiError as exc:
+                    if exc.status != 409:
+                        raise
+                    log.error("launch %s: conflicting session link: %s", lid, exc)
+            elif (
+                result.returncode is not None and result.returncode != 0 and job is None
+            ):
+                self.ctx.api.fail_launch(
+                    self.adapter.harness, lid, _reason(result.returncode, result.output)
+                )
+            else:
+                log.error("launch %s: no session reported; do not retry", lid)
 
     def resume(self, sid: str, prompt: str, home: str | None = None) -> bool:
         """Resume a session as a background job. Start `claude` in `home` (the
@@ -1044,12 +1159,26 @@ class Launcher:
             # Send the heartbeat before the resumes, so that a stale `live`
             # from before a restart clears.
             wakes = (self.runner or self.stay) and self.ctx.api.has_capability(CAP_WAKE)
-            send_heartbeat(self.ctx, self.adapter, live, self.interval, wakes=wakes)
+            launches = (
+                (self.runner or self.stay)
+                and self.launches
+                and self.ctx.api.has_capability(CAP_LAUNCH)
+            )
+            send_heartbeat(
+                self.ctx,
+                self.adapter,
+                live,
+                self.interval,
+                wakes=wakes,
+                launches=launches,
+            )
             self.sweep(live)
             if self.runner:
                 self.restore()
             if self.runner or wakes:
                 self.resume_held(live)
+            if launches:
+                self.launch_pending()
         except (ApiError, httpx.HTTPError, OSError) as exc:
             # The next tick tries again.
             log.warning("launcher: %s: %s", type(exc).__name__, exc)

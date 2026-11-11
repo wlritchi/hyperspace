@@ -117,7 +117,7 @@ def main() -> None:
         os.makedirs(job)
         with open(os.path.join(job, "state.json"), "w") as f:
             f.write(os.environ["FAKE_CLAUDE_JOB_STATE"])
-        print("job started")
+        print("backgrounded · " + os.path.basename(job))
         return
     if mode == "resume":
         args = sys.argv[1:]

@@ -424,3 +424,17 @@ kubectl -n hyperspace exec deploy/hyperspace -- python /app/hyperspace/scripts/p
 `purge.py` shows what it would remove, and removes it only with `--yes`. A
 host that still has the session uploads it again at its next sync, so remove
 the local copies too.
+
+## Launch requests
+
+Runner launchers and workstation launchers with `--stay` act on launch
+requests by default. Set `launches = false` in `config.toml` to turn this off.
+Such a launcher does not advertise launch support in its heartbeat. The
+`launch` scope lets a caller start sessions with the host's credentials.
+
+Use `hyperspace launch --host runner-1 --wait "Review the changes"` to start a
+session. Use `--workspace` for an absolute directory on the destination, and
+`--model`, `--effort`, or `--name` to set the job options. `--json` gives the
+launch record. `hyperspace launch --cancel l_ID` cancels a pending request.
+Without `--host`, the command uses this host. If the request is queued here,
+the command runs one launcher pass, unless launches are off.

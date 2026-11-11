@@ -17,7 +17,7 @@ import threading
 import uuid
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -50,17 +50,21 @@ from hyperspace_client.launcher import (
     close_after_exit,
     close_job,
     host_lock,
+    launch_argv,
+    launch_job_id,
+    launch_session,
     load_unclosed,
     needs_process,
     record_refusal,
     run_bg,
     run_rm,
+    save_launch_links,
 )
 from hyperspace_client.notices import session_start_notice
 from hyperspace_client.state import State
-from hyperspace_client.sync import Context, Syncer
+from hyperspace_client.sync import Context, Syncer, register_host
 from hyperspace_client.teleport import HeldRestore, TeleportError, restore
-from hyperspace_protocol import SessionStateBody, SessionSummary
+from hyperspace_protocol import Launch, SessionStateBody, SessionSummary
 from store import SessionKey
 
 WS = "/home/wlritchi/hyperspace"
@@ -122,7 +126,7 @@ def server(tmp_path: Path) -> Iterator[Server]:
     s = make_server(
         tmp_path / "server",
         hosts={
-            "laptop": ("laptop", {"append", "read", "grant"}, "all"),
+            "laptop": ("laptop", {"append", "read", "grant", "launch"}, "all"),
             "agent": ("agent-1", {"append", "read", "grant"}, "granted"),
             "sender": ("sender", {"wake"}, "own"),
         },
@@ -1994,15 +1998,22 @@ def test_restore_retry_backs_off(
 
 def test_launcher_claude_args_config(tmp_path: Path) -> None:
     none = tmp_path / "none.toml"
-    env = {"HYPERSPACE_LAUNCHER_CLAUDE_ARGS": '["--model", "opus", "--agent", "a"]'}
-    assert load(env, none).launcher_claude_args == ["--model", "opus", "--agent", "a"]
+    env = {
+        "HYPERSPACE_LAUNCHER_CLAUDE_ARGS": '["--agent", "opus", "--permission-mode", "default"]'
+    }
+    assert load(env, none).launcher_claude_args == [
+        "--agent",
+        "opus",
+        "--permission-mode",
+        "default",
+    ]
     assert load({}, none).launcher_claude_args == []
     toml = tmp_path / "config.toml"
-    toml.write_text('launcher_claude_args = ["--model", "sonnet"]\n')
-    assert load({}, toml).launcher_claude_args == ["--model", "sonnet"]
+    toml.write_text('launcher_claude_args = ["--agent", "sonnet"]\n')
+    assert load({}, toml).launcher_claude_args == ["--agent", "sonnet"]
     for bad in (
         "not json",
-        '"--model"',
+        '"--agent"',
         "[1]",
         '[""]',
         '["--resume", "x"]',
@@ -2023,7 +2034,7 @@ def test_launcher_claude_args_config(tmp_path: Path) -> None:
     "args",
     [
         ["--dangerously-load-development-channels", "plugin:a@b"],
-        ["--model", "opus", "--add-dir", "/a", "/b"],
+        ["--agent", "opus", "--add-dir", "/a", "/b"],
         ["--allowedTools", "Bash"],
         ["--allowed-tools", "Bash"],
         ["--disallowedTools", "Bash"],
@@ -2034,12 +2045,12 @@ def test_launcher_claude_args_config(tmp_path: Path) -> None:
         ["--mcp-config", "a.json"],
         ["--tools", "Bash"],
         ["--plugin-dir", "/opt/plugins"],
-        ["--model", "opus", "--plugin-dir=/opt/plugins"],
+        ["--agent", "opus", "--plugin-dir=/opt/plugins"],
         # With no value, the option takes the message.
-        ["--model", "opus", "--tools"],
+        ["--agent", "opus", "--tools"],
         # The `=` form also takes the arguments after it.
-        ["--model", "opus", "--add-dir=/a"],
-        ["--model", "opus", "--add-dir=/a", "/b"],
+        ["--agent", "opus", "--add-dir=/a"],
+        ["--agent", "opus", "--add-dir=/a", "/b"],
         ["--dangerously-load-development-channels=plugin:a@b"],
     ],
 )
@@ -2058,9 +2069,9 @@ def test_launcher_claude_args_cannot_end_with_a_list_option(args: list[str]) -> 
             "plugin:a@b",
             "--dangerously-skip-permissions",
         ],
-        ["--add-dir", "/a", "/b", "--model", "opus"],
-        ["--add-dir=/a", "--model", "opus"],
-        ["--model", "opus"],
+        ["--add-dir", "/a", "/b", "--agent", "opus"],
+        ["--add-dir=/a", "--agent", "opus"],
+        ["--agent", "opus"],
         ["--dangerously-skip-permissions"],
         [],
     ],
@@ -2367,3 +2378,237 @@ def test_workstation_without_wake_capability(
     assert not bg.calls
     assert sender.wake(HARNESS, {"session": sid})["verdict"] == "queued"
     sender.close()
+
+
+@pytest.mark.parametrize(
+    "mode", ["started", "error", "missing", "cwd", "workspace", "off"]
+)
+def test_launch_pass(
+    ctx: Context, host: Host, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+
+    register_host(ctx, "workstation")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    sid = str(uuid.uuid4())
+    item = ctx.api.launch(
+        HARNESS,
+        {
+            "host": ctx.host,
+            "prompt": "--dangerously-skip-permissions",
+            "workspace": str(workspace),
+        },
+    )
+    calls: list[list[str]] = []
+
+    def start(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
+        calls.append(argv)
+        assert argv[-3:] == ["--bg", "--", "--dangerously-skip-permissions"]
+        assert env["HYPERSPACE_LAUNCH"] == item["launch"]
+        assert "HYPERSPACE_LAUNCH_PARENT" not in env
+        if mode == "error":
+            return RunResult(1, "start failed\nmore detail")
+        if mode != "missing":
+            path = host.config_dir / "jobs" / "job1" / "state.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps(
+                    {"sessionId": sid, "cwd": "/wrong" if mode == "cwd" else cwd}
+                )
+            )
+        return RunResult(0, "backgrounded · job1")
+
+    if mode == "workspace":
+        workspace.rmdir()
+    run = Launcher(
+        ctx,
+        host,
+        FAKE,
+        60,
+        None,
+        workspace=str(workspace),
+        run_claude=start,
+        resume_env=dict,
+        launches=mode != "off",
+    )
+    run.launch_pending()
+    run.launch_pending()
+    result = ctx.api.get_launch(HARNESS, item["launch"])
+    expected = {
+        "started": "started",
+        "error": "failed",
+        "missing": "claimed",
+        "cwd": "claimed",
+        "workspace": "failed",
+        "off": "pending",
+    }
+    assert result["state"] == expected[mode]
+    assert len(calls) == (0 if mode in ("workspace", "off") else 1)
+    if mode == "started":
+        assert result["session"] == sid
+        assert (
+            ctx.state.session(HARNESS, sid).metadata["links"]["launch"]
+            == item["launch"]
+        )
+        assert launch_session(host.config_dir, "../job1", str(workspace)) is None
+    assert launch_job_id("backgrounded · job1") == "job1"
+    assert launch_job_id("job started") is None
+
+
+@pytest.mark.parametrize("option", ["--model", "--effort", "--name"])
+def test_launch_options_owned(option: str) -> None:
+    with pytest.raises(ConfigError):
+        check_claude_args([option, "value"])
+
+
+def test_launch_argv_values() -> None:
+
+    item = cast(
+        Launch,
+        {
+            "prompt": "--dangerously-skip-permissions",
+            "model": "--bad",
+            "effort": "high",
+            "name": "a b",
+        },
+    )
+    assert launch_argv(FAKE, [], item) == [
+        FAKE,
+        "--model",
+        "--bad",
+        "--effort",
+        "high",
+        "--name",
+        "a b",
+        "--bg",
+        "--",
+        "--dangerously-skip-permissions",
+    ]
+
+
+@pytest.mark.parametrize("source", ["startup", "resume", "clear", "compact"])
+def test_launch_hook_marker(source: str) -> None:
+    env = {"HYPERSPACE_LAUNCH": "l_one", "HYPERSPACE_LAUNCH_PARENT": "parent"}
+    assert ClaudeCode.launch_marker(source, env) == (
+        ("l_one", "parent") if source == "startup" else None
+    )
+
+
+def test_launch_hook_sync_links(ctx: Context, fake: FakeClaude, host: Host) -> None:
+
+    register_host(ctx, "workstation")
+    parent = session(ctx, fake)
+    response = ctx.api.launch(
+        HARNESS, {"host": ctx.host, "prompt": "hi", "parent": parent}
+    )
+    lid = response["launch"]
+    ctx.api.claim_launch(HARNESS, lid)
+    path = fake.transcript(WS)
+    fake.write(path, prompt("hi"), text_reply())
+    found = host.session_for_transcript(path)
+    assert found is not None
+    save_launch_links(ctx.state, HARNESS, found.session_id, lid, parent)
+    ctx.api.link_launch(HARNESS, lid, found.session_id)
+    Syncer(ctx, found, WS).run()
+    fake.write(path, prompt("again"), text_reply())
+    Syncer(ctx, found, WS).run()
+    assert ctx.api.get_launch(HARNESS, lid)["session"] == found.session_id
+    assert (
+        ctx.api.manifest(HARNESS, found.session_id)["metadata"]["links"]["parent"]
+        == parent
+    )
+
+
+def test_launch_cli_local(
+    server: Server,
+    fake: FakeClaude,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+
+    values = {
+        "XDG_STATE_HOME": str(tmp_path / "xdg"),
+        "HYPERSPACE_CONFIG": str(tmp_path / "none.toml"),
+        "HYPERSPACE_URL": "http://127.0.0.1:9",
+        "HYPERSPACE_TOKEN": "unused",
+        "HYPERSPACE_HOST": "laptop",
+        "CLAUDE_CONFIG_DIR": str(fake.root),
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+
+    def context(cfg: Config, state: State) -> Context:
+        return Context(
+            api=server.api("laptop"), state=state, adapter=ClaudeCode(), host=cfg.host
+        )
+
+    monkeypatch.setattr("hyperspace_client.cli._context", context)
+    sid = str(uuid.uuid4())
+    original = Launcher.launch_pending
+
+    def start(run: Launcher) -> None:
+        def bg(
+            argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+        ) -> RunResult:
+            path = fake.root / "jobs" / "localjob" / "state.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"sessionId": sid, "cwd": cwd}))
+            return RunResult(0, "backgrounded · localjob")
+
+        run.run_claude = bg
+        run.resume_env = dict
+        original(run)
+
+    monkeypatch.setattr(Launcher, "launch_pending", start)
+    local = State(tmp_path / "register")
+    ctx = context(load(), local)
+    register_host(ctx, "workstation")
+    ctx.api.close()
+    local.close()
+    assert main(["launch", "--wait", "--json", "hello"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["session"] == sid
+    api = server.api("laptop")
+    queued = api.launch(HARNESS, {"host": "laptop", "prompt": "later"})
+    api.close()
+    assert main(["launch", "--cancel", queued["launch"], "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "cancelled"
+
+
+def test_launch_claim_race(
+    ctx: Context, host: Host, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+
+    register_host(ctx, "workstation")
+    item = ctx.api.launch(
+        HARNESS, {"host": ctx.host, "prompt": "hi", "workspace": str(tmp_path)}
+    )
+    pending = ctx.api.pending_launches(HARNESS)
+    monkeypatch.setattr(ctx.api, "pending_launches", lambda harness: pending)
+    calls: list[list[str]] = []
+
+    def start(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
+        calls.append(argv)
+        return RunResult(0, "no job id")
+
+    first = Launcher(ctx, host, FAKE, 60, None, run_claude=start, resume_env=dict)
+    second = Launcher(ctx, host, FAKE, 60, None, run_claude=start, resume_env=dict)
+    first.launch_pending()
+    second.launch_pending()
+    assert len(calls) == 1
+    assert ctx.api.get_launch(HARNESS, item["launch"])["state"] == "claimed"
+
+
+def test_launch_heartbeat_off(
+    ctx: Context, host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requests: list[dict[str, Any]] = []
+    monkeypatch.setattr(ctx.api, "heartbeat", requests.append)
+    run = Launcher(ctx, host, FAKE, 60, None, stay=True, launches=False)
+    run.tick()
+    assert requests and "launches" not in requests[0]

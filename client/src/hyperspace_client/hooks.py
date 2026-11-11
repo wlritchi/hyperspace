@@ -98,6 +98,19 @@ def handle(
         log.info("%s: no status: the job's session is not known", session.session_id)
     else:
         session = resolved
+    marker = (
+        adapter.launch_marker(_str(payload, "source"), os.environ)
+        if event == "SessionStart"
+        else None
+    )
+    if marker:
+        state = State(cfg.state_dir)
+        try:
+            launcher.save_launch_links(
+                state, session.harness, session.session_id, *marker
+            )
+        finally:
+            state.close()
     transcript = str(session.transcript)
     if event in STATUS_EVENTS and known:
         try:

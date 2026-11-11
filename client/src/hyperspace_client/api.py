@@ -29,6 +29,9 @@ from hyperspace_protocol import (
     HeartbeatRequest,
     HeartbeatResponse,
     HostInfo,
+    Launch,
+    LaunchRequest,
+    LaunchResponse,
     Manifest,
     SessionList,
     SessionMetadata,
@@ -192,6 +195,49 @@ class Api:
         return cast(
             WakeResponse,
             self._json("POST", f"/wake/{quote(harness, safe='')}", json=body),
+        )
+
+    def launch(self, harness: str, body: LaunchRequest) -> LaunchResponse:
+        return cast(
+            LaunchResponse,
+            self._json("POST", f"/launch/{quote(harness, safe='')}", json=body),
+        )
+
+    def get_launch(self, harness: str, launch: str) -> Launch:
+        return cast(Launch, self._json("GET", self._launch_path(harness, launch)))
+
+    @staticmethod
+    def _launch_path(harness: str, launch: str) -> str:
+        return f"/launch/{quote(harness, safe='')}/{quote(launch, safe='')}"
+
+    def cancel_launch(self, harness: str, launch: str) -> Launch:
+        return cast(Launch, self._json("DELETE", self._launch_path(harness, launch)))
+
+    def pending_launches(self, harness: str) -> list[Launch]:
+        return cast(
+            list[Launch],
+            self._json(
+                "GET", f"/launch/{quote(harness, safe='')}", params={"state": "pending"}
+            )["launches"],
+        )
+
+    def claim_launch(self, harness: str, launch: str) -> Launch:
+        return cast(
+            Launch, self._json("POST", self._launch_path(harness, launch) + "/claim")
+        )
+
+    def link_launch(self, harness: str, launch: str, session: str) -> None:
+        self._json(
+            "POST",
+            self._launch_path(harness, launch) + "/link",
+            json={"session": session},
+        )
+
+    def fail_launch(self, harness: str, launch: str, reason: str) -> None:
+        self._json(
+            "POST",
+            self._launch_path(harness, launch) + "/fail",
+            json={"reason": reason},
         )
 
     # --- Sessions ----------------------------------------------------------
