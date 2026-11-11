@@ -551,6 +551,10 @@ def _restore(
     for key in ("parent", "launch"):
         if key in server_links:
             record.metadata.setdefault("links", {})[key] = server_links[key]
+    if server_links.get("launch"):
+        ctx.state.put(
+            f"launch_linked:{harness}:{session_id}:{server_links['launch']}", "1"
+        )
     record.sent_metadata = {}
     ctx.state.save_session(record)
 

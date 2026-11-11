@@ -2842,16 +2842,51 @@ def test_launch_cli_wait_failure(
     assert requests[0] == requests[1]
 
 
+@pytest.mark.parametrize("capped", [False, True])
 def test_launch_cli_local_error(
-    ctx: Context, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ctx: Context,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    capped: bool,
 ) -> None:
     register_host(ctx, "workstation")
     monkeypatch.setattr("hyperspace_client.cli._context", lambda cfg, state: ctx)
 
+    original = Launcher.launch_pending
+
     def broken(run: Launcher, launch_id: str | None = None) -> None:
+        if capped:
+            run.max_sessions = 0
+            original(run, launch_id)
+            return
         raise launcher_mod.CredentialError("secret locked")
 
     monkeypatch.setattr(Launcher, "launch_pending", broken)
     monkeypatch.setenv("HYPERSPACE_HOST", ctx.host)
-    assert main(["launch", "--json", "hi"]) == 0
-    assert json.loads(capsys.readouterr().out)["state"] == "pending"
+    assert main(["launch", "--json", "hi"]) == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["state"] == "cancelled"
+    assert "not started; launch was cancelled" in captured.err
+
+
+def test_local_launch_does_not_list(
+    ctx: Context, host: Host, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    register_host(ctx, "workstation")
+    item = ctx.api.launch(
+        HARNESS, {"host": ctx.host, "prompt": "hi", "workspace": str(tmp_path)}
+    )
+
+    def no_list(harness: str) -> list[Launch]:
+        raise AssertionError("a local launch must not list pending requests")
+
+    monkeypatch.setattr(ctx.api, "pending_launches", no_list)
+
+    def bg(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
+        return RunResult(None, "")
+
+    run = Launcher(ctx, host, FAKE, 60, None, resume_env=dict, run_claude=bg)
+    run.launch_pending(item["launch"])
+    assert ctx.api.get_launch(HARNESS, item["launch"])["state"] == "claimed"

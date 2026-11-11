@@ -1045,11 +1045,12 @@ def cmd_launch(args: argparse.Namespace, cfg: Config) -> int:
             print(lid, file=sys.stderr)
             if args.wait and response["verdict"] == "queued":
                 print("queued", file=sys.stderr)
-            if (
+            local_pass = (
                 body["host"] == cfg.host
                 and response["verdict"] == "queued"
                 and cfg.launches
-            ):
+            )
+            if local_pass:
                 try:
                     env = launcher.ResumeEnv(
                         cfg.launcher_env, cfg.launcher_secret_env, cfg.token_cache_ttl
@@ -1067,6 +1068,14 @@ def cmd_launch(args: argparse.Namespace, cfg: Config) -> int:
                     ).launch_pending(lid)
                 except Exception as exc:  # noqa: BLE001
                     log.error("launch %s: local pass: %s", lid, exc)
+            if local_pass:
+                try:
+                    ctx.api.cancel_launch(harness, lid)
+                except ApiError as exc:
+                    if exc.status != 409:
+                        raise
+                else:
+                    print("not started; launch was cancelled", file=sys.stderr)
             item = ctx.api.get_launch(harness, lid)
             while args.wait and item["state"] not in ("started", "failed", "cancelled"):
                 time.sleep(1)

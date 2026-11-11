@@ -801,29 +801,38 @@ class Launcher:
         """Claim pending launches once, or only the caller's local request."""
         if not self.launches or not self.ctx.api.has_capability(CAP_LAUNCH):
             return
-        try:
-            base_env = dict(self.resume_env())
-        except CredentialError as exc:
-            if self._env_error != str(exc):
-                log.error("launcher: launch environment: %s", exc)
-            self._env_error = str(exc)
-            return
-        self._env_error = None
         running = len(
             self.adapter.live_processes(
                 self.ctx.state.continued_from(self.adapter.harness)
             )
         )
-        for pending in self.ctx.api.pending_launches(self.adapter.harness):
-            if launch_id is not None and pending["launch"] != launch_id:
-                continue
+        candidates = (
+            [launch_id]
+            if launch_id is not None
+            else [
+                item["launch"]
+                for item in self.ctx.api.pending_launches(self.adapter.harness)
+            ]
+        )
+        if not candidates or running < self.max_sessions:
+            self._launch_capped = False
+        base_env: dict[str, str] | None = None
+        for lid in candidates:
             if running >= self.max_sessions:
                 if not self._launch_capped:
                     log.warning("launcher: process limit holds pending launches")
                 self._launch_capped = True
                 break
             self._launch_capped = False
-            lid = pending["launch"]
+            if base_env is None:
+                try:
+                    base_env = dict(self.resume_env())
+                except CredentialError as exc:
+                    if self._env_error != str(exc):
+                        log.error("launcher: launch environment: %s", exc)
+                    self._env_error = str(exc)
+                    return
+                self._env_error = None
             try:
                 item = self.ctx.api.claim_launch(self.adapter.harness, lid)
             except ApiError as exc:

@@ -573,7 +573,9 @@ def test_lease_loss_refresh_skips_locked_session(laptop: Host, agent: Host) -> N
     assert not t.exists()
 
 
-def test_restore_keeps_launch_links(server: Server, laptop: Host, agent: Host) -> None:
+def test_restore_keeps_launch_links(
+    server: Server, laptop: Host, agent: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
     transcript = start_session(laptop, LAPTOP_WS)
     sid = transcript.stem
     record = laptop.ctx.state.session("claude-code", sid)
@@ -588,6 +590,11 @@ def test_restore_keeps_launch_links(server: Server, laptop: Host, agent: Host) -
         agent.ctx.state.session("claude-code", sid).metadata["links"]["parent"]
         == "12345678-parent"
     )
+
+    def no_link(harness: str, launch: str, session: str) -> None:
+        raise AssertionError("a restored launch is already linked")
+
+    monkeypatch.setattr(agent.ctx.api, "link_launch", no_link)
     agent.fake.write(result.transcript, prompt("continue", cwd=AGENT_WS))
     sync(agent, result.transcript, AGENT_WS)
     assert manifest(server, sid)["metadata"]["links"] == {
