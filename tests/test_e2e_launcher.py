@@ -2457,7 +2457,7 @@ def test_launch_pass(
     assert launch_job_id("job started") is None
 
 
-@pytest.mark.parametrize("option", ["--model", "--effort", "--name"])
+@pytest.mark.parametrize("option", ["--name"])
 def test_launch_options_owned(option: str) -> None:
     with pytest.raises(ConfigError):
         check_claude_args([option, "value"])
@@ -2476,12 +2476,9 @@ def test_launch_argv_values() -> None:
     )
     assert launch_argv(FAKE, [], item) == [
         FAKE,
-        "--model",
-        "--bad",
-        "--effort",
-        "high",
-        "--name",
-        "a b",
+        "--model=--bad",
+        "--effort=high",
+        "--name=a b",
         "--bg",
         "--",
         "--dangerously-skip-permissions",
@@ -2490,8 +2487,12 @@ def test_launch_argv_values() -> None:
 
 @pytest.mark.parametrize("source", ["startup", "resume", "clear", "compact"])
 def test_launch_hook_marker(source: str) -> None:
-    env = {"HYPERSPACE_LAUNCH": "l_one", "HYPERSPACE_LAUNCH_PARENT": "parent"}
-    assert ClaudeCode.launch_marker(source, env) == (
+    env = {
+        "HYPERSPACE_LAUNCH": "l_one",
+        "HYPERSPACE_LAUNCH_PARENT": "parent",
+        "CLAUDE_JOB_DIR": "/jobs/12345678",
+    }
+    assert ClaudeCode.launch_marker(source, env, "12345678-session") == (
         ("l_one", "parent") if source == "startup" else None
     )
 
@@ -2549,7 +2550,7 @@ def test_launch_cli_local(
     sid = str(uuid.uuid4())
     original = Launcher.launch_pending
 
-    def start(run: Launcher) -> None:
+    def start(run: Launcher, launch_id: str | None = None) -> None:
         def bg(
             argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
         ) -> RunResult:
@@ -2560,18 +2561,20 @@ def test_launch_cli_local(
 
         run.run_claude = bg
         run.resume_env = dict
-        original(run)
+        original(run, launch_id)
 
     monkeypatch.setattr(Launcher, "launch_pending", start)
     local = State(tmp_path / "register")
     ctx = context(load(), local)
     register_host(ctx, "workstation")
+    other = ctx.api.launch(HARNESS, {"host": ctx.host, "prompt": "not this command"})
     ctx.api.close()
     local.close()
     assert main(["launch", "--wait", "--json", "hello"]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["session"] == sid
     api = server.api("laptop")
+    assert api.get_launch(HARNESS, other["launch"])["state"] == "pending"
     queued = api.launch(HARNESS, {"host": "laptop", "prompt": "later"})
     api.close()
     assert main(["launch", "--cancel", queued["launch"], "--json"]) == 0
@@ -2612,3 +2615,243 @@ def test_launch_heartbeat_off(
     run = Launcher(ctx, host, FAKE, 60, None, stay=True, launches=False)
     run.tick()
     assert requests and "launches" not in requests[0]
+
+
+def test_launch_defaults() -> None:
+    options = ["--model", "host", "--effort=low"]
+    assert check_claude_args(options) == options
+    assert launch_argv(FAKE, options, cast(Launch, {"prompt": "hi"})) == [
+        FAKE,
+        *options,
+        "--bg",
+        "--",
+        "hi",
+    ]
+    assert launch_argv(
+        FAKE,
+        options,
+        cast(Launch, {"prompt": "hi", "model": "request", "effort": "high"}),
+    ) == [FAKE, "--model=request", "--effort=high", "--bg", "--", "hi"]
+
+
+def test_launch_env_before_claim(
+    ctx: Context, host: Host, caplog: pytest.LogCaptureFixture
+) -> None:
+    register_host(ctx, "workstation")
+    item = ctx.api.launch(HARNESS, {"host": ctx.host, "prompt": "hi"})
+
+    def env() -> Mapping[str, str]:
+        raise launcher_mod.CredentialError("locked secret")
+
+    run = Launcher(ctx, host, FAKE, 60, None, resume_env=env)
+    run.launch_pending()
+    run.launch_pending()
+    assert ctx.api.get_launch(HARNESS, item["launch"])["state"] == "pending"
+    assert sum("locked secret" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.parametrize("outcome", [None, 0])
+def test_launch_timeout_and_cap(
+    ctx: Context, host: Host, tmp_path: Path, outcome: int | None
+) -> None:
+    register_host(ctx, "workstation")
+    item = ctx.api.launch(
+        HARNESS, {"host": ctx.host, "prompt": "hi", "workspace": str(tmp_path)}
+    )
+    calls: list[list[str]] = []
+
+    def bg(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
+        calls.append(argv)
+        return RunResult(outcome, "")
+
+    run = Launcher(
+        ctx, host, FAKE, 60, None, resume_env=dict, run_claude=bg, max_sessions=0
+    )
+    run.launch_pending()
+    assert not calls
+    run.max_sessions = 1
+    run.launch_pending()
+    run.launch_pending()
+    assert len(calls) == 1
+    assert ctx.api.get_launch(HARNESS, item["launch"])["state"] == "claimed"
+
+
+def test_launch_marker_child_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HYPERSPACE_LAUNCH", "l_one")
+    monkeypatch.setenv("HYPERSPACE_LAUNCH_PARENT", "parent")
+    assert "HYPERSPACE_LAUNCH" not in launcher_mod.child_env()
+    assert "HYPERSPACE_LAUNCH_PARENT" not in launcher_mod.child_env()
+    assert (
+        ClaudeCode.launch_marker(
+            "startup",
+            {"HYPERSPACE_LAUNCH": "l_one", "CLAUDE_JOB_DIR": "/jobs/parent12"},
+            "child123-session",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("rejection", [None, 409, 404])
+def test_sync_first_launch_link(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    rejection: int | None,
+) -> None:
+    register_host(ctx, "workstation")
+    parent = session(ctx, fake)
+    item = ctx.api.launch(HARNESS, {"host": ctx.host, "prompt": "hi", "parent": parent})
+    ctx.api.claim_launch(HARNESS, item["launch"])
+    path = fake.transcript(WS)
+    fake.write(path, prompt("hi"))
+    found = host.session_for_transcript(path)
+    assert found is not None
+    save_launch_links(ctx.state, HARNESS, found.session_id, item["launch"], parent)
+    calls: list[str] = []
+    original = ctx.api.link_launch
+
+    def link(harness: str, lid: str, sid: str) -> None:
+        calls.append(sid)
+        if rejection:
+            raise ApiError(rejection, "rejected")
+        original(harness, lid, sid)
+
+    monkeypatch.setattr(ctx.api, "link_launch", link)
+    Syncer(ctx, found, WS).run()
+    fake.write(path, text_reply())
+    Syncer(ctx, found, WS).run()
+    assert calls == [found.session_id]
+    links = ctx.state.session(HARNESS, found.session_id).metadata.get("links", {})
+    if rejection == 409:
+        assert "launch" not in links and "parent" not in links
+        assert ctx.state.get(f"launch_links:{HARNESS}:{found.session_id}") is None
+    if rejection:
+        assert (
+            sum("session link rejected" in r.getMessage() for r in caplog.records) == 1
+        )
+    else:
+        assert (
+            ctx.api.get_launch(HARNESS, item["launch"])["session"] == found.session_id
+        )
+
+
+@pytest.mark.parametrize("source", ["startup", "resume"])
+def test_handle_launch_marker(
+    fake: FakeClaude, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    path = fake.transcript(WS)
+    fake.write(path, prompt("hi"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(fake.root))
+    monkeypatch.setenv("CLAUDE_JOB_DIR", str(fake.root / "jobs" / path.stem[:8]))
+    monkeypatch.setenv("HYPERSPACE_LAUNCH", "l_marker")
+    monkeypatch.setenv("HYPERSPACE_LAUNCH_PARENT", "parent")
+    cfg = Config(state_dir=tmp_path / "marker-state")
+    handle(
+        {
+            "hook_event_name": "SessionStart",
+            "transcript_path": str(path),
+            "cwd": WS,
+            "source": source,
+        },
+        cfg,
+        start=lambda args: None,
+    )
+    state = State(cfg.state_dir)
+    try:
+        links = state.session(HARNESS, path.stem).metadata.get("links", {})
+        assert links == (
+            {"launch": "l_marker", "parent": "parent"} if source == "startup" else {}
+        )
+    finally:
+        state.close()
+
+
+def test_launch_parent_env(
+    ctx: Context, fake: FakeClaude, host: Host, tmp_path: Path
+) -> None:
+    register_host(ctx, "workstation")
+    parent = session(ctx, fake)
+    ctx.api.launch(
+        HARNESS,
+        {
+            "host": ctx.host,
+            "prompt": "hi",
+            "parent": parent,
+            "workspace": str(tmp_path),
+        },
+    )
+
+    def bg(
+        argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
+    ) -> RunResult:
+        assert env["HYPERSPACE_LAUNCH_PARENT"] == parent
+        return RunResult(None, "")
+
+    Launcher(ctx, host, FAKE, 60, None, resume_env=dict, run_claude=bg).launch_pending()
+
+
+def test_launch_workspace_realpath(tmp_path: Path) -> None:
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(ws)
+    state = tmp_path / "jobs" / "job" / "state.json"
+    state.parent.mkdir(parents=True)
+    sid = str(uuid.uuid4())
+    state.write_text(json.dumps({"sessionId": sid, "cwd": str(alias) + "/../alias/"}))
+    assert launch_session(tmp_path, "job", str(ws)) == sid
+    assert launch_job_id("note backgrounded · job") is None
+    assert launch_job_id("backgrounded · job extra") is None
+    assert launch_job_id("\x1b[32mbackgrounded · job\x1b[0m") == "job"
+
+
+@pytest.mark.parametrize("terminal", ["failed", "cancelled"])
+def test_launch_cli_wait_failure(
+    ctx: Context,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("hyperspace_client.cli._context", lambda cfg, state: ctx)
+    monkeypatch.setattr(ctx.api, "require_capability", lambda capability: None)
+    requests: list[dict[str, Any]] = []
+
+    def post(harness: str, body: dict[str, Any]) -> dict[str, str]:
+        requests.append(dict(body))
+        if len(requests) == 1:
+            raise httpx.ConnectError("lost response")
+        return {"launch": "l_retry", "verdict": "queued"}
+
+    monkeypatch.setattr(ctx.api, "launch", post)
+    monkeypatch.setattr(
+        ctx.api,
+        "get_launch",
+        lambda harness, lid: {
+            "launch": lid,
+            "state": terminal,
+            "reason": "not started",
+        },
+    )
+    assert main(["launch", "--host", "other-host", "--wait", "hi"]) == 1
+    captured = capsys.readouterr()
+    assert "l_retry" in captured.err and "queued" in captured.err
+    assert requests[0] == requests[1]
+
+
+def test_launch_cli_local_error(
+    ctx: Context, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    register_host(ctx, "workstation")
+    monkeypatch.setattr("hyperspace_client.cli._context", lambda cfg, state: ctx)
+
+    def broken(run: Launcher, launch_id: str | None = None) -> None:
+        raise launcher_mod.CredentialError("secret locked")
+
+    monkeypatch.setattr(Launcher, "launch_pending", broken)
+    monkeypatch.setenv("HYPERSPACE_HOST", ctx.host)
+    assert main(["launch", "--json", "hi"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "pending"

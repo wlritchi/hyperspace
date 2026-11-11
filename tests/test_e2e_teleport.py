@@ -571,3 +571,26 @@ def test_lease_loss_refresh_skips_locked_session(laptop: Host, agent: Host) -> N
         assert t.exists()
     refresh_states(laptop.ctx, laptop.adapter)
     assert not t.exists()
+
+
+def test_restore_keeps_launch_links(server: Server, laptop: Host, agent: Host) -> None:
+    transcript = start_session(laptop, LAPTOP_WS)
+    sid = transcript.stem
+    record = laptop.ctx.state.session("claude-code", sid)
+    record.metadata["links"] = {"parent": "12345678-parent", "launch": "l_restored"}
+    laptop.ctx.state.save_session(record, ("metadata",))
+    laptop.fake.write(transcript, text_reply("more"))
+    sync(laptop, transcript, LAPTOP_WS)
+    send(laptop.ctx, laptop.adapter, sid, "agent-1")
+    result = restore(agent.ctx, agent.adapter, sid, AGENT_WS)
+    assert result.transcript is not None
+    assert (
+        agent.ctx.state.session("claude-code", sid).metadata["links"]["parent"]
+        == "12345678-parent"
+    )
+    agent.fake.write(result.transcript, prompt("continue", cwd=AGENT_WS))
+    sync(agent, result.transcript, AGENT_WS)
+    assert manifest(server, sid)["metadata"]["links"] == {
+        "parent": "12345678-parent",
+        "launch": "l_restored",
+    }

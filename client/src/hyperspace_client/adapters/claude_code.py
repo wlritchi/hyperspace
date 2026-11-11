@@ -1484,9 +1484,14 @@ class ClaudeCode:
 
     @staticmethod
     def launch_marker(
-        source: str | None, env: Mapping[str, str]
+        source: str | None, env: Mapping[str, str], session_id: str
     ) -> tuple[str, str | None] | None:
-        if source != "startup" or not env.get("HYPERSPACE_LAUNCH"):
+        if (
+            source != "startup"
+            or not env.get("HYPERSPACE_LAUNCH")
+            or not env.get("CLAUDE_JOB_DIR")
+            or Path(env["CLAUDE_JOB_DIR"]).name != session_id[:8]
+        ):
             return None
         return env["HYPERSPACE_LAUNCH"], env.get("HYPERSPACE_LAUNCH_PARENT")
 

@@ -286,7 +286,7 @@ def _reason(code: int, output: str) -> str:
         note = clean_note(line)
         if note:
             return note
-    return f"claude rm exited with status {code}"
+    return f"claude exited with status {code}"
 
 
 def queued_reopen(state: State, harness: str, session_id: str) -> bool:
@@ -559,25 +559,33 @@ def needs_process(
 
 
 def launch_argv(claude: str, options: list[str], item: Launch) -> list[str]:
+    """Apply request options over the host defaults, without shell parsing."""
     argv = [claude, *options]
     for key in ("model", "effort", "name"):
         value = item.get(key)
         if value is not None:
-            argv.extend(["--" + key, str(value)])
+            argv = without_option(argv, "--" + key)
+            argv.append("--" + key + "=" + str(value))
     return [*argv, "--bg", "--", item.get("prompt", "")]
 
 
 def launch_job_id(output: str) -> str | None:
-    match = re.search(r"backgrounded\s*·\s*([A-Za-z0-9_-]+)", output)
+    """Read only the job announcement of this start process."""
+    match = re.search(r"^backgrounded · (\S+)$", printable(output), re.MULTILINE)
     return match[1] if match else None
 
 
 def launch_session(config: Path, job: str, workspace: str) -> str | None:
+    """Read a job identity only when its workspace agrees with the request."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", job):
         return None
     try:
         body = json.loads((config / "jobs" / job / "state.json").read_text())
-        if not isinstance(body, dict) or body.get("cwd") != workspace:
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("cwd"), str)
+            or os.path.realpath(body["cwd"]) != os.path.realpath(workspace)
+        ):
             return None
         sid = body.get("sessionId")
         return validate_session_id(sid) if isinstance(sid, str) else None
@@ -588,6 +596,7 @@ def launch_session(config: Path, job: str, workspace: str) -> str | None:
 def save_launch_links(
     state: State, harness: str, sid: str, launch: str, parent: str | None
 ) -> None:
+    """Keep launch links outside the transcript for every metadata upload."""
     record = state.session(harness, sid)
     links = dict(record.metadata.get("links") or {})
     links["launch"] = launch
@@ -653,6 +662,7 @@ class Launcher:
     _env_error: str | None = None
     # True while the cap on processes holds resumes, so that it logs once.
     _capped: bool = False
+    _launch_capped: bool = False
     # The earliest time of the next restore of held sessions; None after a
     # restore with no failure.
     _restore_at: float | None = float("-inf")
@@ -787,17 +797,32 @@ class Launcher:
             )
         self._capped = bool(waiting)
 
-    def launch_pending(self) -> None:
+    def launch_pending(self, launch_id: str | None = None) -> None:
+        """Claim pending launches once, or only the caller's local request."""
         if not self.launches or not self.ctx.api.has_capability(CAP_LAUNCH):
             return
+        try:
+            base_env = dict(self.resume_env())
+        except CredentialError as exc:
+            if self._env_error != str(exc):
+                log.error("launcher: launch environment: %s", exc)
+            self._env_error = str(exc)
+            return
+        self._env_error = None
         running = len(
             self.adapter.live_processes(
                 self.ctx.state.continued_from(self.adapter.harness)
             )
         )
         for pending in self.ctx.api.pending_launches(self.adapter.harness):
+            if launch_id is not None and pending["launch"] != launch_id:
+                continue
             if running >= self.max_sessions:
+                if not self._launch_capped:
+                    log.warning("launcher: process limit holds pending launches")
+                self._launch_capped = True
                 break
+            self._launch_capped = False
             lid = pending["launch"]
             try:
                 item = self.ctx.api.claim_launch(self.adapter.harness, lid)
@@ -813,7 +838,12 @@ class Launcher:
                     "workspace must be an absolute existing directory",
                 )
                 continue
-            env = dict(self.resume_env())
+            if not item.get("prompt"):
+                self.ctx.api.fail_launch(
+                    self.adapter.harness, lid, "launch prompt is empty"
+                )
+                continue
+            env = dict(base_env)
             env["HYPERSPACE_LAUNCH"] = lid
             env.pop("HYPERSPACE_LAUNCH_PARENT", None)
             if item.get("parent"):
@@ -822,7 +852,7 @@ class Launcher:
                 result = self.run_claude(
                     launch_argv(self.claude, self.claude_args, item),
                     workspace,
-                    120.0,
+                    RESUME_TIMEOUT,
                     env,
                 )
             except OSError as exc:

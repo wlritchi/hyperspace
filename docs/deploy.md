@@ -437,4 +437,6 @@ session. Use `--workspace` for an absolute directory on the destination, and
 `--model`, `--effort`, or `--name` to set the job options. `--json` gives the
 launch record. `hyperspace launch --cancel l_ID` cancels a pending request.
 Without `--host`, the command uses this host. If the request is queued here,
-the command runs one launcher pass, unless launches are off.
+the command runs one launcher pass for only that request, unless launches are
+off. Host `launcher_claude_args` can set model and effort defaults. A launch
+request that sets either option replaces that default.

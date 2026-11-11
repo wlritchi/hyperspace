@@ -99,7 +99,7 @@ def handle(
     else:
         session = resolved
     marker = (
-        adapter.launch_marker(_str(payload, "source"), os.environ)
+        adapter.launch_marker(_str(payload, "source"), os.environ, session.session_id)
         if event == "SessionStart"
         else None
     )

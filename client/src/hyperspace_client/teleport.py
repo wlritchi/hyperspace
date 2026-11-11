@@ -547,6 +547,10 @@ def _restore(
     _note_lease(record, response["session"], ctx.host)
     # Metadata for later syncs comes from the restored transcript.
     record.metadata = adapter.update_metadata({}, TRANSCRIPT, target.read_bytes())
+    server_links = manifest.get("metadata", {}).get("links", {})
+    for key in ("parent", "launch"):
+        if key in server_links:
+            record.metadata.setdefault("links", {})[key] = server_links[key]
     record.sent_metadata = {}
     ctx.state.save_session(record)
 

@@ -605,9 +605,13 @@ class Syncer:
             try:
                 self.ctx.api.link_launch(self._h, lid, self._sid)
             except ApiError as exc:
-                if exc.status != 409:
+                if not 400 <= exc.status < 500:
                     raise
-                log.error("launch %s: conflicting session link: %s", lid, exc)
+                log.error("launch %s: session link rejected: %s", lid, exc)
+                if exc.status == 409:
+                    state.delete(f"launch_links:{self._h}:{self._sid}")
+                    metadata.get("links", {}).pop("launch", None)
+                    metadata.get("links", {}).pop("parent", None)
             state.put(linked_key, "1")
         server_meta = server_metadata(self.workspace, metadata)
         if server_meta != record.sent_metadata and self.result.files:

@@ -113,8 +113,9 @@ class Config:
     # values in the keyring (see `credentials`).
     launcher_env: dict[str, str] = field(default_factory=dict[str, str])
     launcher_secret_env: list[str] = field(default_factory=list[str])
-    # No resume while this many Claude Code processes run on the host.
+    # Accept launch requests on this host.
     launches: bool = True
+    # No resume while this many Claude Code processes run on the host.
     launcher_max_sessions: int = 10
     state_dir: Path = field(default_factory=state_dir)
 
@@ -159,8 +160,6 @@ _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # the wrong session, fork a copy, or start a headless turn.
 _LAUNCHER_OWNS = frozenset(
     {
-        "--model",
-        "--effort",
         "--name",
         "--bg",
         "--background",

@@ -1020,6 +1020,8 @@ def cmd_launch(args: argparse.Namespace, cfg: Config) -> int:
     try:
         ctx.api.require_capability(CAP_LAUNCH)
         if args.cancel:
+            if args.prompt is not None:
+                raise Exit(1, "--cancel cannot have a prompt")
             item = ctx.api.cancel_launch(harness, args.cancel)
         else:
             if args.prompt is None:
@@ -1040,29 +1042,38 @@ def cmd_launch(args: argparse.Namespace, cfg: Config) -> int:
             except httpx.TransportError:
                 response = ctx.api.launch(harness, body)
             lid = response["launch"]
+            print(lid, file=sys.stderr)
+            if args.wait and response["verdict"] == "queued":
+                print("queued", file=sys.stderr)
             if (
                 body["host"] == cfg.host
                 and response["verdict"] == "queued"
                 and cfg.launches
             ):
-                env = launcher.ResumeEnv(
-                    cfg.launcher_env, cfg.launcher_secret_env, cfg.token_cache_ttl
-                )
-                launcher.Launcher(
-                    ctx,
-                    cast(ClaudeCode, ctx.adapter),
-                    cfg.claude_bin,
-                    cfg.heartbeat_interval,
-                    None,
-                    claude_args=cfg.launcher_claude_args,
-                    max_sessions=cfg.launcher_max_sessions,
-                    workspace=str(Path.cwd().resolve()),
-                    resume_env=env,
-                ).launch_pending()
+                try:
+                    env = launcher.ResumeEnv(
+                        cfg.launcher_env, cfg.launcher_secret_env, cfg.token_cache_ttl
+                    )
+                    launcher.Launcher(
+                        ctx,
+                        cast(ClaudeCode, ctx.adapter),
+                        cfg.claude_bin,
+                        cfg.heartbeat_interval,
+                        None,
+                        claude_args=cfg.launcher_claude_args,
+                        max_sessions=cfg.launcher_max_sessions,
+                        workspace=str(Path.cwd().resolve()),
+                        resume_env=env,
+                    ).launch_pending(lid)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("launch %s: local pass: %s", lid, exc)
             item = ctx.api.get_launch(harness, lid)
             while args.wait and item["state"] not in ("started", "failed", "cancelled"):
                 time.sleep(1)
-                item = ctx.api.get_launch(harness, lid)
+                try:
+                    item = ctx.api.get_launch(harness, lid)
+                except httpx.TransportError as exc:
+                    log.warning("launch %s: poll: %s", lid, exc)
         if args.json:
             print(json.dumps(item))
         elif args.wait and item["state"] in ("started", "failed", "cancelled"):
