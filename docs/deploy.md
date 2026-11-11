@@ -74,8 +74,10 @@ kubectl -n hyperspace exec deploy/hyperspace -- \
 | Runner      | `append`, `read`, `grant` | `granted` |
 
 A runner with `--read granted` can read only its own sessions and the sessions
-granted to it. Revoke a credential with
-`scripts/revoke-credential.py <credential id>`; it stops working at once.
+granted to it. Add `launch` to the scopes of a credential whose host may start
+sessions on the other hosts of the account (see "The `launch` scope" below).
+Revoke a credential with `scripts/revoke-credential.py <credential id>`; it
+stops working at once.
 
 ### A credential for subspace
 
@@ -94,6 +96,27 @@ in the wake configuration of subspace. A `wake` credential can call only the
 wake endpoint, so a leak of it exposes no transcript. With `reopen`, its
 senders can also reopen a `done` session on purpose; leave `reopen` out to
 refuse that.
+
+### The `launch` scope
+
+A credential with `launch` can start a new session on a host of its account,
+with a prompt of its choice, through `POST /v1/launch/{harness}` (see the
+[launch spec](specs/2026-11-10-launch.md)). The launcher of that host starts
+the session, and the session runs with the host's credentials (for example a
+forge token). Thus give `launch` only to the hosts that may start such
+sessions. For example, a fleet whose agents start sessions on each other's
+runners gives it to workstations and to runners:
+
+```sh
+kubectl -n hyperspace exec deploy/hyperspace -- \
+  python /app/hyperspace/scripts/new-credential.py \
+  --host laptop --scopes append,read,grant,launch --read all
+```
+
+A credential with `launch` can also read and cancel the launches of its
+account. A `launch` credential cannot also have `wake`. A host whose
+credentials must stay apart gets no `launch` credential in its account, or its
+launcher turns off `launches`.
 
 ### Credentials from a provisioner
 
