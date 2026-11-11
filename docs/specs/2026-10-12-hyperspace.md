@@ -1218,8 +1218,8 @@ that start with `HYPERSPACE_`, the names that the client removes from the
 environment of a `claude` that it starts (`CLAUDE_CODE_SESSION_ID` and
 `CLAUDE_JOB_DIR`), and a name in both settings.
 
-Each value is in the environment of each session that the launcher resumes,
-and the agent can read it. Give only values that each session can hold.
+A value can get to a session that the launcher resumes, and the agent can then
+read it. Give only values that each session can hold.
 
 ### Sync engine
 
