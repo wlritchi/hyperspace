@@ -2406,7 +2406,9 @@ def test_launch_pass(
     ) -> RunResult:
         calls.append(argv)
         assert argv[-3:] == ["--bg", "--", "--dangerously-skip-permissions"]
-        assert env["HYPERSPACE_LAUNCH"] == item["launch"]
+        assert "HYPERSPACE_LAUNCH" not in env
+        marker = json.loads(argv[argv.index("--settings") + 1])["env"]
+        assert marker["HYPERSPACE_LAUNCH"] == item["launch"]
         assert "HYPERSPACE_LAUNCH_PARENT" not in env
         if mode == "error":
             return RunResult(1, "start failed\nmore detail")
@@ -2788,7 +2790,13 @@ def test_launch_parent_env(
     def bg(
         argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
     ) -> RunResult:
-        assert env["HYPERSPACE_LAUNCH_PARENT"] == parent
+        assert "HYPERSPACE_LAUNCH_PARENT" not in env
+        assert (
+            json.loads(argv[argv.index("--settings") + 1])["env"][
+                "HYPERSPACE_LAUNCH_PARENT"
+            ]
+            == parent
+        )
         return RunResult(None, "")
 
     Launcher(ctx, host, FAKE, 60, None, resume_env=dict, run_claude=bg).launch_pending()
@@ -2890,3 +2898,44 @@ def test_local_launch_does_not_list(
     run = Launcher(ctx, host, FAKE, 60, None, resume_env=dict, run_claude=bg)
     run.launch_pending(item["launch"])
     assert ctx.api.get_launch(HARNESS, item["launch"])["state"] == "claimed"
+
+
+@pytest.mark.parametrize("named", [False, True])
+def test_launch_real_announcement(named: bool) -> None:
+    output = (
+        "backgrounded · 1c5c3d7c"
+        + (" · env-probe" if named else "")
+        + "\n  claude attach 1c5c3d7c    open in this terminal\n"
+    )
+    assert launch_job_id(output) == "1c5c3d7c"
+
+
+@pytest.mark.parametrize("settings", [["--settings", "{}"], ["--settings={}"]])
+def test_host_settings_disable_marker(settings: list[str]) -> None:
+    argv = launch_argv(
+        FAKE, settings, cast(Launch, {"launch": "l_one", "prompt": "hi"})
+    )
+    assert argv == [FAKE, *settings, "--bg", "--", "hi"]
+
+
+def test_fake_launch_settings_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = str(uuid.uuid4())
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "job")
+    monkeypatch.setenv("FAKE_CLAUDE_JOB", sid[:8])
+    monkeypatch.setenv(
+        "FAKE_CLAUDE_JOB_STATE", json.dumps({"sessionId": sid, "cwd": str(tmp_path)})
+    )
+    monkeypatch.setenv("HYPERSPACE_LAUNCH", "l_wrong_daemon_marker")
+    argv = launch_argv(
+        FAKE,
+        [],
+        cast(Launch, {"launch": "l_right", "parent": "parent", "prompt": "hi"}),
+    )
+    result = run_bg(argv, str(tmp_path), 10, {})
+    assert result.returncode == 0
+    env = json.loads((tmp_path / "jobs" / sid[:8] / "environment.json").read_text())
+    env["CLAUDE_JOB_DIR"] = str(tmp_path / "jobs" / sid[:8])
+    assert ClaudeCode.launch_marker("startup", env, sid) == ("l_right", "parent")

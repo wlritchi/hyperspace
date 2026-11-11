@@ -566,12 +566,21 @@ def launch_argv(claude: str, options: list[str], item: Launch) -> list[str]:
         if value is not None:
             argv = without_option(argv, "--" + key)
             argv.append("--" + key + "=" + str(value))
+    if not any(arg.split("=", 1)[0] == "--settings" for arg in options) and item.get(
+        "launch"
+    ):
+        marker = {"HYPERSPACE_LAUNCH": item["launch"]}
+        if item.get("parent"):
+            marker["HYPERSPACE_LAUNCH_PARENT"] = item.get("parent", "")
+        argv.extend(["--settings", json.dumps({"env": marker})])
     return [*argv, "--bg", "--", item.get("prompt", "")]
 
 
 def launch_job_id(output: str) -> str | None:
     """Read only the job announcement of this start process."""
-    match = re.search(r"^backgrounded · (\S+)$", printable(output), re.MULTILINE)
+    match = re.search(
+        r"^backgrounded · ([A-Za-z0-9_-]+)(?: · .*)?$", printable(output), re.MULTILINE
+    )
     return match[1] if match else None
 
 
@@ -663,6 +672,7 @@ class Launcher:
     # True while the cap on processes holds resumes, so that it logs once.
     _capped: bool = False
     _launch_capped: bool = False
+    _marker_off_logged: bool = False
     # The earliest time of the next restore of held sessions; None after a
     # restore with no failure.
     _restore_at: float | None = float("-inf")
@@ -853,10 +863,16 @@ class Launcher:
                 )
                 continue
             env = dict(base_env)
-            env["HYPERSPACE_LAUNCH"] = lid
+            env.pop("HYPERSPACE_LAUNCH", None)
             env.pop("HYPERSPACE_LAUNCH_PARENT", None)
-            if item.get("parent"):
-                env["HYPERSPACE_LAUNCH_PARENT"] = item.get("parent", "")
+            if (
+                any(arg.split("=", 1)[0] == "--settings" for arg in self.claude_args)
+                and not self._marker_off_logged
+            ):
+                log.warning(
+                    "launcher: host settings disable the launch hook marker; use the launcher link"
+                )
+                self._marker_off_logged = True
             try:
                 result = self.run_claude(
                     launch_argv(self.claude, self.claude_args, item),

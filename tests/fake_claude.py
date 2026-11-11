@@ -117,6 +117,15 @@ def main() -> None:
         os.makedirs(job)
         with open(os.path.join(job, "state.json"), "w") as f:
             f.write(os.environ["FAKE_CLAUDE_JOB_STATE"])
+        marker: dict[str, str] = {}
+        args = sys.argv[1:]
+        for index, arg in enumerate(args):
+            if arg == "--settings" and index + 1 < len(args):
+                marker = json.loads(args[index + 1]).get("env", {})
+            elif arg.startswith("--settings="):
+                marker = json.loads(arg.split("=", 1)[1]).get("env", {})
+        with open(os.path.join(job, "environment.json"), "w") as f:
+            json.dump(marker, f)
         print("backgrounded · " + os.path.basename(job))
         return
     if mode == "resume":
