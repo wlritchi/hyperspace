@@ -868,7 +868,6 @@ class LaunchRequest(TypedDict):
     workspace: NotRequired[str]
     model: NotRequired[str]
     effort: NotRequired[str]
-    # The display name of the job.
     name: NotRequired[str]
     # A session of the account. The new session gets it as `links.parent`.
     parent: NotRequired[str]

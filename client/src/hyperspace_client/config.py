@@ -113,7 +113,7 @@ class Config:
     # values in the keyring (see `credentials`).
     launcher_env: dict[str, str] = field(default_factory=dict[str, str])
     launcher_secret_env: list[str] = field(default_factory=list[str])
-    # Accept launch requests on this host.
+    # False stops this host from claiming launches, also in a runner.
     launches: bool = True
     # No resume while this many Claude Code processes run on the host.
     launcher_max_sessions: int = 10
