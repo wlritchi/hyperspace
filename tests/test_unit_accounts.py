@@ -85,6 +85,9 @@ def test_dump_and_parse(tmp_path: Path) -> None:
         '[[accounts.default.credentials]]\nid = "abcdefghijkl"\n'
         'secret_sha256 = "' + "0" * 64 + '"\nhost = "subspace"\n'
         'scopes = ["reopen"]',
+        '[[accounts.default.credentials]]\nid = "abcdefghijkl"\n'
+        'secret_sha256 = "' + "0" * 64 + '"\nhost = "subspace"\n'
+        'scopes = ["wake", "launch"]',
         "not toml [",
     ],
 )
@@ -99,6 +102,16 @@ def test_wake_credential(tmp_path: Path) -> None:
     assert 'scopes = ["wake"]' in (tmp_path / "accounts.toml").read_text()
     principal = AccountsFile(tmp_path / "accounts.toml").authenticate(token, NOW)
     assert principal is not None and principal.scopes == frozenset({"wake"})
+
+
+def test_launch_credential(tmp_path: Path) -> None:
+    scopes = frozenset({"append", "read", "grant", "launch"})
+    token, c = make(scopes=scopes)
+    write(tmp_path / "accounts.toml", c)
+    text = (tmp_path / "accounts.toml").read_text()
+    assert 'scopes = ["append", "read", "grant", "launch"]' in text
+    principal = AccountsFile(tmp_path / "accounts.toml").authenticate(token, NOW)
+    assert principal is not None and principal.scopes == scopes
 
 
 def test_authenticate(tmp_path: Path) -> None:
@@ -480,6 +493,8 @@ def test_new_credential_avoids_directory_ids(
         ("wake", 0, frozenset({"wake"})),
         ("wake,reopen", 0, frozenset({"wake", "reopen"})),
         ("wake,read", 1, None),
+        ("wake,launch", 1, None),
+        ("launch", 0, frozenset({"launch"})),
         ("reopen", 1, None),
     ],
 )

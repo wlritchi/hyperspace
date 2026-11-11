@@ -5,6 +5,7 @@
     scripts/new-credential.py --host laptop --scopes append,read,grant --read all
     scripts/new-credential.py --host agent-1 --scopes append,read,grant --read granted
     scripts/new-credential.py --host subspace --scopes wake
+    scripts/new-credential.py --host laptop --scopes append,read,grant,launch --read all
 
 A `wake` credential can only send wakes, so it has no other scope. Its host
 is a name for logs.

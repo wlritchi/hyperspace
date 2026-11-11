@@ -47,6 +47,8 @@ from hyperspace_protocol import (
     LIVENESS_STATES,
     MAX_BODY,
     STATUSES,
+    Launch,
+    LaunchList,
     SessionList,
     StatusResponse,
     ValidationError,
@@ -57,6 +59,9 @@ from hyperspace_protocol import (
     validate_heartbeat,
     validate_host_name,
     validate_id,
+    validate_launch_failure,
+    validate_launch_request,
+    validate_launch_session,
     validate_session_id,
     validate_sha256,
     validate_status_request,
@@ -83,6 +88,9 @@ _JSON_LIMIT = 64 * 1024
 # A heartbeat can list MAX_HEARTBEAT_SESSIONS sessions and as many unclosed
 # sessions with a reason each.
 _HEARTBEAT_JSON_LIMIT = 1024 * 1024
+# A launch carries a prompt of up to MAX_LAUNCH_PROMPT bytes. JSON can escape
+# each byte as six characters.
+_LAUNCH_JSON_LIMIT = 512 * 1024
 
 _STATUS = {
     "not_found": 404,
@@ -97,6 +105,8 @@ _STATUS = {
     "teleport_committed_moved": 409,
     "session_done": 409,
     "lease_free": 409,
+    "launch_state": 409,
+    "request_used": 409,
     "bad_request": 400,
     "bad_range": 400,
     "bad_digest": 400,
@@ -1031,7 +1041,144 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         response: WakeResponse = {"verdict": verdict}
         return JSONResponse(response)
 
+    def launch_target(request: Request) -> tuple[str, str]:
+        return (
+            validate_harness(request.path_params["harness"]),
+            validate_id(request.path_params["launch"]),
+        )
+
+    def log_launch(
+        principal: Principal, harness: str, launch: str, action: str, result: str
+    ) -> None:
+        log.info(
+            "launch %s/%s/%s %s by=%s result=%s",
+            principal.account,
+            harness,
+            launch,
+            action,
+            principal.host,
+            result,
+        )
+
+    async def change_launch(
+        principal: Principal,
+        harness: str,
+        launch: str,
+        action: str,
+        operation: Callable[[], Launch],
+    ) -> Response:
+        try:
+            body = await run_in_threadpool(operation)
+        except StoreError as exc:
+            log_launch(principal, harness, launch, action, exc.code)
+            raise
+        log_launch(principal, harness, launch, action, body["state"])
+        return JSONResponse(body)
+
+    @authed("launch")
+    async def post_launch(request: Request, principal: Principal) -> Response:
+        harness = validate_harness(request.path_params["harness"])
+        body = validate_launch_request(await read_json(request, _LAUNCH_JSON_LIMIT))
+
+        def log_request(result: str, launch: str = "-") -> None:
+            log.info(
+                "launch %s/%s/%s request host=%s by=%s parent=%s result=%s",
+                principal.account,
+                harness,
+                launch,
+                body["host"],
+                principal.host,
+                body.get("parent", "-"),
+                result,
+            )
+
+        try:
+            response = await run_in_threadpool(
+                store.launch, principal.account, harness, principal.host, body
+            )
+        except StoreError as exc:
+            log_request(exc.code)
+            raise
+        log_request(response["verdict"], response["launch"])
+        return JSONResponse(response)
+
+    @authed()
+    async def get_launch(request: Request, principal: Principal) -> Response:
+        if not principal.scopes & {"read", "launch"}:
+            return error("forbidden", "missing scope: read or launch")
+        harness, launch = launch_target(request)
+        body = await run_in_threadpool(
+            store.get_launch, principal.account, harness, launch
+        )
+        return JSONResponse(body)
+
+    @authed("launch")
+    async def delete_launch(request: Request, principal: Principal) -> Response:
+        harness, launch = launch_target(request)
+        return await change_launch(
+            principal,
+            harness,
+            launch,
+            "cancel",
+            lambda: store.cancel_launch(principal.account, harness, launch),
+        )
+
+    @authed("append")
+    async def get_launches(request: Request, principal: Principal) -> Response:
+        harness = validate_harness(request.path_params["harness"])
+        if request.query_params.get("state") != "pending":
+            raise ApiError("bad_request", "state must be pending")
+        launches = await run_in_threadpool(
+            store.pending_launches, principal.account, harness, principal.host
+        )
+        response: LaunchList = {"launches": launches}
+        return JSONResponse(response)
+
+    # The launcher's routes act only on the launches for the credential's
+    # host. A launch for another host gets the same 404 as a missing one.
+    @authed("append")
+    async def post_claim(request: Request, principal: Principal) -> Response:
+        harness, launch = launch_target(request)
+        return await change_launch(
+            principal,
+            harness,
+            launch,
+            "claim",
+            lambda: store.claim_launch(
+                principal.account, harness, principal.host, launch
+            ),
+        )
+
+    @authed("append")
+    async def post_link(request: Request, principal: Principal) -> Response:
+        harness, launch = launch_target(request)
+        session = validate_launch_session(await read_json(request))
+        return await change_launch(
+            principal,
+            harness,
+            launch,
+            f"link session={session}",
+            lambda: store.link_launch(
+                principal.account, harness, principal.host, launch, session
+            ),
+        )
+
+    @authed("append")
+    async def post_fail(request: Request, principal: Principal) -> Response:
+        harness, launch = launch_target(request)
+        reason = validate_launch_failure(await read_json(request))
+        return await change_launch(
+            principal,
+            harness,
+            launch,
+            "fail",
+            lambda: store.fail_launch(
+                principal.account, harness, principal.host, launch, reason
+            ),
+        )
+
     s = f"{API_PREFIX}/sessions/{{harness}}/{{sid}}"
+    launches = f"{API_PREFIX}/launch/{{harness}}"
     routes = [
         Route("/healthz", healthz, methods=["GET"]),
         Route(f"{API_PREFIX}/whoami", whoami, methods=["GET"]),
@@ -1041,6 +1188,13 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         Route(f"{API_PREFIX}/workspaces", get_workspaces, methods=["GET"]),
         Route(f"{API_PREFIX}/sessions", list_sessions, methods=["GET"]),
         Route(f"{API_PREFIX}/wake/{{harness}}", post_wake, methods=["POST"]),
+        Route(launches, post_launch, methods=["POST"]),
+        Route(launches, get_launches, methods=["GET"]),
+        Route(f"{launches}/{{launch}}", get_launch, methods=["GET"]),
+        Route(f"{launches}/{{launch}}", delete_launch, methods=["DELETE"]),
+        Route(f"{launches}/{{launch}}/claim", post_claim, methods=["POST"]),
+        Route(f"{launches}/{{launch}}/link", post_link, methods=["POST"]),
+        Route(f"{launches}/{{launch}}/fail", post_fail, methods=["POST"]),
         Route(s, get_manifest, methods=["GET"]),
         Route(f"{s}/state", get_state, methods=["GET"]),
         Route(f"{s}/meta", post_meta, methods=["POST"]),

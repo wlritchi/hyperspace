@@ -45,6 +45,10 @@ from hyperspace_protocol import (
     HeartbeatResponse,
     HostInfo,
     HostRecord,
+    Launch,
+    LaunchRequest,
+    LaunchResponse,
+    LaunchVerdict,
     Lease,
     Liveness,
     LogManifest,
@@ -374,6 +378,38 @@ _MIGRATIONS: list[str] = [
     DROP TABLE teleports;
     ALTER TABLE teleports_by_session RENAME TO teleports;
     """,
+    # Launches (see the launch spec). `fields` is the JSON of the optional
+    # fields of the request. `request_sha256` identifies the harness and all
+    # fields of the request, so that a request id can be checked after the
+    # prompt is deleted. `verdict` is the verdict of the first response.
+    # `launches_received` and `launches_interval` are the time and the
+    # interval of the last heartbeat with `launches: true` of the source.
+    """
+    CREATE TABLE launches (
+        id TEXT PRIMARY KEY,
+        account TEXT NOT NULL,
+        harness TEXT NOT NULL,
+        host TEXT NOT NULL,
+        caller TEXT NOT NULL,
+        fields TEXT NOT NULL,
+        prompt TEXT,
+        request TEXT,
+        request_sha256 TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        state TEXT NOT NULL,
+        session TEXT,
+        reason TEXT,
+        created TEXT NOT NULL,
+        updated TEXT NOT NULL,
+        claimed TEXT
+    );
+    CREATE INDEX launches_by_host ON launches (account, harness, host, state, created);
+    CREATE INDEX launches_by_request ON launches (account, request)
+    WHERE request IS NOT NULL;
+    CREATE INDEX launches_claimed ON launches (claimed) WHERE state = 'claimed';
+    ALTER TABLE host_heartbeats ADD COLUMN launches_received TEXT;
+    ALTER TABLE host_heartbeats ADD COLUMN launches_interval INTEGER;
+    """,
 ]
 
 # `recheck_conflict` compares two branches in pieces of this size.
@@ -493,6 +529,15 @@ class ListPosition:
 
 # A heartbeat expires after this many of its intervals.
 HEARTBEAT_EXPIRY = 3
+
+# A launch that stays `claimed` this long with no linked session fails with
+# the reason NO_SESSION_REPORTED.
+LAUNCH_CLAIM_TIMEOUT = timedelta(minutes=10)
+NO_SESSION_REPORTED = "no session reported"
+# The time for which the store keeps the request id of a launch.
+LAUNCH_REQUEST_TTL = timedelta(hours=24)
+# The largest number of launches in one list of pending launches.
+MAX_PENDING_LAUNCHES = 100
 
 # The page cache of the writer connection.
 WRITE_CACHE_BYTES = 128 * 1024**2
@@ -2202,18 +2247,23 @@ class Store:
                         """,
                         (session["id"], host, source, since, since),
                     )
-            # The wake mark. The heartbeats of the hooks do not send
-            # `wakes`, and they must not clear the mark of the launcher of
-            # the same source. A launcher that stops clears it.
+            # The wake and launch marks. The heartbeats of the hooks do not
+            # send `wakes`, and they must not clear the marks of the launcher
+            # of the same source. A launcher that stops clears them. A
+            # launcher that acts on wakes and not on launches clears the
+            # launch mark.
             final = request.get("final", False)
             wakes = request.get("wakes", False) and not final
+            launches = request.get("launches", False) and not final
             self._db.execute(
                 """
                 INSERT INTO host_heartbeats
                 (account, host, source, received, interval, final, unclosed,
-                 wakes_received, wakes_interval)
+                 wakes_received, wakes_interval,
+                 launches_received, launches_interval)
                 VALUES (:account, :host, :source, :now, :interval, :final,
-                        :unclosed, :wakes_received, :wakes_interval)
+                        :unclosed, :wakes_received, :wakes_interval,
+                        :launches_received, :launches_interval)
                 ON CONFLICT (account, host, source) DO UPDATE SET
                     received = excluded.received,
                     interval = excluded.interval,
@@ -2222,7 +2272,13 @@ class Store:
                     wakes_received = CASE WHEN :set_mark
                         THEN excluded.wakes_received ELSE wakes_received END,
                     wakes_interval = CASE WHEN :set_mark
-                        THEN excluded.wakes_interval ELSE wakes_interval END
+                        THEN excluded.wakes_interval ELSE wakes_interval END,
+                    launches_received = CASE WHEN :set_launch_mark
+                        THEN excluded.launches_received
+                        ELSE launches_received END,
+                    launches_interval = CASE WHEN :set_launch_mark
+                        THEN excluded.launches_interval
+                        ELSE launches_interval END
                 """,
                 {
                     "account": account,
@@ -2235,6 +2291,9 @@ class Store:
                     "wakes_received": now if wakes else None,
                     "wakes_interval": request["interval"] if wakes else None,
                     "set_mark": int(wakes or final),
+                    "launches_received": now if launches else None,
+                    "launches_interval": request["interval"] if launches else None,
+                    "set_launch_mark": int(wakes or launches or final),
                 },
             )
             return {"received": now, "recorded": recorded}
@@ -2404,6 +2463,265 @@ class Store:
                 ("liveness", "session_liveness"),
             )
         }
+
+    # --- Launches -------------------------------------------------------
+
+    def _acts_on_launches(self, account: str, host: str, now: str) -> bool:
+        """True if a launcher that acts on launches runs on `host`: a
+        heartbeat of a source of the host with `launches: true` has not
+        expired."""
+        rows = self._db.execute(
+            "SELECT launches_received, launches_interval FROM host_heartbeats "
+            "WHERE account = ? AND host = ? AND launches_received IS NOT NULL",
+            (account, host),
+        ).fetchall()
+        return any(
+            not _past_expiry(r["launches_received"], r["launches_interval"], now)
+            for r in rows
+        )
+
+    @staticmethod
+    def _claim_expired(row: sqlite3.Row, now: str) -> bool:
+        return (
+            row["state"] == "claimed"
+            and _parse_iso(now) - _parse_iso(row["claimed"]) >= LAUNCH_CLAIM_TIMEOUT
+        )
+
+    def _launch_body(self, row: sqlite3.Row, now: str, prompt: bool) -> Launch:
+        """The launch in `row`. A claim that expired shows as a failure also
+        before a write records it. With `prompt`, the body has the prompt if
+        the store still keeps it."""
+        state, reason, updated = row["state"], row["reason"], row["updated"]
+        if self._claim_expired(row, now):
+            state, reason = "failed", NO_SESSION_REPORTED
+            updated = _iso(_parse_iso(row["claimed"]) + LAUNCH_CLAIM_TIMEOUT)
+        body: dict[str, Any] = {
+            "launch": row["id"],
+            "harness": row["harness"],
+            "host": row["host"],
+            "state": state,
+            "caller": row["caller"],
+            "created": row["created"],
+            "updated": updated,
+            **json.loads(row["fields"]),
+        }
+        if prompt and state in ("pending", "claimed") and row["prompt"] is not None:
+            body["prompt"] = row["prompt"]
+        if state == "started":
+            body["session"] = row["session"]
+        if state == "failed":
+            body["reason"] = reason
+        return body  # type: ignore[return-value]
+
+    def _expire_claims(self, now: str) -> None:
+        """Record the failure of each claim that expired, and delete its
+        prompt."""
+        cutoff = _iso(_parse_iso(now) - LAUNCH_CLAIM_TIMEOUT)
+        rows = self._db.execute(
+            "SELECT id, claimed FROM launches WHERE state = 'claimed' AND claimed <= ?",
+            (cutoff,),
+        ).fetchall()
+        for row in rows:
+            self._db.execute(
+                "UPDATE launches SET state = 'failed', reason = ?, prompt = NULL, "
+                "updated = ? WHERE id = ?",
+                (
+                    NO_SESSION_REPORTED,
+                    _iso(_parse_iso(row["claimed"]) + LAUNCH_CLAIM_TIMEOUT),
+                    row["id"],
+                ),
+            )
+
+    def launch(
+        self, account: str, harness: str, caller: str, request: LaunchRequest
+    ) -> LaunchResponse:
+        """Record a launch from the host `caller`, and return its id and the
+        verdict.
+
+        A request id that the store keeps gives the first response again if
+        the harness and all fields are the same, and records nothing. Raise
+        `StoreError` with `request_used` if they differ, with `bad_request`
+        if the parent is not a session of the account, and `NotFound` if the
+        host is not registered. This method does not check read access: the
+        caller can name each session of its account as the parent.
+        """
+        known = {k: v for k, v in request.items() if k != "request"}
+        digest = hashlib.sha256(
+            json.dumps(
+                {"harness": harness, **known}, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        fields = {k: v for k, v in known.items() if k not in ("host", "prompt")}
+        with self._tx():
+            now = self.now()
+            self._expire_claims(now)
+            request_id = request.get("request")
+            if request_id is not None:
+                row = self._db.execute(
+                    "SELECT id, request_sha256, verdict FROM launches "
+                    "WHERE account = ? AND request = ? AND created > ? "
+                    "ORDER BY created DESC LIMIT 1",
+                    (account, request_id, _iso(_parse_iso(now) - LAUNCH_REQUEST_TTL)),
+                ).fetchone()
+                if row is not None:
+                    if row["request_sha256"] != digest:
+                        raise StoreError("request_used", "request id used")
+                    return {"launch": row["id"], "verdict": row["verdict"]}
+            parent = request.get("parent")
+            if parent is not None and (
+                self._session_row(SessionKey(account, harness, parent)) is None
+            ):
+                raise StoreError(
+                    "bad_request", "parent is not a session in the account"
+                )
+            host = request["host"]
+            if self.get_host(account, host) is None:
+                raise NotFound("no such host")
+            verdict: LaunchVerdict = (
+                "starting" if self._acts_on_launches(account, host, now) else "queued"
+            )
+            launch_id = _new_id("l")
+            self._db.execute(
+                """
+                INSERT INTO launches
+                (id, account, harness, host, caller, fields, prompt, request,
+                 request_sha256, verdict, state, created, updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    launch_id,
+                    account,
+                    harness,
+                    host,
+                    caller,
+                    json.dumps(fields),
+                    request["prompt"],
+                    request_id,
+                    digest,
+                    verdict,
+                    now,
+                    now,
+                ),
+            )
+            return {"launch": launch_id, "verdict": verdict}
+
+    def _launch_row(
+        self, account: str, harness: str, launch: str, host: str | None = None
+    ) -> sqlite3.Row:
+        """The launch of the account and harness. With `host`, only a launch
+        for that host. Raise `NotFound` if there is none, so that a launch of
+        another account or host is not shown to exist."""
+        row = self._db.execute(
+            "SELECT * FROM launches WHERE id = ? AND account = ? AND harness = ?",
+            (launch, account, harness),
+        ).fetchone()
+        if row is None or (host is not None and row["host"] != host):
+            raise NotFound("launch")
+        return row
+
+    @_reading
+    def get_launch(self, account: str, harness: str, launch: str) -> Launch:
+        """A launch, without its prompt."""
+        return self._launch_body(
+            self._launch_row(account, harness, launch), self.now(), False
+        )
+
+    @_reading
+    def pending_launches(
+        self, account: str, harness: str, host: str, limit: int = MAX_PENDING_LAUNCHES
+    ) -> list[Launch]:
+        """The pending launches for `host`, with their prompts, oldest
+        first."""
+        now = self.now()
+        rows = self._db.execute(
+            "SELECT * FROM launches "
+            "WHERE account = ? AND harness = ? AND host = ? AND state = 'pending' "
+            "ORDER BY created, id LIMIT ?",
+            (account, harness, host, limit),
+        ).fetchall()
+        return [self._launch_body(r, now, True) for r in rows]
+
+    def _change_launch(
+        self,
+        account: str,
+        harness: str,
+        launch: str,
+        host: str | None,
+        change: Callable[[sqlite3.Row, str], dict[str, Any] | None],
+    ) -> Launch:
+        """Apply `change` to a launch in one write transaction. `change` gets
+        the row and the time. It returns the columns to set, or None for no
+        change, or raises `StoreError`. The result has the prompt if `host`
+        is given (a launcher's route)."""
+        with self._tx():
+            now = self.now()
+            self._expire_claims(now)
+            row = self._launch_row(account, harness, launch, host)
+            columns = change(row, now)
+            if columns is not None:
+                columns["updated"] = now
+                assignments = ", ".join(f"{name} = ?" for name in columns)
+                self._db.execute(
+                    f"UPDATE launches SET {assignments} WHERE id = ?",
+                    (*columns.values(), row["id"]),
+                )
+                row = self._launch_row(account, harness, launch, host)
+            return self._launch_body(row, now, host is not None)
+
+    def claim_launch(
+        self, account: str, harness: str, host: str, launch: str
+    ) -> Launch:
+        def change(row: sqlite3.Row, now: str) -> dict[str, Any]:
+            if row["state"] != "pending":
+                raise StoreError("launch_state", f"launch is {row['state']}")
+            return {"state": "claimed", "claimed": now}
+
+        return self._change_launch(account, harness, launch, host, change)
+
+    def link_launch(
+        self, account: str, harness: str, host: str, launch: str, session: str
+    ) -> Launch:
+        """Link a session to a `claimed` launch for `host`. The first link
+        stays: a link of the same session again changes nothing, and a link
+        of another session is refused. A launch that failed because no
+        session was reported accepts a late link."""
+
+        def change(row: sqlite3.Row, now: str) -> dict[str, Any] | None:
+            if row["state"] == "started":
+                if row["session"] == session:
+                    return None
+                raise StoreError("launch_state", "launch is linked to another session")
+            late = row["state"] == "failed" and row["reason"] == NO_SESSION_REPORTED
+            if row["state"] != "claimed" and not late:
+                raise StoreError("launch_state", f"launch is {row['state']}")
+            return {
+                "state": "started",
+                "session": session,
+                "reason": None,
+                "prompt": None,
+            }
+
+        return self._change_launch(account, harness, launch, host, change)
+
+    def fail_launch(
+        self, account: str, harness: str, host: str, launch: str, reason: str
+    ) -> Launch:
+        def change(row: sqlite3.Row, now: str) -> dict[str, Any]:
+            if row["state"] != "claimed":
+                raise StoreError("launch_state", f"launch is {row['state']}")
+            return {"state": "failed", "reason": reason, "prompt": None}
+
+        return self._change_launch(account, harness, launch, host, change)
+
+    def cancel_launch(self, account: str, harness: str, launch: str) -> Launch:
+        """Change a `pending` launch to `cancelled`, and delete its prompt."""
+
+        def change(row: sqlite3.Row, now: str) -> dict[str, Any]:
+            if row["state"] != "pending":
+                raise StoreError("launch_state", f"launch is {row['state']}")
+            return {"state": "cancelled", "prompt": None}
+
+        return self._change_launch(account, harness, launch, None, change)
 
     # --- Forks ----------------------------------------------------------
 
