@@ -4,7 +4,10 @@ client: the scopes, the caller's routes, and the launcher's routes."""
 
 import hashlib
 import json
+import sqlite3
+import time
 from collections.abc import Iterator
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -48,6 +51,7 @@ class Env:
     client: TestClient
     tokens: dict[str, str]
     clock: Clock
+    data: Path
 
     def h(self, who: str, workspace: str | None = None) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self.tokens[who]}"}
@@ -97,9 +101,11 @@ def env(tmp_path: Path) -> Iterator[Env]:
     )
     clock = Clock()
     store = Store(data, clock=clock)
-    app = create_app(store, AccountSources(path), Settings(data_dir=data))
+    # A short sweep interval, so that a test sees the sweep.
+    settings = Settings(data_dir=data, launch_sweep_seconds=0.05)
+    app = create_app(store, AccountSources(path), settings)
     with TestClient(app) as client:
-        e = Env(client, tokens, clock)
+        e = Env(client, tokens, clock, data)
         for who in ("agent", "agent2"):
             r = client.put("/v1/hosts/self", headers=e.h(who), json={"kind": "runner"})
             assert r.status_code == 200, r.text
@@ -388,6 +394,26 @@ def test_claim_without_a_session_fails_after_ten_minutes(env: Env) -> None:
     r = env.post(f"{L}/{lid}/link", "agent", {"session": "new-1"})
     assert r.status_code == 200, r.text
     assert env.get(f"{L}/{lid}", "caller").json()["session"] == "new-1"
+
+
+def test_server_sweep_deletes_the_prompt_of_an_expired_claim(env: Env) -> None:
+    # The launcher stops after its claim, and no request comes for the launch.
+    lid = launch_id(env)
+    env.post(f"{L}/{lid}/claim", "agent")
+    env.clock.offset += LAUNCH_CLAIM_TIMEOUT
+
+    def stored() -> tuple[str, str | None]:
+        with closing(sqlite3.connect(env.data / "index.sqlite3")) as db:
+            return db.execute(
+                "SELECT state, prompt FROM launches WHERE id = ?", (lid,)
+            ).fetchone()
+
+    deadline = time.monotonic() + 5
+    while stored() != ("failed", None) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert stored() == ("failed", None)
+    r = env.post(f"{L}/{lid}/link", "agent", {"session": "new-1"})
+    assert r.status_code == 200, r.text
 
 
 def test_bad_paths_and_queries(env: Env) -> None:

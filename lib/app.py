@@ -8,6 +8,7 @@ run it in-process.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import ipaddress
@@ -17,7 +18,8 @@ import os
 import threading
 import time
 from collections import OrderedDict, deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -136,6 +138,9 @@ class Settings:
     read_cache_bytes: int = READ_CACHE_BYTES
     # A request that takes longer is logged at INFO, the others at DEBUG.
     slow_request_seconds: float = 1.0
+    # The time between two passes that record the claims of launches that
+    # expired (see `Store.expire_launch_claims`).
+    launch_sweep_seconds: float = 60.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -1210,8 +1215,28 @@ def create_app(store: Store, accounts: AccountSources, settings: Settings) -> St
         Route(f"{s}/blobs/{{path:path}}", get_blob, methods=["GET"]),
     ]
     # AccountSources logs its errors when it loads the files.
+
+    async def sweep_launches() -> None:
+        while True:
+            try:
+                await run_in_threadpool(store.expire_launch_claims)
+            except Exception:
+                log.exception("the sweep of expired launch claims failed")
+            await asyncio.sleep(settings.launch_sweep_seconds)
+
+    @asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        task = asyncio.create_task(sweep_launches())
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
     return Starlette(
         routes=routes,
+        lifespan=lifespan,
         middleware=[
             Middleware(_RequestLog, slow_seconds=settings.slow_request_seconds)
         ],

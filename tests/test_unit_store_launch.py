@@ -302,14 +302,12 @@ def test_claim_expires(store: Store, clock: Clock) -> None:
     clock.t += LAUNCH_CLAIM_TIMEOUT - timedelta(seconds=5)
     assert state(store, launch_id) == "claimed"
     clock.t += timedelta(seconds=5)
-    # A read shows the failure before a write records it.
+    # A read records the failure and deletes the prompt.
     body = store.get_launch(ACCOUNT, HARNESS, launch_id)
     assert (body["state"], body["reason"]) == ("failed", "no session reported")
     assert body["updated"] > claimed["updated"]
-    assert stored_prompt(store, launch_id) is not None
-    # The next write of a launch records it, and deletes the prompt.
-    launch(store)
     assert stored_prompt(store, launch_id) is None
+    assert store.expire_launch_claims() == 0
     assert store.get_launch(ACCOUNT, HARNESS, launch_id) == body
     with pytest.raises(StoreError) as err:
         store.fail_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "late")
@@ -318,6 +316,27 @@ def test_claim_expires(store: Store, clock: Clock) -> None:
     linked = store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-1")
     assert (linked["state"], linked["session"]) == ("started", "new-1")
     assert "reason" not in linked
+
+
+def test_sweep_records_an_expired_claim(store: Store, clock: Clock) -> None:
+    # The launcher stops after its claim, and no request comes for launches.
+    launch_id = launch(store)
+    other = launch(store)
+    claimed = store.claim_launch(ACCOUNT, HARNESS, "agent-1", launch_id)
+    assert store.expire_launch_claims() == 0
+    clock.t += LAUNCH_CLAIM_TIMEOUT
+    assert store.expire_launch_claims() == 1
+    assert stored_prompt(store, launch_id) is None
+    # A pending launch has no expiry.
+    assert stored_prompt(store, other) is not None
+    body = store.get_launch(ACCOUNT, HARNESS, launch_id)
+    assert (body["state"], body["reason"]) == ("failed", "no session reported")
+    # The failure has the time when the claim expired.
+    expired = datetime.fromisoformat(body["updated"])
+    assert expired - datetime.fromisoformat(claimed["updated"]) == LAUNCH_CLAIM_TIMEOUT
+    # The session can report late.
+    linked = store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-1")
+    assert (linked["state"], linked["session"]) == ("started", "new-1")
 
 
 def test_late_link_before_the_failure_is_recorded(store: Store, clock: Clock) -> None:

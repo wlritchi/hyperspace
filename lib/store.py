@@ -2513,12 +2513,12 @@ class Store:
             body["reason"] = reason
         return body  # type: ignore[return-value]
 
-    def _expire_claims(self, now: str) -> None:
-        """Record the failure of each claim that expired, and delete its
-        prompt."""
+    def _expire_claims(self, now: str) -> int:
+        """`expire_launch_claims` in the current write transaction."""
         cutoff = _iso(_parse_iso(now) - LAUNCH_CLAIM_TIMEOUT)
         rows = self._db.execute(
-            "SELECT id, claimed FROM launches WHERE state = 'claimed' AND claimed <= ?",
+            "SELECT id, account, harness, claimed FROM launches "
+            "WHERE state = 'claimed' AND claimed <= ?",
             (cutoff,),
         ).fetchall()
         for row in rows:
@@ -2531,6 +2531,22 @@ class Store:
                     row["id"],
                 ),
             )
+            log.info(
+                "launch %s/%s/%s failed: %s",
+                row["account"],
+                row["harness"],
+                row["id"],
+                NO_SESSION_REPORTED,
+            )
+        return len(rows)
+
+    def expire_launch_claims(self) -> int:
+        """Record the failure of each claim that expired, and delete its
+        prompt. Return the number of such claims. The server calls this
+        periodically, so that a prompt does not stay when no request comes
+        for the launch."""
+        with self._tx():
+            return self._expire_claims(self.now())
 
     def launch(
         self, account: str, harness: str, caller: str, request: LaunchRequest
@@ -2619,12 +2635,17 @@ class Store:
             raise NotFound("launch")
         return row
 
-    @_reading
     def get_launch(self, account: str, harness: str, launch: str) -> Launch:
-        """A launch, without its prompt."""
-        return self._launch_body(
-            self._launch_row(account, harness, launch), self.now(), False
-        )
+        """A launch, without its prompt. If the claim of the launch expired,
+        first record the failure, so that the prompt is deleted."""
+        with self._read():
+            row = self._launch_row(account, harness, launch)
+            if not self._claim_expired(row, self.now()):
+                return self._launch_body(row, self.now(), False)
+        self.expire_launch_claims()
+        with self._read():
+            row = self._launch_row(account, harness, launch)
+            return self._launch_body(row, self.now(), False)
 
     @_reading
     def pending_launches(
