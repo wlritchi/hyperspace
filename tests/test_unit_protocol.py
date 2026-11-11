@@ -7,6 +7,7 @@ import pytest
 
 from hyperspace_protocol import (
     MAX_HEARTBEAT_SESSIONS,
+    MAX_LAUNCH_PROMPT,
     MAX_STATUS_EXCERPT,
     MAX_STATUS_NOTE,
     MAX_WAKE_HANDLE,
@@ -18,6 +19,9 @@ from hyperspace_protocol import (
     validate_heartbeat,
     validate_host_name,
     validate_id,
+    validate_launch_failure,
+    validate_launch_request,
+    validate_launch_session,
     validate_session_id,
     validate_sha256,
     validate_status_request,
@@ -197,9 +201,11 @@ def test_heartbeat_validation() -> None:
         "unclosed": [{**ref, "reason": "unpushed work"}],
         "final": True,
         "wakes": True,
+        "launches": True,
     }
     assert validate_heartbeat(full) == full
     assert "wakes" not in validate_heartbeat({"interval": 60, "wakes": False})
+    assert "launches" not in validate_heartbeat({"interval": 60, "launches": False})
     assert validate_heartbeat({"interval": 3600}) == {"interval": 3600, "sessions": []}
     assert validate_heartbeat({"interval": 60, "source": "ab_12-"}) == {
         "interval": 60,
@@ -219,6 +225,7 @@ def test_heartbeat_validation() -> None:
         {"interval": 60, "unclosed": [{**ref, "reason": "a\nb"}]},
         {"interval": 60, "final": "yes"},
         {"interval": 60, "wakes": 1},
+        {"interval": 60, "launches": "yes"},
         {"interval": 60, "source": "../x"},
         {"interval": 60, "source": "x" * 65},
         {"interval": 60, "source": 3},
@@ -288,3 +295,79 @@ def test_wake_request_validation() -> None:
     ):
         with pytest.raises(ValidationError):
             validate_wake_request(bad)
+
+
+LAUNCH: dict[str, Any] = {"host": "agent-1", "prompt": "review the change"}
+
+
+def test_launch_request_validation() -> None:
+    full = {
+        **LAUNCH,
+        "request": "3f1c2a9e-7d4b-4c1e-9a2f-0b8d6e5c4a31",
+        "workspace": "/home/claude/workspace",
+        "model": "claude-opus-5-5",
+        "effort": "high",
+        "name": "reviewer",
+        "parent": "20e924a9-68b5-48d3-b1a4-15aa285980fd",
+    }
+    assert validate_launch_request(full) == full
+    # Unknown fields are dropped, and null is the same as absent.
+    assert validate_launch_request({**LAUNCH, "later": 1, "model": None}) == LAUNCH
+    for model in ("opus", "sonnet[1m]", "us.anthropic.claude-x:0", "a/b@c"):
+        assert validate_launch_request({**LAUNCH, "model": model})["model"] == model
+    largest = "é" * (MAX_LAUNCH_PROMPT // 2)
+    assert validate_launch_request({**LAUNCH, "prompt": largest})["prompt"] == largest
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"host": None},
+        {"host": "Laptop"},
+        {"prompt": None},
+        {"prompt": ""},
+        {"prompt": 7},
+        {"prompt": "a\x00b"},
+        {"prompt": "x" * (MAX_LAUNCH_PROMPT + 1)},
+        {"prompt": "é" * (MAX_LAUNCH_PROMPT // 2 + 1)},
+        {"prompt": "\ud800"},
+        {"request": ""},
+        {"request": "a b"},
+        {"request": "x" * 65},
+        {"request": 7},
+        {"workspace": "relative/path"},
+        {"workspace": ""},
+        {"workspace": 7},
+        {"model": "--dangerously-skip-permissions"},
+        {"model": ""},
+        {"model": "a b"},
+        {"model": 7},
+        {"effort": "-high"},
+        {"effort": "HIGH"},
+        {"effort": ""},
+        {"name": "-x"},
+        {"name": ""},
+        {"name": "a\nb"},
+        {"name": "x" * 129},
+        {"parent": "../x"},
+        {"parent": 7},
+    ],
+)
+def test_launch_request_invalid(extra: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        validate_launch_request({**LAUNCH, **extra})
+
+
+def test_launch_link_and_failure_bodies() -> None:
+    assert validate_launch_session({"session": "s1"}) == "s1"
+    for bad in ({}, {"session": 7}, {"session": "../x"}):
+        with pytest.raises(ValidationError):
+            validate_launch_session(bad)
+    assert validate_launch_failure({"reason": " claude:\n  bad\toption "}) == (
+        "claude: bad option"
+    )
+    long = validate_launch_failure({"reason": "x" * 1000})
+    assert long == "x" * MAX_STATUS_NOTE
+    for bad in ({}, {"reason": 7}, {"reason": " \n "}):
+        with pytest.raises(ValidationError):
+            validate_launch_failure(bad)

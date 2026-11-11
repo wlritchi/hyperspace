@@ -33,6 +33,9 @@ CAP_CHILD_SESSIONS = "child-sessions"
 # `POST /wake/{harness}`, the `wake` scope, `wake_request` in the session
 # state, and `wake=pending` for `GET /sessions` (see the wake spec).
 CAP_WAKE = "wake"
+# `POST /launch/{harness}` and the routes under it, the `launch` scope, and
+# `launches` in a heartbeat (see the launch spec).
+CAP_LAUNCH = "launch"
 CAPABILITIES = [
     CAP_WORKSPACE_UTF8,
     CAP_RESTORE_PRECONDITION,
@@ -41,6 +44,7 @@ CAPABILITIES = [
     CAP_LIST_CURSOR,
     CAP_CHILD_SESSIONS,
     CAP_WAKE,
+    CAP_LAUNCH,
 ]
 
 # One request carries at most this much uncompressed file data. The client
@@ -67,11 +71,14 @@ REOPEN_NOTE_PREFIX = "reopened: "
 # The largest `pending` of a wake that the server keeps. A larger value is
 # cut to this one. SQLite cannot store integers above 2**63 - 1.
 MAX_WAKE_PENDING = 2**31 - 1
+# The largest prompt of a launch, in UTF-8 bytes.
+MAX_LAUNCH_PROMPT = 64 * 1024
+MAX_LAUNCH_NAME = 128
 
 FileKind = Literal["log", "blob"]
 HostKind = Literal["workstation", "runner"]
 ReadScope = Literal["own", "granted", "all"]
-Scope = Literal["append", "read", "grant", "wake", "reopen"]
+Scope = Literal["append", "read", "grant", "wake", "reopen", "launch"]
 GenerationCause = Literal["root", "rewrite", "diverge", "fork"]
 PlacementCause = Literal["start", "move", "teleport", "steal", "diverge"]
 SessionState = Literal["normal", "conflicted"]
@@ -82,6 +89,8 @@ WakeKind = Literal["local", "message"]
 StatusSourceKind = Literal["user", "agent", "hook"]
 LivenessState = Literal["live", "stopped", "unknown"]
 WakeVerdict = Literal["live", "waking", "queued"]
+LaunchState = Literal["pending", "claimed", "started", "failed", "cancelled"]
+LaunchVerdict = Literal["starting", "queued"]
 
 FILE_KINDS: tuple[FileKind, ...] = ("log", "blob")
 HOST_KINDS: tuple[HostKind, ...] = ("workstation", "runner")
@@ -91,6 +100,13 @@ READY_REASONS: tuple[ReadyReason, ...] = ("asked", "idle")
 WAKE_KINDS: tuple[WakeKind, ...] = ("local", "message")
 STATUS_SOURCE_KINDS: tuple[StatusSourceKind, ...] = ("user", "agent", "hook")
 LIVENESS_STATES: tuple[LivenessState, ...] = ("live", "stopped", "unknown")
+LAUNCH_STATES: tuple[LaunchState, ...] = (
+    "pending",
+    "claimed",
+    "started",
+    "failed",
+    "cancelled",
+)
 
 
 class ValidationError(ValueError):
@@ -349,6 +365,11 @@ def validate_heartbeat(value: dict[str, Any]) -> HeartbeatRequest:
         raise ValidationError("wakes must be a boolean")
     if wakes:
         request["wakes"] = True
+    launches = value.get("launches", False)
+    if not isinstance(launches, bool):
+        raise ValidationError("launches must be a boolean")
+    if launches:
+        request["launches"] = True
     return cast(HeartbeatRequest, request)
 
 
@@ -396,6 +417,101 @@ def _wake_reopen(value: object) -> WakeReopen:
         raise ValidationError("reopen.by must be a string")
     limit = MAX_STATUS_NOTE - len(REOPEN_NOTE_PREFIX)
     return {"reason": clean[:limit], "by": validate_session_id(by)}
+
+
+# The model and the effort level go to Claude Code as option values. They
+# cannot start with "-", so that Claude Code cannot read them as options.
+_LAUNCH_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@\[\]-]{0,127}")
+_LAUNCH_EFFORT_RE = re.compile(r"[a-z]{1,32}")
+
+
+def validate_launch_request(value: dict[str, Any]) -> LaunchRequest:
+    """Check a launch, and return it with only the known fields. Other
+    fields are not refused: a later client can add fields."""
+    request: dict[str, Any] = {}
+    rid = value.get("request")
+    if rid is not None:
+        if not isinstance(rid, str):
+            raise ValidationError("request must be a string")
+        request["request"] = validate_id(rid)
+    host = value.get("host")
+    if not isinstance(host, str):
+        raise ValidationError("host must be a string")
+    request["host"] = validate_host_name(host)
+    prompt = value.get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        raise ValidationError("prompt must be a string that is not empty")
+    # The prompt goes to Claude Code as an argument, which cannot hold NUL.
+    if "\x00" in prompt or _utf8_length(prompt, "prompt") > MAX_LAUNCH_PROMPT:
+        raise ValidationError(
+            f"prompt must be at most {MAX_LAUNCH_PROMPT} bytes, with no NUL"
+        )
+    request["prompt"] = prompt
+    workspace = value.get("workspace")
+    if workspace is not None:
+        if not isinstance(workspace, str):
+            raise ValidationError("workspace must be a string")
+        _utf8_length(workspace, "workspace")
+        request["workspace"] = validate_workspace(workspace)
+    for name, pattern in (("model", _LAUNCH_MODEL_RE), ("effort", _LAUNCH_EFFORT_RE)):
+        option = value.get(name)
+        if option is None:
+            continue
+        if not isinstance(option, str) or not pattern.fullmatch(option):
+            raise ValidationError(f"invalid {name}: {option!r}")
+        request[name] = option
+    name = value.get("name")
+    if name is not None:
+        if (
+            not isinstance(name, str)
+            or not 1 <= len(name) <= MAX_LAUNCH_NAME
+            or name.startswith("-")
+            or any(_is_control(c) for c in name)
+        ):
+            raise ValidationError(
+                f"name must be one line of 1 to {MAX_LAUNCH_NAME} characters "
+                "that does not start with -"
+            )
+        _utf8_length(name, "name")
+        request["name"] = name
+    parent = value.get("parent")
+    if parent is not None:
+        if not isinstance(parent, str):
+            raise ValidationError("parent must be a string")
+        request["parent"] = validate_session_id(parent)
+    return cast(LaunchRequest, request)
+
+
+def _utf8_length(value: str, name: str) -> int:
+    # JSON can carry a lone surrogate, which has no UTF-8 form.
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ValidationError(f"{name} is not valid Unicode") from None
+
+
+def validate_launch_session(value: dict[str, Any]) -> str:
+    """Check the body of a link, and return its session id."""
+    session = value.get("session")
+    if not isinstance(session, str):
+        raise ValidationError("session must be a string")
+    return validate_session_id(session)
+
+
+def validate_launch_failure(value: dict[str, Any]) -> str:
+    """Check the body of a failure, and return its reason as one line.
+
+    The launcher sends output of Claude Code. A reason that is too long or
+    not clean is cut or cleaned, so that the failure is not lost."""
+    reason = value.get("reason")
+    if not isinstance(reason, str):
+        raise ValidationError("reason must be a string")
+    clean = " ".join("".join(" " if _is_control(c) else c for c in reason).split())
+    if not clean:
+        raise ValidationError("reason must not be empty")
+    clean = clean[:MAX_STATUS_NOTE]
+    _utf8_length(clean, "reason")
+    return clean
 
 
 # --- Bodies -----------------------------------------------------------------
@@ -701,6 +817,10 @@ class HeartbeatRequest(TypedDict):
     # A launcher that acts on wakes sends this. A heartbeat without it (for
     # example from a hook) keeps the wake mark of the source.
     wakes: NotRequired[bool]
+    # A launcher that acts on launches sends this, together with `wakes`. A
+    # heartbeat with `wakes` and without `launches` clears the launch mark of
+    # the source; a heartbeat without both keeps it.
+    launches: NotRequired[bool]
 
 
 class HeartbeatResponse(TypedDict):
@@ -734,3 +854,59 @@ class WakeReopen(TypedDict):
 
 class WakeResponse(TypedDict):
     verdict: WakeVerdict
+
+
+class LaunchRequest(TypedDict):
+    """The body of `POST /launch/{harness}`."""
+
+    # A random id from the caller. The server keeps it for 24 hours, so that
+    # the caller can send the same request again.
+    request: NotRequired[str]
+    host: str
+    prompt: str
+    # An absolute path on the host. Absent: the launcher's default.
+    workspace: NotRequired[str]
+    model: NotRequired[str]
+    effort: NotRequired[str]
+    # The display name of the job.
+    name: NotRequired[str]
+    # A session of the account. The new session gets it as `links.parent`.
+    parent: NotRequired[str]
+
+
+class LaunchResponse(TypedDict):
+    launch: str
+    verdict: LaunchVerdict
+
+
+class Launch(TypedDict):
+    """A launch, as `GET /launch/{harness}/{launch}` and the launcher's
+    routes give it."""
+
+    launch: str
+    harness: str
+    host: str
+    state: LaunchState
+    # The host of the credential that sent the launch.
+    caller: str
+    created: str
+    # The time of the last change of the state.
+    updated: str
+    workspace: NotRequired[str]
+    model: NotRequired[str]
+    effort: NotRequired[str]
+    name: NotRequired[str]
+    parent: NotRequired[str]
+    # Only in the launcher's routes, and only while the launch is `pending`
+    # or `claimed`.
+    prompt: NotRequired[str]
+    # Only when `started`.
+    session: NotRequired[str]
+    # Only when `failed`.
+    reason: NotRequired[str]
+
+
+class LaunchList(TypedDict):
+    """The body of `GET /launch/{harness}?state=pending`, oldest first."""
+
+    launches: list[Launch]

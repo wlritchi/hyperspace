@@ -140,6 +140,7 @@ def test_auth(env: Env) -> None:
             "list-cursor",
             "child-sessions",
             "wake",
+            "launch",
         ],
     }
 
