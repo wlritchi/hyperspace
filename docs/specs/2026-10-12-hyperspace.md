@@ -1173,6 +1173,25 @@ dialog.
 
 #### The environment of a resume
 
+The settings `launcher_env` and `launcher_secret_env` are deprecated, and a
+later release removes them. A plugin that needs a value, for example a message
+relay's token, must read it from its own configuration.
+
+The reason: the environment of `claude --bg` does not reliably get to the
+session. In Claude Code 2.1.301, a background job runs in a process that the
+Claude Code daemon starts, with the environment of the daemon (seen on
+2026-11-11). The daemon has the environment of the process that started it,
+which is frequently not the launcher, and `claude --bg` sends the daemon only
+a fixed list of variables. Thus a value gets to the job only if the same
+`claude --bg` started the daemon, and a later value (for example a new token)
+does not get to jobs while the daemon runs. The launch marker moved to
+`--settings` for the same reason (see "The environment marker" in the
+[launch spec](2026-11-10-launch.md)).
+
+While the settings have a value, the launcher logs one warning at its start.
+`hyperspace secret set` also writes a warning. Their behavior does not change
+otherwise.
+
 A session that the launcher resumes can need values that the launcher's own
 environment does not have, for example the token of a message relay. Two
 settings give them to each `claude --bg` that the launcher runs:

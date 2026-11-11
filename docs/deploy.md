@@ -311,9 +311,23 @@ launcher_claude_args = [
 Do not put `--model` in this list: the resume takes the model from the
 session's transcript, and `--model` replaces it.
 
-If the relay needs values from the environment, for example its server URL and
-its token, give them to the launcher's resumes in `config.toml` too. Put a
-secret in the keyring, not in the file:
+If the relay needs values, for example its server URL and its token, put them
+in the configuration of the relay plugin.
+
+`launcher_env` and `launcher_secret_env` are deprecated, and a later release
+removes them. They give values to the environment of each `claude --bg` that
+the launcher runs, but a background job does not reliably get that
+environment. In Claude Code 2.1.301, the job runs in a process that the Claude
+Code daemon starts, with the environment of the daemon. The daemon gets the
+environment of the process that started it, which is frequently not the
+launcher. Thus a value gets to the session only if the same `claude --bg`
+started the daemon, and a changed value (for example a new token) does not get
+to the sessions while the daemon runs. The launcher logs a warning at its
+start if one of these options has a value, and `hyperspace secret set` writes
+a warning.
+
+Until then, the options continue to work. Give the values in `config.toml`,
+and put a secret in the keyring, not in the file:
 
 ```toml
 launcher_secret_env = ["RELAY_TOKEN"]

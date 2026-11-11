@@ -558,14 +558,19 @@ def start_launcher(
     server: Server,
     tmp_path: Path,
     argv: list[str],
+    config: str = "",
     **errors: list[Exception],
 ) -> tuple[int, list[float], list[str]]:
-    """Run `hyperspace launcher` with the in-process server, where the API
-    methods in `errors` fail first. Return the exit code, the sleeps, and
-    the modes of the launcher that ran."""
+    """Run `hyperspace launcher` with the in-process server and the
+    config.toml text `config`, where the API methods in `errors` fail
+    first. Return the exit code, the sleeps, and the modes of the launcher
+    that ran."""
+    config_path = tmp_path / "config.toml"
+    if config:
+        config_path.write_text(config)
     for name, value in {
         "XDG_STATE_HOME": str(tmp_path / "xdg"),
-        "HYPERSPACE_CONFIG": str(tmp_path / "none.toml"),
+        "HYPERSPACE_CONFIG": str(config_path),
         "HYPERSPACE_URL": "http://127.0.0.1:9",
         "HYPERSPACE_TOKEN": "unused",
         "HYPERSPACE_HOST": "laptop",
@@ -1232,6 +1237,44 @@ def test_run_bg_adds_the_environment(tmp_path: Path) -> None:
     ]
     assert run_bg(argv, str(tmp_path), 30, {"X_TEST": "v"}).returncode == 0
     assert out.read_text() == "v"
+
+
+@pytest.mark.parametrize(
+    ("config", "names"),
+    [
+        ("", None),
+        ("launcher_secret_env = []\n[launcher_env]\n", None),
+        ('[launcher_env]\nRELAY_URL = "wss://relay.test"\n', "launcher_env is"),
+        ('launcher_secret_env = ["RELAY_TOKEN"]\n', "launcher_secret_env is"),
+        (
+            (
+                'launcher_secret_env = ["RELAY_TOKEN"]\n'
+                '[launcher_env]\nRELAY_URL = "wss://relay.test"\n'
+            ),
+            "launcher_env and launcher_secret_env are",
+        ),
+    ],
+)
+def test_launcher_warns_at_start_about_deprecated_env(
+    monkeypatch: pytest.MonkeyPatch,
+    server: Server,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    config: str,
+    names: str | None,
+) -> None:
+    code, _, ran = start_launcher(monkeypatch, server, tmp_path, ["--stay"], config)
+    assert (code, ran) == (0, ["workstation"])
+    warnings = [
+        r.getMessage() for r in caplog.records if "deprecated" in r.getMessage()
+    ]
+    if names is None:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1
+        assert warnings[0].startswith(f"launcher: {names} deprecated.")
+        assert "configuration of the plugin" in warnings[0]
+        assert "A later release removes" in warnings[0]
 
 
 def test_launcher_env_config(tmp_path: Path) -> None:

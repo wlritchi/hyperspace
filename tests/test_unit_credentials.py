@@ -311,6 +311,8 @@ def test_secret_set_load_forget(
     out, err = capsys.readouterr()
     assert "stored RELAY_TOKEN in the keyring" in out
     assert "not in launcher_secret_env" in err
+    assert err.count("launcher_secret_env is deprecated.") == 1
+    assert "configuration of the plugin that uses it" in err
     assert run(monkeypatch, "secret", "set", "HYPERSPACE_X", "--stdin", stdin="v") == 2
     assert run(monkeypatch, "secret", "load") == 2
     config = tmp_path / "config" / "hyperspace" / "config.toml"

@@ -392,6 +392,10 @@ def cmd_secret(args: argparse.Namespace, cfg: Config) -> int:
         raise Exit(2, "the value must be a non-empty string with no NUL")
     backend = credentials.store_secret(name, value, cfg.token_cache_ttl)
     print(f"stored {name} in the keyring ({backend})")
+    print(
+        f"hyperspace: {config_mod.env_deprecation(['launcher_secret_env'])}",
+        file=sys.stderr,
+    )
     if name not in configured:
         print(
             f"hyperspace: {name} is not in launcher_secret_env in config.toml, "
@@ -1118,6 +1122,16 @@ def cmd_launcher(args: argparse.Namespace, cfg: Config) -> int:
             env = launcher.ResumeEnv(
                 cfg.launcher_env, cfg.launcher_secret_env, cfg.token_cache_ttl
             )
+            deprecated = [
+                name
+                for name, value in (
+                    ("launcher_env", cfg.launcher_env),
+                    ("launcher_secret_env", cfg.launcher_secret_env),
+                )
+                if value
+            ]
+            if deprecated:
+                log.warning("launcher: %s", config_mod.env_deprecation(deprecated))
 
             def before_tick() -> None:
                 _refresh_token(cfg, ctx)
@@ -1322,7 +1336,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_logout)
 
     p = sub.add_parser(
-        "secret", help="manage values for the environment of the launcher's resumes"
+        "secret",
+        help="manage values for the environment of the launcher's resumes (deprecated)",
+        description="Manage the values of launcher_secret_env. "
+        + config_mod.env_deprecation(["launcher_secret_env"]),
     )
     actions = p.add_subparsers(dest="action", required=True)
     q = actions.add_parser("set", help="store a value in the keyring and the cache")

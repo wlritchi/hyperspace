@@ -15,9 +15,9 @@ environment.
 | Launcher idle exit |                           | `launcher_idle_exit` |
 | Claude Code binary | `HYPERSPACE_CLAUDE`       | `claude_bin`         |
 | Runner resume args | `HYPERSPACE_LAUNCHER_CLAUDE_ARGS` (JSON) | `launcher_claude_args` |
-| Resume environment |                           | `launcher_env`       |
+| Resume environment |                           | `launcher_env` (deprecated) |
 | Resume process cap | `HYPERSPACE_LAUNCHER_MAX_SESSIONS` | `launcher_max_sessions` |
-| Resume secrets     |                           | `launcher_secret_env`|
+| Resume secrets     |                           | `launcher_secret_env` (deprecated) |
 
 With no token in the environment or a file, the token comes from the token
 cache or the system keyring (see `credentials`).
@@ -254,6 +254,18 @@ def check_launcher_env(
     if both:
         raise ConfigError(f"{both[0]} is in launcher_env and in launcher_secret_env")
     return env, list(dict.fromkeys(names))
+
+
+def env_deprecation(names: list[str]) -> str:
+    """The warning for the deprecated options in `names` (see "The
+    environment of a resume" in the spec)."""
+    subject = " and ".join(names) + (" are" if len(names) > 1 else " is")
+    return (
+        f"{subject} deprecated. A resumed session gets the environment of the "
+        "Claude Code daemon, not of the launcher, so the value does not always "
+        "get to the session. Put the value in the configuration of the plugin "
+        f"that uses it. A later release removes {'them' if len(names) > 1 else 'it'}."
+    )
 
 
 def check_token(token: str, where: str) -> str:
