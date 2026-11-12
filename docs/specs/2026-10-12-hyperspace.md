@@ -1047,7 +1047,9 @@ server is on the open internet from the first release.
     metadata event, or blob version written by this host. These writes record
     the author in the same transaction that creates the session. Metadata and
     blob uploads do not acquire the lease. A reserved lease alone does not
-    permit reads. `granted` also permits sessions with a grant to this host.
+    permit reads. `granted` also permits sessions with a grant to this host. A
+    launch grants the session that it starts to the caller of the launch (see
+    "Read access of the caller" in the [launch spec](2026-11-10-launch.md)).
     `all` permits every session in the account.
   - `grant`: permit another host to read one session. A credential can grant
     only a session that it can read, so `grant` never widens the reads of the
