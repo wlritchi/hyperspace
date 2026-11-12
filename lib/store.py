@@ -410,6 +410,12 @@ _MIGRATIONS: list[str] = [
     ALTER TABLE host_heartbeats ADD COLUMN launches_received TEXT;
     ALTER TABLE host_heartbeats ADD COLUMN launches_interval INTEGER;
     """,
+    # The launches that started a session, so that the first upload of a
+    # session can find them and grant the session to their callers.
+    """
+    CREATE INDEX launches_by_session ON launches (account, harness, session)
+    WHERE session IS NOT NULL;
+    """,
 ]
 
 # `recheck_conflict` compares two branches in pieces of this size.
@@ -1040,7 +1046,11 @@ class Store:
             raise NotFound("session")
         return row
 
-    def _ensure_session(self, key: SessionKey) -> sqlite3.Row:
+    def _ensure_session(self, key: SessionKey, host: str) -> sqlite3.Row:
+        """The session row. If there is none, make it for a first write by
+        `host`, and grant the session to the callers of the launches of
+        `host` that this session started (a link can come before the first
+        upload)."""
         row = self._session_row(key)
         if row is not None:
             return row
@@ -1051,6 +1061,14 @@ class Store:
         )
         row = self._session_row(key)
         assert row is not None
+        launches = self._db.execute(
+            "SELECT caller FROM launches "
+            "WHERE account = ? AND harness = ? AND session = ? "
+            "AND state = 'started' AND host = ?",
+            (key.account, key.harness, key.session_id, host),
+        ).fetchall()
+        for launch in launches:
+            self._grant_to_caller(row["id"], launch["caller"], host)
         return row
 
     @_reading
@@ -1205,7 +1223,7 @@ class Store:
         the path to a log, and starts with the latest blob version.
         """
         with self._tx():
-            session = self._ensure_session(key)
+            session = self._ensure_session(key, writer.host)
             previous = self._file_row(session["id"], path)
             seed: bytes | None = None
             if previous is not None and previous["kind"] == "blob":
@@ -1399,7 +1417,7 @@ class Store:
         if hashlib.sha256(data).hexdigest() != sha256:
             raise StoreError("bad_digest", "the sha256 does not match the data")
         with self._tx():
-            session = self._ensure_session(key)
+            session = self._ensure_session(key, writer.host)
             file = self._ensure_file(session["id"], path, "blob")
             latest = self._db.execute(
                 "SELECT * FROM blob_versions WHERE file = ? "
@@ -1462,7 +1480,7 @@ class Store:
         parent = metadata.get("links", {}).get("parent")
         top_level = parent is None and "automation" not in metadata
         with self._tx():
-            session = self._ensure_session(key)
+            session = self._ensure_session(key, writer.host)
             written = self._db.execute(
                 "INSERT INTO metadata_events (session, host, received, body) "
                 "VALUES (?, ?, ?, ?)",
@@ -2705,16 +2723,22 @@ class Store:
         """Link a session to a `claimed` launch for `host`. The first link
         stays: a link of the same session again changes nothing, and a link
         of another session is refused. A launch that failed because no
-        session was reported accepts a late link."""
+        session was reported accepts a late link.
+
+        A link grants the session to the caller of the launch, if the session
+        exists and `host` can read it by the `own` rules. Else the first
+        upload of the session by `host` records the grant."""
 
         def change(row: sqlite3.Row, now: str) -> dict[str, Any] | None:
             if row["state"] == "started":
                 if row["session"] == session:
+                    self._grant_linked(row, session)
                     return None
                 raise StoreError("launch_state", "launch is linked to another session")
             late = row["state"] == "failed" and row["reason"] == NO_SESSION_REPORTED
             if row["state"] != "claimed" and not late:
                 raise StoreError("launch_state", f"launch is {row['state']}")
+            self._grant_linked(row, session)
             return {
                 "state": "started",
                 "session": session,
@@ -2723,6 +2747,30 @@ class Store:
             }
 
         return self._change_launch(account, harness, launch, host, change)
+
+    def _grant_linked(self, launch: sqlite3.Row, session: str) -> None:
+        """Grant `session` to the caller of `launch`. The launch's host must
+        be able to read the session by the `own` rules, so that a link
+        cannot give the caller a session of a different host."""
+        if launch["caller"] == launch["host"]:
+            return
+        row = self._session_row(
+            SessionKey(launch["account"], launch["harness"], session)
+        )
+        if row is None or not self._can_read_row(row, launch["host"], "own"):
+            return
+        self._grant_to_caller(row["id"], launch["caller"], launch["host"])
+
+    def _grant_to_caller(self, session: int, caller: str, host: str) -> None:
+        """Grant the session row `session` to the caller of a launch for
+        `host`. A host can read its own sessions, so it gets no grant."""
+        if caller == host:
+            return
+        self._db.execute(
+            "INSERT INTO grants (session, host, granted_by, created) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            (session, caller, host, self.now()),
+        )
 
     def fail_launch(
         self, account: str, harness: str, host: str, launch: str, reason: str

@@ -75,6 +75,7 @@ def env(tmp_path: Path) -> Iterator[Env]:
         "agent": ("agent-1", {"append", "read", "grant"}, "granted"),
         "agent2": ("agent-2", {"append", "read", "grant"}, "granted"),
         "caller": ("caller", {"launch"}, "own"),
+        "watcher": ("watcher", {"launch", "read"}, "granted"),
         "reader": ("reader", {"read"}, "own"),
         "appender": ("appender", {"append"}, "own"),
         "waker": ("subspace", {"wake"}, "own"),
@@ -114,17 +115,22 @@ def env(tmp_path: Path) -> Iterator[Env]:
 
 
 def make_parent(env: Env) -> None:
+    upload(env, "laptop", PARENT)
+
+
+def upload(env: Env, who: str, session: str) -> None:
+    path = f"/v1/sessions/{HARNESS}/{session}"
     r = env.client.post(
-        f"{P}/generations",
-        headers=env.h("laptop", WS_LAPTOP),
+        f"{path}/generations",
+        headers=env.h(who, WS_LAPTOP),
         json={"path": "transcript.jsonl", "cause": "root"},
     )
     assert r.status_code == 200, r.text
     data = b"one\n"
     r = env.client.post(
-        f"{P}/generations/{r.json()['id']}/append",
+        f"{path}/generations/{r.json()['id']}/append",
         headers={
-            **env.h("laptop", WS_LAPTOP),
+            **env.h(who, WS_LAPTOP),
             "Hyperspace-Base-Length": "0",
             "Hyperspace-Sha256": hashlib.sha256(data).hexdigest(),
             "Content-Encoding": "zstd",
@@ -357,6 +363,33 @@ def test_launcher_flow(env: Env) -> None:
     }
     r = env.post(f"{L}/{lid}/fail", "agent", {"reason": "late"})
     assert r.status_code == 409
+
+
+@pytest.mark.parametrize("link_first", [True, False])
+def test_the_caller_can_read_the_launched_session(env: Env, link_first: bool) -> None:
+    session = "a6c1d8e2-3f4b-4c5d-9e6f-7a8b9c0d1e2f"
+    manifest = f"/v1/sessions/{HARNESS}/{session}"
+    r = launch(env, "watcher")
+    assert r.status_code == 200, r.text
+    lid = r.json()["launch"]
+    assert env.post(f"{L}/{lid}/claim", "agent").status_code == 200
+    if not link_first:
+        upload(env, "agent", session)
+        assert env.get(manifest, "watcher").status_code == 404
+    r = env.post(f"{L}/{lid}/link", "agent", {"session": session})
+    assert r.status_code == 200, r.text
+    if link_first:
+        assert env.get(manifest, "watcher").status_code == 404
+        upload(env, "agent", session)
+    assert env.get(manifest, "watcher").status_code == 200
+    # A repeat link changes nothing. Other hosts get no grant.
+    r = env.post(f"{L}/{lid}/link", "agent", {"session": session})
+    assert r.status_code == 200, r.text
+    assert env.get(manifest, "watcher").status_code == 200
+    assert env.get(manifest, "agent2").status_code == 404
+    with closing(sqlite3.connect(env.data / "index.sqlite3")) as db:
+        rows = db.execute("SELECT host, granted_by FROM grants").fetchall()
+    assert rows == [("watcher", "agent-1")]
 
 
 def test_fail_and_cancel(env: Env) -> None:

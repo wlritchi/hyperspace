@@ -405,3 +405,126 @@ def test_migration_adds_launches(tmp_path: Path) -> None:
         # A wake mark from before the migration is not a launch mark.
         response = migrated.launch(ACCOUNT, HARNESS, "laptop", request())
         assert response["verdict"] == "queued"
+
+
+AGENT = Writer(ACCOUNT, "agent-1", "/work")
+NEW = SessionKey(ACCOUNT, HARNESS, "new-1")
+
+
+def upload(store: Store, writer: Writer = AGENT, key: SessionKey = NEW) -> None:
+    gen = store.create_generation(key, "transcript.jsonl", writer, "root")["id"]
+    data = b"one\n"
+    store.append(key, gen, writer, 0, data, hashlib.sha256(data).hexdigest(), 1)
+
+
+def grants(store: Store, key: SessionKey = NEW) -> list[tuple[str, str]]:
+    with closing(sqlite3.connect(store.data_dir / "index.sqlite3")) as db:
+        return db.execute(
+            "SELECT g.host, g.granted_by FROM grants g "
+            "JOIN sessions s ON s.id = g.session "
+            "WHERE s.account = ? AND s.harness = ? AND s.session_id = ? "
+            "ORDER BY g.host",
+            (key.account, key.harness, key.session_id),
+        ).fetchall()
+
+
+def claimed(store: Store, caller: str = "laptop") -> str:
+    launch_id = store.launch(ACCOUNT, HARNESS, caller, request())["launch"]
+    store.claim_launch(ACCOUNT, HARNESS, "agent-1", launch_id)
+    return launch_id
+
+
+def test_link_then_first_upload_grants_the_session_to_the_caller(
+    store: Store,
+) -> None:
+    launch_id = claimed(store)
+    store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-1")
+    assert not store.can_read(NEW, "laptop", "granted")
+    upload(store)
+    assert grants(store) == [("laptop", "agent-1")]
+    assert store.can_read(NEW, "laptop", "granted")
+    assert not store.can_read(NEW, "laptop", "own")
+    # A repeat link changes nothing.
+    store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-1")
+    assert grants(store) == [("laptop", "agent-1")]
+
+
+def test_first_upload_then_link_grants_the_session_to_the_caller(
+    store: Store,
+) -> None:
+    launch_id = claimed(store)
+    upload(store)
+    assert not store.can_read(NEW, "laptop", "granted")
+    store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-1")
+    assert grants(store) == [("laptop", "agent-1")]
+    assert store.can_read(NEW, "laptop", "granted")
+    again = store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-1")
+    assert again["state"] == "started"
+    assert grants(store) == [("laptop", "agent-1")]
+
+
+def test_a_launch_of_the_callers_own_host_records_no_grant(store: Store) -> None:
+    first = claimed(store, caller="agent-1")
+    store.link_launch(ACCOUNT, HARNESS, "agent-1", first, "new-1")
+    upload(store)
+    second = claimed(store, caller="agent-1")
+    store.link_launch(ACCOUNT, HARNESS, "agent-1", second, "new-1")
+    assert grants(store) == []
+
+
+def test_a_late_link_grants_the_session(store: Store, clock: Clock) -> None:
+    launch_id = claimed(store)
+    upload(store)
+    clock.t += LAUNCH_CLAIM_TIMEOUT
+    assert state(store, launch_id) == "failed"
+    store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-1")
+    assert grants(store) == [("laptop", "agent-1")]
+
+
+def test_a_link_does_not_give_a_session_of_another_host(store: Store) -> None:
+    # The launch's host cannot read the session, so the link grants nothing.
+    store.register_host(ACCOUNT, "other", {"kind": "workstation"})
+    other = Writer(ACCOUNT, "other", "/elsewhere")
+    launch_id = claimed(store)
+    upload(store, other)
+    store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-1")
+    assert grants(store) == []
+    assert not store.can_read(NEW, "laptop", "granted")
+    # The first upload of a linked session by another host grants nothing.
+    second = SessionKey(ACCOUNT, HARNESS, "new-2")
+    launch_id = claimed(store)
+    store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-2")
+    upload(store, other, second)
+    assert grants(store, second) == []
+    # When the launch's host writes the session, a repeat link grants it.
+    store.put_blob(second, "blob", AGENT, b"x", hashlib.sha256(b"x").hexdigest())
+    store.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-2")
+    assert grants(store, second) == [("laptop", "agent-1")]
+
+
+def test_migration_adds_the_session_index_of_launches(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    index = next(i for i, m in enumerate(_MIGRATIONS) if "launches_by_session" in m)
+    with closing(sqlite3.connect(data / "index.sqlite3")) as db:
+        for migration in _MIGRATIONS[:index]:
+            db.executescript(migration)
+        db.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        db.execute("INSERT INTO schema_version VALUES (?)", (index,))
+        db.commit()
+    with closing(Store(data, clock=Clock())) as migrated:
+        migrated.register_host(ACCOUNT, "agent-1", {"kind": "runner"})
+        launch_id = claimed(migrated)
+        migrated.link_launch(ACCOUNT, HARNESS, "agent-1", launch_id, "new-1")
+        upload(migrated)
+        assert grants(migrated) == [("laptop", "agent-1")]
+    with closing(sqlite3.connect(data / "index.sqlite3")) as db:
+        version = db.execute("SELECT version FROM schema_version").fetchone()
+        assert version == (len(_MIGRATIONS),)
+        plan = db.execute(
+            "EXPLAIN QUERY PLAN SELECT caller FROM launches "
+            "WHERE account = ? AND harness = ? AND session = ? "
+            "AND state = 'started' AND host = ?",
+            (ACCOUNT, HARNESS, "new-1", "agent-1"),
+        ).fetchall()
+        assert any("launches_by_session" in row[3] for row in plan)
