@@ -56,6 +56,7 @@ from hyperspace_protocol import (
     CAP_LIVENESS,
     CAP_SESSION_STATUS,
     STATUSES,
+    Launch,
     LaunchRequest,
     SessionStateBody,
     SessionSummary,
@@ -972,12 +973,33 @@ def cmd_grant(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def _print_launch(item: Launch, as_json: bool) -> None:
+    """Print a launch, without its prompt even if the server sends it."""
+    record = {k: v for k, v in item.items() if k != "prompt"}
+    if as_json:
+        print(json.dumps(record))
+        return
+    fields = ["launch", "state", "host", "caller", "created", "updated"]
+    fields.append("session" if item["state"] == "started" else "reason")
+    for field in fields:
+        if field in record:
+            print(f"{field + ':':<9} {printable(str(record[field]))}")
+
+
 def cmd_launch(args: argparse.Namespace, cfg: Config) -> int:
     state = State(cfg.state_dir)
     ctx = _context(cfg, state)
     harness = "claude-code"
     try:
         ctx.api.require_capability(CAP_LAUNCH)
+        if args.show and args.cancel:
+            raise Exit(1, "--show cannot have --cancel")
+        if args.show:
+            if args.prompt is not None:
+                raise Exit(1, "--show cannot have a prompt")
+            shown = ctx.api.get_launch(harness, args.show)
+            _print_launch(shown, args.json)
+            return 0
         if args.cancel:
             if args.prompt is not None:
                 raise Exit(1, "--cancel cannot have a prompt")
@@ -1233,12 +1255,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("launch", help="start a new session on a host")
-    p.add_argument("prompt", nargs="?")
-    for option in ("host", "workspace", "model", "effort", "name", "cancel"):
-        p.add_argument("--" + option)
-    p.add_argument("--wait", action="store_true")
-    p.add_argument("--json", action="store_true")
+    p = sub.add_parser(
+        "launch",
+        help="start a new session on a host, or show or cancel a launch",
+    )
+    p.add_argument("prompt", nargs="?", help="the first message of the session")
+    p.add_argument(
+        "--host", help="the host to start the session on (default: this host)"
+    )
+    p.add_argument(
+        "--workspace",
+        help="the absolute path of the session's directory on the host "
+        "(default: the launcher's workspace)",
+    )
+    p.add_argument("--model", help="the model of the session")
+    p.add_argument("--effort", help="the effort of the session")
+    p.add_argument("--name", help="the display name of the job")
+    p.add_argument(
+        "--wait",
+        action="store_true",
+        help="wait until the launch starts or fails, then print the session id "
+        "or the reason",
+    )
+    p.add_argument("--json", action="store_true", help="print the launch record")
+    p.add_argument(
+        "--show",
+        metavar="LAUNCH",
+        help="print the launch: its state, host, caller, and session or reason",
+    )
+    p.add_argument("--cancel", metavar="LAUNCH", help="cancel a pending launch")
     p.set_defaults(func=cmd_launch)
 
     p = sub.add_parser("whoami", help="show the credential's account and host")

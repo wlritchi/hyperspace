@@ -2946,6 +2946,84 @@ def test_local_launch_does_not_list(
     assert ctx.api.get_launch(HARNESS, item["launch"])["state"] == "claimed"
 
 
+def test_launch_cli_show(
+    server: Server,
+    ctx: Context,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    register_host(ctx, "workstation")
+
+    def context(cfg: Config, state: State) -> Context:
+        return Context(
+            api=server.api("laptop"), state=state, adapter=ClaudeCode(), host="laptop"
+        )
+
+    monkeypatch.setattr("hyperspace_client.cli._context", context)
+    with server.api("other") as caller:
+        started = caller.launch(HARNESS, {"host": "laptop", "prompt": "secret plan"})
+        failed = caller.launch(HARNESS, {"host": "laptop", "prompt": "secret plan"})
+    ctx.api.claim_launch(HARNESS, started["launch"])
+    ctx.api.link_launch(HARNESS, started["launch"], "new-1")
+    ctx.api.claim_launch(HARNESS, failed["launch"])
+    ctx.api.fail_launch(HARNESS, failed["launch"], "claude: unknown option")
+    record = ctx.api.get_launch(HARNESS, started["launch"])
+
+    assert main(["launch", "--show", started["launch"]]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        f"launch:   {started['launch']}",
+        "state:    started",
+        "host:     laptop",
+        "caller:   other",
+        f"created:  {record['created']}",
+        f"updated:  {record['updated']}",
+        "session:  new-1",
+    ]
+    assert main(["launch", "--show", started["launch"], "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == record
+    # A failed launch shows the reason. The result does not change the exit
+    # code of --show.
+    assert main(["launch", "--show", failed["launch"]]) == 0
+    out = capsys.readouterr().out
+    assert "reason:   claude: unknown option" in out.splitlines()
+    assert "session" not in out
+
+    # The prompt is never printed, also if the server sends it.
+    original = Api.get_launch
+
+    def with_prompt(api: Api, harness: str, launch: str) -> Launch:
+        item = original(api, harness, launch)
+        item["prompt"] = "secret plan"
+        return item
+
+    monkeypatch.setattr(Api, "get_launch", with_prompt)
+    for extra in ([], ["--json"]):
+        assert main(["launch", "--show", started["launch"], *extra]) == 0
+        out = capsys.readouterr().out
+        assert "new-1" in out and "secret plan" not in out
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--show", "l_missing"], "hyperspace: 404 not_found: launch"),
+        (["--show", "l_1", "--cancel", "l_1"], "--show cannot have --cancel"),
+        (["--show", "l_1", "hi"], "--show cannot have a prompt"),
+    ],
+)
+def test_launch_cli_show_errors(
+    ctx: Context,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: list[str],
+    message: str,
+) -> None:
+    monkeypatch.setattr("hyperspace_client.cli._context", lambda cfg, state: ctx)
+    assert main(["launch", *argv]) == 1
+    captured = capsys.readouterr()
+    assert message in captured.err and captured.out == ""
+
+
 @pytest.mark.parametrize("named", [False, True])
 def test_launch_real_announcement(named: bool) -> None:
     output = (
