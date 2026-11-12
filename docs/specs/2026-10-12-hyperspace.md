@@ -1173,9 +1173,9 @@ dialog.
 
 #### The environment of a resume
 
-The settings `launcher_env` and `launcher_secret_env` are deprecated, and a
-later release removes them. A plugin that needs a value, for example a message
-relay's token, must read it from its own configuration.
+The launcher adds no variables of its own to the environment of a resume or a
+launch. A plugin that needs a value, for example a message relay's token,
+reads it from its own configuration.
 
 The reason: the environment of `claude --bg` does not reliably get to the
 session. In Claude Code 2.1.301, a background job runs in a process that the
@@ -1184,42 +1184,14 @@ Claude Code daemon starts, with the environment of the daemon (seen on
 which is frequently not the launcher, and `claude --bg` sends the daemon only
 a fixed list of variables. Thus a value gets to the job only if the same
 `claude --bg` started the daemon, and a later value (for example a new token)
-does not get to jobs while the daemon runs. The launch marker moved to
+does not get to jobs while the daemon runs. The launch marker is in
 `--settings` for the same reason (see "The environment marker" in the
 [launch spec](2026-11-10-launch.md)).
 
-While the settings have a value, the launcher logs one warning at its start.
-`hyperspace secret set` also writes a warning. Their behavior does not change
-otherwise.
-
-A session that the launcher resumes can need values that the launcher's own
-environment does not have, for example the token of a message relay. Two
-settings give them to each `claude --bg` that the launcher runs:
-
-- `launcher_env`: a table of names and values.
-- `launcher_secret_env`: a list of names. The value of each name comes from
-  the system keyring (user name `env:<name>`), through the token cache.
-
-`hyperspace secret set <name>` stores a value in the keyring and the cache.
-`hyperspace secret forget <name>` removes it from both. When a process reads
-the token from the keyring, it also reads each secret that is not in the
-cache, so that after a reboot one prompt fills both. `hyperspace secret load`
-reads the secrets on request, for example when the token comes from a file.
-
-The launcher reads the secrets only from the cache (on macOS, from an unlocked
-Keychain), at each tick, so that the cache stays alive. It keeps the last
-value that it read. If a secret has no value, the launcher does not resume a
-session, because without its relay a session does not get its messages. It
-logs an error, and tries again at the next tick. Such a resume does not count
-toward the resume limit.
-
-A name must be a valid environment variable name. The client refuses names
-that start with `HYPERSPACE_`, the names that the client removes from the
-environment of a `claude` that it starts (`CLAUDE_CODE_SESSION_ID` and
-`CLAUDE_JOB_DIR`), and a name in both settings.
-
-A value can get to a session that the launcher resumes, and the agent can then
-read it. Give only values that each session can hold.
+A `config.toml` for an older client can have the settings `launcher_env` and
+`launcher_secret_env`. The client ignores their values, and
+`hyperspace launcher` logs one warning at its start. A hook does not fail
+because of them.
 
 ### Sync engine
 

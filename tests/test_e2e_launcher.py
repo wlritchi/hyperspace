@@ -22,7 +22,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from _hs import FakeClaude, MemoryCache, Server, make_server, prompt, text_reply
+from _hs import FakeClaude, Server, make_server, prompt, text_reply
 from hyperspace_client import launcher as launcher_mod
 from hyperspace_client.adapters import claude_code as claude_code_mod
 from hyperspace_client.adapters.claude_code import ClaudeCode, ContinuedFrom
@@ -46,7 +46,6 @@ from hyperspace_client.launcher import (
     START_CHECK,
     START_RETRY,
     Launcher,
-    ResumeEnv,
     close_after_exit,
     close_job,
     host_lock,
@@ -856,13 +855,11 @@ class Bg:
     def __init__(self, code: int = 0) -> None:
         self.code = code
         self.calls: list[tuple[list[str], str]] = []
-        self.envs: list[Mapping[str, str]] = []
 
     def __call__(
         self, argv: list[str], cwd: str, timeout: float, env: Mapping[str, str]
     ) -> RunResult:
         self.calls.append((argv, cwd))
-        self.envs.append(env)
         return RunResult(self.code, "" if self.code == 0 else "no such session")
 
 
@@ -1152,39 +1149,6 @@ def test_resume_limit(
     assert sid not in run._limited  # pyright: ignore[reportPrivateUsage]
 
 
-def test_a_resume_gets_the_launchers_environment(
-    ctx: Context,
-    fake: FakeClaude,
-    host: Host,
-    tmp_path: Path,
-    token_cache: MemoryCache,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    sid = held_session(ctx, fake, tmp_path / "ws")
-    set_status(ctx, sid, "working")
-    bg = Bg(code=1)
-    clock = Clock()
-    env = ResumeEnv({"RELAY_URL": "wss://relay.test"}, ["RELAY_TOKEN"], 600)
-    run = runner(ctx, host, bg, clock, resume_env=env)
-    # With no value for a secret, the session does not resume, and the
-    # held resumes do not count toward the limit.
-    for _ in range(MAX_RESUMES + 2):
-        run.tick()
-        clock.t += 60
-    assert bg.calls == []
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1
-    assert "no value for RELAY_TOKEN in the token cache" in errors[0].getMessage()
-    token_cache.items["env:RELAY_TOKEN"] = "s3cret"
-    run.tick()
-    assert bg.envs == [{"RELAY_URL": "wss://relay.test", "RELAY_TOKEN": "s3cret"}]
-    # The launcher keeps the value after its cache entry goes.
-    token_cache.items.clear()
-    clock.t += 60
-    run.tick()
-    assert bg.envs[-1]["RELAY_TOKEN"] == "s3cret"
-
-
 def test_resumes_wait_while_the_host_runs_max_sessions(
     ctx: Context,
     fake: FakeClaude,
@@ -1243,19 +1207,14 @@ def test_run_bg_adds_the_environment(tmp_path: Path) -> None:
     ("config", "names"),
     [
         ("", None),
-        ("launcher_secret_env = []\n[launcher_env]\n", None),
-        ('[launcher_env]\nRELAY_URL = "wss://relay.test"\n', "launcher_env is"),
-        ('launcher_secret_env = ["RELAY_TOKEN"]\n', "launcher_secret_env is"),
+        ('launcher_secret_env = ["RELAY_TOKEN"]\n', "launcher_secret_env"),
         (
-            (
-                'launcher_secret_env = ["RELAY_TOKEN"]\n'
-                '[launcher_env]\nRELAY_URL = "wss://relay.test"\n'
-            ),
-            "launcher_env and launcher_secret_env are",
+            "launcher_secret_env = 1\n[launcher_env]\nRELAY_TOKEN = 2\n",
+            "launcher_env and launcher_secret_env",
         ),
     ],
 )
-def test_launcher_warns_at_start_about_deprecated_env(
+def test_launcher_warns_at_start_about_removed_options(
     monkeypatch: pytest.MonkeyPatch,
     server: Server,
     tmp_path: Path,
@@ -1263,45 +1222,21 @@ def test_launcher_warns_at_start_about_deprecated_env(
     config: str,
     names: str | None,
 ) -> None:
+    # A removed option must not stop the load of config.toml, even with a
+    # value of the wrong type, because a hook must not fail.
     code, _, ran = start_launcher(monkeypatch, server, tmp_path, ["--stay"], config)
     assert (code, ran) == (0, ["workstation"])
-    warnings = [
-        r.getMessage() for r in caplog.records if "deprecated" in r.getMessage()
-    ]
+    warnings = [r.getMessage() for r in caplog.records if "removed" in r.getMessage()]
     if names is None:
         assert warnings == []
     else:
         assert len(warnings) == 1
-        assert warnings[0].startswith(f"launcher: {names} deprecated.")
-        assert "configuration of the plugin" in warnings[0]
-        assert "A later release removes" in warnings[0]
-
-
-def test_launcher_env_config(tmp_path: Path) -> None:
-    toml = tmp_path / "config.toml"
-    toml.write_text(
-        'launcher_secret_env = ["RELAY_TOKEN", "RELAY_TOKEN"]\n'
-        '[launcher_env]\nRELAY_URL = "wss://relay.test"\n'
-    )
-    cfg = load({}, toml)
-    assert cfg.launcher_env == {"RELAY_URL": "wss://relay.test"}
-    assert cfg.launcher_secret_env == ["RELAY_TOKEN"]
-    assert load({}, tmp_path / "none.toml").launcher_env == {}
-    for bad, match in (
-        ('launcher_env = ["A"]\n', "table"),
-        ("[launcher_env]\nA = 1\n", "must be a string"),
-        ('[launcher_env]\n"1A" = "x"\n', "not an environment variable name"),
-        ('[launcher_env]\nHYPERSPACE_TOKEN = "x"\n', "cannot contain"),
-        ('launcher_secret_env = ["CLAUDE_JOB_DIR"]\n', "cannot contain"),
-        ('launcher_secret_env = "A"\n', "list of names"),
-        (
-            'launcher_secret_env = ["A"]\n[launcher_env]\nA = "x"\n',
-            "in launcher_env and",
-        ),
-    ):
-        toml.write_text(bad)
-        with pytest.raises(ConfigError, match=match):
-            load({}, toml)
+        pronoun = "them" if " and " in names else "it"
+        assert warnings[0] == (
+            f"launcher: config.toml has {names}, which a release removed; the "
+            f"launcher ignores {pronoun}. A plugin that needs a value must read it "
+            "from its own configuration"
+        )
 
 
 def job_bg(
@@ -2475,7 +2410,6 @@ def test_launch_pass(
         None,
         workspace=str(workspace),
         run_claude=start,
-        resume_env=dict,
         launches=mode != "off",
     )
     run.launch_pending()
@@ -2605,7 +2539,6 @@ def test_launch_cli_local(
             return RunResult(0, "backgrounded · localjob")
 
         run.run_claude = bg
-        run.resume_env = dict
         original(run, launch_id)
 
     monkeypatch.setattr(Launcher, "launch_pending", start)
@@ -2644,8 +2577,8 @@ def test_launch_claim_race(
         calls.append(argv)
         return RunResult(0, "no job id")
 
-    first = Launcher(ctx, host, FAKE, 60, None, run_claude=start, resume_env=dict)
-    second = Launcher(ctx, host, FAKE, 60, None, run_claude=start, resume_env=dict)
+    first = Launcher(ctx, host, FAKE, 60, None, run_claude=start)
+    second = Launcher(ctx, host, FAKE, 60, None, run_claude=start)
     first.launch_pending()
     second.launch_pending()
     assert len(calls) == 1
@@ -2679,22 +2612,6 @@ def test_launch_defaults() -> None:
     ) == [FAKE, "--model=request", "--effort=high", "--bg", "--", "hi"]
 
 
-def test_launch_env_before_claim(
-    ctx: Context, host: Host, caplog: pytest.LogCaptureFixture
-) -> None:
-    register_host(ctx, "workstation")
-    item = ctx.api.launch(HARNESS, {"host": ctx.host, "prompt": "hi"})
-
-    def env() -> Mapping[str, str]:
-        raise launcher_mod.CredentialError("locked secret")
-
-    run = Launcher(ctx, host, FAKE, 60, None, resume_env=env)
-    run.launch_pending()
-    run.launch_pending()
-    assert ctx.api.get_launch(HARNESS, item["launch"])["state"] == "pending"
-    assert sum("locked secret" in r.getMessage() for r in caplog.records) == 1
-
-
 @pytest.mark.parametrize("outcome", [None, 0])
 def test_launch_timeout_and_cap(
     ctx: Context, host: Host, tmp_path: Path, outcome: int | None
@@ -2711,9 +2628,7 @@ def test_launch_timeout_and_cap(
         calls.append(argv)
         return RunResult(outcome, "")
 
-    run = Launcher(
-        ctx, host, FAKE, 60, None, resume_env=dict, run_claude=bg, max_sessions=0
-    )
+    run = Launcher(ctx, host, FAKE, 60, None, run_claude=bg, max_sessions=0)
     run.launch_pending()
     assert not calls
     run.max_sessions = 1
@@ -2842,7 +2757,7 @@ def test_launch_parent_env(
         )
         return RunResult(None, "")
 
-    Launcher(ctx, host, FAKE, 60, None, resume_env=dict, run_claude=bg).launch_pending()
+    Launcher(ctx, host, FAKE, 60, None, run_claude=bg).launch_pending()
 
 
 def test_launch_workspace_realpath(tmp_path: Path) -> None:
@@ -2910,7 +2825,7 @@ def test_launch_cli_local_error(
             run.max_sessions = 0
             original(run, launch_id)
             return
-        raise launcher_mod.CredentialError("secret locked")
+        raise RuntimeError("local pass failed")
 
     monkeypatch.setattr(Launcher, "launch_pending", broken)
     monkeypatch.setenv("HYPERSPACE_HOST", ctx.host)
@@ -2938,7 +2853,7 @@ def test_local_launch_does_not_list(
     ) -> RunResult:
         return RunResult(None, "")
 
-    run = Launcher(ctx, host, FAKE, 60, None, resume_env=dict, run_claude=bg)
+    run = Launcher(ctx, host, FAKE, 60, None, run_claude=bg)
     run.launch_pending(item["launch"])
     assert ctx.api.get_launch(HARNESS, item["launch"])["state"] == "claimed"
 

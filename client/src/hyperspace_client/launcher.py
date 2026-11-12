@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,11 +29,9 @@ from typing import Any, cast
 
 import httpx
 
-from hyperspace_client import credentials
 from hyperspace_client.adapters.claude_code import ClaudeCode, Job, without_option
 from hyperspace_client.api import ApiError, NotFound
 from hyperspace_client.backfill import RunResult, child_env
-from hyperspace_client.credentials import CredentialError
 from hyperspace_client.state import State
 from hyperspace_client.status import clean_note, end_continued, printable
 from hyperspace_client.sync import Context, register_host
@@ -492,38 +490,6 @@ def connect(
         delay = min(delay * 2, START_RETRY_MAX)
 
 
-@dataclass
-class ResumeEnv:
-    """The environment that the launcher adds to its resumes: `values`, and
-    the `secrets` from the token cache (see "The environment of a resume" in
-    the spec)."""
-
-    values: Mapping[str, str] = field(default_factory=dict[str, str])
-    secrets: Sequence[str] = ()
-    ttl: int = 86400
-    # The last value read of each secret, so that a value stays after its
-    # cache entry goes.
-    _last: dict[str, str] = field(default_factory=dict[str, str])
-
-    def refresh(self) -> None:
-        """Read the secrets from the cache. Each read keeps the cache alive."""
-        for name in self.secrets:
-            value = credentials.cached_secret(name, self.ttl)
-            if value:
-                self._last[name] = value
-
-    def __call__(self) -> dict[str, str]:
-        """The environment. Raise `CredentialError` if a secret has no value."""
-        self.refresh()
-        missing = [name for name in self.secrets if name not in self._last]
-        if missing:
-            raise CredentialError(
-                f"no value for {', '.join(missing)} in the token cache: run "
-                "`hyperspace secret load`, or `hyperspace secret set <name>`"
-            )
-        return {**self.values, **self._last}
-
-
 def _copied_key(harness: str, sid: str) -> str:
     """The local state key of a session that a resume copied."""
     return f"resume_copied:{harness}:{sid}"
@@ -639,7 +605,6 @@ class Launcher:
     # The workspace for a held session that has no workspace of its own.
     workspace: str = ""
     run_claude: BgRunner = run_bg
-    resume_env: Callable[[], Mapping[str, str]] = field(default_factory=ResumeEnv)
     # Starts a CLI command in the background, for a trailing checkpoint.
     start: Detach = detach
     sleep: Callable[[float], None] = time.sleep
@@ -667,8 +632,6 @@ class Launcher:
     # The sessions with an unreadable job state, logged once until it goes
     # away.
     _unreadable_logged: set[str] = field(default_factory=set[str])
-    # The last error of `resume_env`, logged once until it changes.
-    _env_error: str | None = None
     # True while the cap on processes holds resumes, so that it logs once.
     _capped: bool = False
     _launch_capped: bool = False
@@ -826,7 +789,6 @@ class Launcher:
         )
         if not candidates or running < self.max_sessions:
             self._launch_capped = False
-        base_env: dict[str, str] | None = None
         for lid in candidates:
             if running >= self.max_sessions:
                 if not self._launch_capped:
@@ -834,15 +796,6 @@ class Launcher:
                 self._launch_capped = True
                 break
             self._launch_capped = False
-            if base_env is None:
-                try:
-                    base_env = dict(self.resume_env())
-                except CredentialError as exc:
-                    if self._env_error != str(exc):
-                        log.error("launcher: launch environment: %s", exc)
-                    self._env_error = str(exc)
-                    return
-                self._env_error = None
             try:
                 item = self.ctx.api.claim_launch(self.adapter.harness, lid)
             except ApiError as exc:
@@ -862,9 +815,6 @@ class Launcher:
                     self.adapter.harness, lid, "launch prompt is empty"
                 )
                 continue
-            env = dict(base_env)
-            env.pop("HYPERSPACE_LAUNCH", None)
-            env.pop("HYPERSPACE_LAUNCH_PARENT", None)
             if (
                 any(arg.split("=", 1)[0] == "--settings" for arg in self.claude_args)
                 and not self._marker_off_logged
@@ -878,7 +828,7 @@ class Launcher:
                     launch_argv(self.claude, self.claude_args, item),
                     workspace,
                     RESUME_TIMEOUT,
-                    env,
+                    {},
                 )
             except OSError as exc:
                 self.ctx.api.fail_launch(
@@ -935,15 +885,6 @@ class Launcher:
                 )
             return False
         self._limited.discard(sid)
-        try:
-            env = self.resume_env()
-        except CredentialError as exc:
-            # Without its relay, a session does not get its messages.
-            if str(exc) != self._env_error:
-                self._env_error = str(exc)
-                log.error("launcher: no resumes: %s", exc)
-            return False
-        self._env_error = None
         harness = self.adapter.harness
         copy = self.ctx.state.get(_copied_key(harness, sid))
         if copy is not None:
@@ -1022,7 +963,7 @@ class Launcher:
             options, kept = prepared
             argv = [self.claude, *options, "--bg", "--resume", sid, prompt]
             before = self.adapter.job_names()
-            result = self.run_claude(argv, workspace, RESUME_TIMEOUT, env)
+            result = self.run_claude(argv, workspace, RESUME_TIMEOUT, {})
         if result.returncode != 0:
             first = next(iter(printable(result.output).splitlines()), "")
             log.warning("%s: resume failed (%s): %s", sid, result.returncode, first)

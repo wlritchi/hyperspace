@@ -9,9 +9,6 @@ keyring may be read:
   process reads the keyring and fills the cache; others wait for it. After a
   failed or dismissed read, no hook reads the keyring for `RETRY_AFTER`.
 - `interactive`: commands that the user runs. Read the keyring if needed.
-
-The keyring also holds the launcher's secrets: values for the environment of
-the sessions that it resumes (see "The environment of a resume" in the spec).
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlsplit
@@ -60,11 +57,6 @@ def account(url: str) -> str:
 
 def _cache_name(url: str) -> str:
     return f"token:{account(url)}"
-
-
-def _secret_name(name: str) -> str:
-    """The keyring user name and the cache name of a secret."""
-    return f"env:{name}"
 
 
 def _backend() -> KeyringBackend:
@@ -153,16 +145,11 @@ def _locked(path: Path, wait: float) -> Iterator[None]:
 
 
 def find(
-    url: str,
-    state_dir: Path,
-    ttl: int,
-    use: KeyringUse,
-    secrets: Sequence[str] = (),
+    url: str, state_dir: Path, ttl: int, use: KeyringUse
 ) -> tuple[str, TokenSource] | None:
     """Return (token, source), or None if the keyring has no token for `url`.
-    A read of the token from the keyring also puts the `secrets` that are not
-    in the cache into it. Raise `NotNow` if `use` does not permit a keyring
-    read now, and `CredentialError` if the keyring fails."""
+    Raise `NotNow` if `use` does not permit a keyring read now, and
+    `CredentialError` if the keyring fails."""
     cache = keycache.CACHE
     name = _cache_name(url)
     token = cache.get(name, ttl)
@@ -195,80 +182,33 @@ def find(
             return None
         cache.put(name, token, ttl)
         marker.unlink(missing_ok=True)
-        missing = [n for n in secrets if not cache.get(_secret_name(n), ttl)]
-        try:
-            load_secrets(missing, ttl)
-        except CredentialError as exc:
-            log.info("the launcher's secrets: %s", exc)
         return token, "keyring"
-
-
-def _store(user: str, value: str, cache_name: str, ttl: int) -> str:
-    backend = _backend()
-    try:
-        backend.set_password(SERVICE, user, value)
-    except Exception as exc:  # noqa: BLE001
-        raise CredentialError(_describe(exc)) from None
-    keycache.CACHE.put(cache_name, value, ttl)
-    return backend.name
-
-
-def _forget(user: str, cache_name: str) -> tuple[bool, bool]:
-    backend = _backend()
-    from keyring.errors import PasswordDeleteError  # see _backend
-
-    try:
-        backend.delete_password(SERVICE, user)
-        in_keyring = True
-    except PasswordDeleteError:
-        in_keyring = False
-    except Exception as exc:  # noqa: BLE001
-        raise CredentialError(_describe(exc)) from None
-    return in_keyring, keycache.CACHE.delete(cache_name)
 
 
 def store(url: str, token: str, state_dir: Path, ttl: int) -> str:
     """Save the token in the keyring and the cache. Return the keyring
     backend's name."""
-    name = _store(account(url), token, _cache_name(url), ttl)
+    backend = _backend()
+    try:
+        backend.set_password(SERVICE, account(url), token)
+    except Exception as exc:  # noqa: BLE001
+        raise CredentialError(_describe(exc)) from None
+    keycache.CACHE.put(_cache_name(url), token, ttl)
     (state_dir / "keyring-tried").unlink(missing_ok=True)
-    return name
+    return backend.name
 
 
 def forget(url: str) -> tuple[bool, bool]:
     """Remove the token from the keyring and the cache. Return whether each
     one had it."""
-    return _forget(account(url), _cache_name(url))
+    backend = _backend()
+    from keyring.errors import PasswordDeleteError  # see _backend
 
-
-def store_secret(name: str, value: str, ttl: int) -> str:
-    """Save a secret in the keyring and the cache. Return the keyring
-    backend's name."""
-    return _store(_secret_name(name), value, _secret_name(name), ttl)
-
-
-def forget_secret(name: str) -> tuple[bool, bool]:
-    """Remove a secret from the keyring and the cache. Return whether each
-    one had it."""
-    return _forget(_secret_name(name), _secret_name(name))
-
-
-def load_secrets(names: Sequence[str], ttl: int) -> list[str]:
-    """Read secrets from the keyring into the cache. Return the names that
-    the keyring does not have."""
-    absent: list[str] = []
-    for name in names:
-        value = _keyring_get(_secret_name(name))
-        if value:
-            keycache.CACHE.put(_secret_name(name), value, ttl)
-        else:
-            absent.append(name)
-    return absent
-
-
-def cached_secret(name: str, ttl: int) -> str | None:
-    """A secret from the cache, or on macOS from an unlocked Keychain. The
-    read never prompts, and it keeps the cache alive."""
-    return keycache.CACHE.get(_secret_name(name), ttl) or _read_unprompted(
-        _secret_name(name)
-    )
+    try:
+        backend.delete_password(SERVICE, account(url))
+        in_keyring = True
+    except PasswordDeleteError:
+        in_keyring = False
+    except Exception as exc:  # noqa: BLE001
+        raise CredentialError(_describe(exc)) from None
+    return in_keyring, keycache.CACHE.delete(_cache_name(url))

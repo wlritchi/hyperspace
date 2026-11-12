@@ -15,9 +15,7 @@ environment.
 | Launcher idle exit |                           | `launcher_idle_exit` |
 | Claude Code binary | `HYPERSPACE_CLAUDE`       | `claude_bin`         |
 | Runner resume args | `HYPERSPACE_LAUNCHER_CLAUDE_ARGS` (JSON) | `launcher_claude_args` |
-| Resume environment |                           | `launcher_env` (deprecated) |
 | Resume process cap | `HYPERSPACE_LAUNCHER_MAX_SESSIONS` | `launcher_max_sessions` |
-| Resume secrets     |                           | `launcher_secret_env` (deprecated) |
 
 With no token in the environment or a file, the token comes from the token
 cache or the system keyring (see `credentials`).
@@ -109,15 +107,14 @@ class Config:
     claude_bin: str = "claude"
     # More Claude Code options for a runner's resumes, for example the model.
     launcher_claude_args: list[str] = field(default_factory=list[str])
-    # More environment for the launcher's resumes: values, and the names of
-    # values in the keyring (see `credentials`).
-    launcher_env: dict[str, str] = field(default_factory=dict[str, str])
-    launcher_secret_env: list[str] = field(default_factory=list[str])
     # False stops this host from claiming launches, also in a runner.
     launches: bool = True
     # No resume while this many Claude Code processes run on the host.
     launcher_max_sessions: int = 10
     state_dir: Path = field(default_factory=state_dir)
+    # Names from `REMOVED_OPTIONS` that config.toml contains. The client
+    # ignores their values.
+    removed_options: list[str] = field(default_factory=list[str])
 
     def require_server(self) -> tuple[str, str]:
         """Return (url, token). Raise `ConfigError` if either is missing."""
@@ -133,7 +130,6 @@ class Config:
                     self.state_dir,
                     self.token_cache_ttl,
                     self.keyring_use,
-                    self.launcher_secret_env,
                 )
             except CredentialError as exc:
                 raise ConfigError(f"no token: {exc}") from None
@@ -154,7 +150,12 @@ class Config:
 # session must not get them, or `hyperspace status` would act on the wrong
 # session.
 SESSION_VARS = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_JOB_DIR")
-_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+# Names that a config.toml for an older client can contain. A hook must not
+# fail because of them, so `load` ignores their values and records the names
+# in `Config.removed_options`. The launcher writes a warning at its start (see
+# "The environment of a resume" in the spec).
+REMOVED_OPTIONS = ("launcher_env", "launcher_secret_env")
 
 # The launcher sets these itself. Another value of one of them would resume
 # the wrong session, fork a copy, or start a headless turn.
@@ -221,51 +222,6 @@ def check_claude_args(value: object) -> list[str]:
             "option that takes no list of values after it"
         )
     return args
-
-
-def check_env_name(name: object, where: str) -> str:
-    """Return `name` if the launcher can set it in the environment of a
-    resume. It cannot set a variable of the client or of the session."""
-    if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
-        raise ConfigError(f"{where}: {name!r} is not an environment variable name")
-    if name.startswith("HYPERSPACE_") or name in SESSION_VARS:
-        raise ConfigError(f"{where} cannot contain {name}")
-    return name
-
-
-def check_launcher_env(
-    values: object, secrets: object
-) -> tuple[dict[str, str], list[str]]:
-    """The launcher's environment for its resumes: a table of names and
-    values, and a list of names of secrets. A name is in one of them only."""
-    if not isinstance(values, dict):
-        raise ConfigError("launcher_env must be a table of names and values")
-    env: dict[str, str] = {}
-    for name, value in cast(dict[object, object], values).items():
-        if not isinstance(value, str) or "\0" in value:
-            raise ConfigError(f"launcher_env: the value of {name} must be a string")
-        env[check_env_name(name, "launcher_env")] = value
-    if not isinstance(secrets, list):
-        raise ConfigError("launcher_secret_env must be a list of names")
-    names = [
-        check_env_name(n, "launcher_secret_env") for n in cast(list[object], secrets)
-    ]
-    both = sorted(set(names) & set(env))
-    if both:
-        raise ConfigError(f"{both[0]} is in launcher_env and in launcher_secret_env")
-    return env, list(dict.fromkeys(names))
-
-
-def env_deprecation(names: list[str]) -> str:
-    """The warning for the deprecated options in `names` (see "The
-    environment of a resume" in the spec)."""
-    subject = " and ".join(names) + (" are" if len(names) > 1 else " is")
-    return (
-        f"{subject} deprecated. A resumed session gets the environment of the "
-        "Claude Code daemon, not of the launcher, so the value does not always "
-        "get to the session. Put the value in the configuration of the plugin "
-        f"that uses it. A later release removes {'them' if len(names) > 1 else 'it'}."
-    )
 
 
 def check_token(token: str, where: str) -> str:
@@ -371,9 +327,7 @@ def load(env: dict[str, str] | None = None, path: Path | None = None) -> Config:
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
         raise ConfigError("launcher_max_sessions must be a whole number >= 1")
     cfg.launcher_max_sessions = cap
-    cfg.launcher_env, cfg.launcher_secret_env = check_launcher_env(
-        data.get("launcher_env", {}), data.get("launcher_secret_env", [])
-    )
+    cfg.removed_options = [n for n in REMOVED_OPTIONS if n in data]
     ttl = data.get("token_cache_ttl", 86400)
     if not isinstance(ttl, int) or isinstance(ttl, bool) or ttl < 60:
         raise ConfigError("token_cache_ttl must be a whole number of seconds >= 60")

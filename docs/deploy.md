@@ -314,39 +314,18 @@ session's transcript, and `--model` replaces it.
 If the relay needs values, for example its server URL and its token, put them
 in the configuration of the relay plugin.
 
-`launcher_env` and `launcher_secret_env` are deprecated, and a later release
-removes them. They give values to the environment of each `claude --bg` that
-the launcher runs, but a background job does not reliably get that
-environment. In Claude Code 2.1.301, the job runs in a process that the Claude
-Code daemon starts, with the environment of the daemon. The daemon gets the
-environment of the process that started it, which is frequently not the
-launcher. Thus a value gets to the session only if the same `claude --bg`
-started the daemon, and a changed value (for example a new token) does not get
-to the sessions while the daemon runs. The launcher logs a warning at its
-start if one of these options has a value, and `hyperspace secret set` writes
-a warning.
-
-Until then, the options continue to work. Give the values in `config.toml`,
-and put a secret in the keyring, not in the file:
-
-```toml
-launcher_secret_env = ["RELAY_TOKEN"]
-
-[launcher_env]
-RELAY_URL = "wss://relay.example.com"
-```
+If `config.toml` has `launcher_env` or `launcher_secret_env` (settings of
+clients before 0.11.0), delete them. The launcher ignores their values and
+logs a warning at its start (see "The environment of a resume" in the
+[spec](specs/2026-10-12-hyperspace.md)). A value that an older client stored
+with `hyperspace secret set` stays in the system keyring, with the service
+`hyperspace` and the user name `env:<NAME>`. To remove it, use one of these
+commands:
 
 ```sh
-hyperspace secret set RELAY_TOKEN
+secret-tool clear service hyperspace username env:RELAY_TOKEN  # Secret Service
+uvx keyring del hyperspace env:RELAY_TOKEN
 ```
-
-The launcher reads secrets only from the token cache, because a service cannot
-answer a passphrase prompt. After a reboot, a command that reads the token
-from the keyring also reads the secrets, for example the first `hyperspace`
-command, or the sync at the first session start. While a secret has no value,
-the launcher does not resume a session and logs an error. If this happens, or
-if the token comes from a file, run `hyperspace secret load`. See "The
-environment of a resume" in the [spec](specs/2026-10-12-hyperspace.md).
 
 The launcher does not resume while `launcher_max_sessions` (default 10) Claude
 Code processes run on the host, and your own sessions count. Set a higher
