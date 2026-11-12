@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import httpx
 
@@ -100,6 +100,8 @@ RESTORE_RETRY_MAX = 3600.0
 # to at most START_RETRY_MAX.
 START_RETRY = 5.0
 START_RETRY_MAX = 300.0
+# The failure reason of a launch from another host, with `launches = "own"`.
+FOREIGN_LAUNCH = "the host takes only its own launches"
 # httpcore's ProxyError for a refused HTTP CONNECT starts with the status, for
 # example "407 Proxy Authentication Required".
 _CONNECT_STATUS = re.compile(r"(\d{3})\b")
@@ -596,7 +598,7 @@ class Launcher:
     # Runner mode: restore and resume the sessions whose lease the host holds.
     runner: bool = False
     stay: bool = False
-    launches: bool = True
+    launches: bool | Literal["own"] = True
     # More Claude Code options for each resume, from the configuration.
     claude_args: list[str] = field(default_factory=list[str])
     # No resume while this many Claude Code processes run on the host, so
@@ -769,6 +771,24 @@ class Launcher:
                 waiting,
             )
         self._capped = bool(waiting)
+
+    def reject_foreign_launches(self) -> None:
+        """Fail pending launches that another host made."""
+        for item in self.ctx.api.pending_launches(self.adapter.harness):
+            if item["caller"] == self.ctx.host:
+                continue
+            lid = item["launch"]
+            try:
+                self.ctx.api.claim_launch(self.adapter.harness, lid)
+                self.ctx.api.fail_launch(self.adapter.harness, lid, FOREIGN_LAUNCH)
+            except ApiError as exc:
+                if exc.status != 409:
+                    log.warning("launcher: launch %s: %s", lid, exc)
+                continue
+            except httpx.HTTPError as exc:
+                log.warning("launcher: launch %s: %s", lid, exc)
+                continue
+            log.info("launcher: rejected foreign launch %s", lid)
 
     def launch_pending(self, launch_id: str | None = None) -> None:
         """Claim pending launches once, or only the caller's local request."""
@@ -1145,7 +1165,8 @@ class Launcher:
 
     def tick(self) -> list[str]:
         """Send a heartbeat and sweep stopped jobs. Restore in runner mode.
-        Resume as needed in runner mode or with --stay. Return live sessions."""
+        Resume as needed, and act on launches, in runner mode or with --stay.
+        Return live sessions."""
         live = self.adapter.live_sessions(
             self.ctx.state.continued_from(self.adapter.harness)
         )
@@ -1155,11 +1176,10 @@ class Launcher:
             # Send the heartbeat before the resumes, so that a stale `live`
             # from before a restart clears.
             wakes = (self.runner or self.stay) and self.ctx.api.has_capability(CAP_WAKE)
-            launches = (
-                (self.runner or self.stay)
-                and self.launches
-                and self.ctx.api.has_capability(CAP_LAUNCH)
+            acts = (self.runner or self.stay) and self.ctx.api.has_capability(
+                CAP_LAUNCH
             )
+            launches = acts and self.launches is True
             send_heartbeat(
                 self.ctx,
                 self.adapter,
@@ -1175,6 +1195,8 @@ class Launcher:
                 self.resume_held(live)
             if launches:
                 self.launch_pending()
+            elif acts and self.launches == "own":
+                self.reject_foreign_launches()
         except (ApiError, httpx.HTTPError, OSError) as exc:
             # The next tick tries again.
             log.warning("launcher: %s: %s", type(exc).__name__, exc)

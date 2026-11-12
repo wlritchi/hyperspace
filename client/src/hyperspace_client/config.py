@@ -31,7 +31,7 @@ import socket
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
 from hyperspace_client import credentials
@@ -107,8 +107,9 @@ class Config:
     claude_bin: str = "claude"
     # More Claude Code options for a runner's resumes, for example the model.
     launcher_claude_args: list[str] = field(default_factory=list[str])
-    # False stops this host from claiming launches, also in a runner.
-    launches: bool = True
+    # True starts the launches of all hosts of the account, "own" starts only
+    # the launches of this host, and False starts no launches.
+    launches: bool | Literal["own"] = True
     # No resume while this many Claude Code processes run on the host.
     launcher_max_sessions: int = 10
     state_dir: Path = field(default_factory=state_dir)
@@ -297,8 +298,8 @@ def load(env: dict[str, str] | None = None, path: Path | None = None) -> Config:
             f"{MIN_HEARTBEAT_INTERVAL} to {MAX_HEARTBEAT_INTERVAL}"
         )
     launches = data.get("launches", True)
-    if not isinstance(launches, bool):
-        raise ConfigError("launches must be a boolean")
+    if not isinstance(launches, bool) and launches != "own":
+        raise ConfigError('launches must be true, false or "own"')
     cfg.launches = launches
     cfg.heartbeat_interval = beat
     idle = data.get("launcher_idle_exit", 600.0)

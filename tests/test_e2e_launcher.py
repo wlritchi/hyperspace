@@ -37,6 +37,7 @@ from hyperspace_client.cli import (
 from hyperspace_client.config import Config, ConfigError, check_claude_args, load
 from hyperspace_client.hooks import handle
 from hyperspace_client.launcher import (
+    FOREIGN_LAUNCH,
     IDLE_STOP,
     MAX_RESUMES,
     RECHECK,
@@ -128,6 +129,7 @@ def server(tmp_path: Path) -> Iterator[Server]:
             "laptop": ("laptop", {"append", "read", "grant", "launch"}, "all"),
             "agent": ("agent-1", {"append", "read", "grant"}, "granted"),
             "sender": ("sender", {"wake"}, "own"),
+            "other": ("other", {"launch"}, "own"),
         },
     )
     yield s
@@ -2501,7 +2503,9 @@ def test_launch_hook_sync_links(ctx: Context, fake: FakeClaude, host: Host) -> N
     )
 
 
+@pytest.mark.parametrize("policy", ["true", '"own"'])
 def test_launch_cli_local(
+    policy: str,
     server: Server,
     fake: FakeClaude,
     tmp_path: Path,
@@ -2509,6 +2513,7 @@ def test_launch_cli_local(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
 
+    (tmp_path / "none.toml").write_text(f"launches = {policy}\n")
     values = {
         "XDG_STATE_HOME": str(tmp_path / "xdg"),
         "HYPERSPACE_CONFIG": str(tmp_path / "none.toml"),
@@ -2546,6 +2551,8 @@ def test_launch_cli_local(
     ctx = context(load(), local)
     register_host(ctx, "workstation")
     other = ctx.api.launch(HARNESS, {"host": ctx.host, "prompt": "not this command"})
+    with server.api("other") as remote:
+        foreign = remote.launch(HARNESS, {"host": ctx.host, "prompt": "foreign"})
     ctx.api.close()
     local.close()
     assert main(["launch", "--wait", "--json", "hello"]) == 0
@@ -2553,6 +2560,7 @@ def test_launch_cli_local(
     assert result["session"] == sid
     api = server.api("laptop")
     assert api.get_launch(HARNESS, other["launch"])["state"] == "pending"
+    assert api.get_launch(HARNESS, foreign["launch"])["state"] == "pending"
     queued = api.launch(HARNESS, {"host": "laptop", "prompt": "later"})
     api.close()
     assert main(["launch", "--cancel", queued["launch"], "--json"]) == 0
@@ -2593,6 +2601,86 @@ def test_launch_heartbeat_off(
     run = Launcher(ctx, host, FAKE, 60, None, stay=True, launches=False)
     run.tick()
     assert requests and "launches" not in requests[0]
+
+
+@pytest.mark.parametrize("value", ['"own"', "true", "false", '"yes"', "1", '"all"'])
+def test_launches_config(tmp_path: Path, value: str) -> None:
+    path = tmp_path / "config.toml"
+    assert load({}, path).launches is True
+    path.write_text(f"launches = {value}\n")
+    if value in ('"own"', "true", "false"):
+        expected = {'"own"': "own", "true": True, "false": False}[value]
+        assert load({}, path).launches == expected
+    else:
+        with pytest.raises(ConfigError, match='launches must be true, false or "own"'):
+            load({}, path)
+
+
+@pytest.mark.parametrize("runner_mode", [False, True])
+@pytest.mark.parametrize("capped", [False, True])
+def test_launch_own_tick(
+    ctx: Context,
+    host: Host,
+    server: Server,
+    runner_mode: bool,
+    capped: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    register_host(ctx, "workstation")
+    bg = Bg()
+    run = Launcher(
+        ctx,
+        host,
+        FAKE,
+        60,
+        None,
+        runner=runner_mode,
+        stay=not runner_mode,
+        launches="own",
+        max_sessions=1,
+        run_claude=bg,
+    )
+    if capped:
+        host.live = [str(uuid.uuid4())]
+    run.tick()
+    own = ctx.api.launch(HARNESS, {"host": ctx.host, "prompt": "local"})
+    assert own["verdict"] == "queued"
+    with server.api("other") as other:
+        foreign = other.launch(HARNESS, {"host": ctx.host, "prompt": "foreign"})
+    assert foreign["verdict"] == "queued"
+    with caplog.at_level(logging.INFO):
+        run.tick()
+    result = ctx.api.get_launch(HARNESS, foreign["launch"])
+    assert result["state"] == "failed"
+    assert result["reason"] == FOREIGN_LAUNCH
+    assert ctx.api.get_launch(HARNESS, own["launch"])["state"] == "pending"
+    assert not bg.calls
+    assert (
+        sum("rejected foreign launch" in record.message for record in caplog.records)
+        == 1
+    )
+
+
+def test_launch_own_claim_race(
+    ctx: Context,
+    host: Host,
+    server: Server,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Another claimer takes the first launch after the list: the pass skips
+    # it and fails the next one.
+    register_host(ctx, "workstation")
+    with server.api("other") as other:
+        item = other.launch(HARNESS, {"host": ctx.host, "prompt": "foreign"})
+        later = other.launch(HARNESS, {"host": ctx.host, "prompt": "foreign 2"})
+    pending = ctx.api.pending_launches(HARNESS)
+    ctx.api.claim_launch(HARNESS, item["launch"])
+    monkeypatch.setattr(ctx.api, "pending_launches", lambda harness: pending)
+    run = Launcher(ctx, host, FAKE, 60, None, stay=True, launches="own")
+    run.reject_foreign_launches()
+    assert ctx.api.get_launch(HARNESS, item["launch"])["state"] == "claimed"
+    result = ctx.api.get_launch(HARNESS, later["launch"])
+    assert (result["state"], result.get("reason")) == ("failed", FOREIGN_LAUNCH)
 
 
 def test_launch_defaults() -> None:
