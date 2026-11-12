@@ -6,6 +6,7 @@ the real ~/.claude are never used."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -1463,12 +1464,33 @@ def test_a_refused_rm_blocks_the_resume(
     assert job_ids(fake) == {sid[:8]: sid}
     assert len(list(host.find_transcripts(sid)[0].parent.glob("*.jsonl"))) == 1
     assert f"claude rm {sid[:8]}: error: job has unpushed commits" in caplog.text
-    # The limit of resumes also applies to the failed removals.
-    for _ in range(MAX_RESUMES + 2):
-        run.tick()
-        clock.t += 60
-    assert len(calls) == MAX_RESUMES
-    assert calls[0] == ["claude", "rm", sid[:8]]
+    # Failed removals have their own limit, not the process start limit.
+    for _index in range(6):
+        deadline, wait, _ = run._rm_backoff[sid]  # pyright: ignore[reportPrivateUsage]
+        clock.t = deadline - 0.01
+        before = len(calls)
+        assert not run.resume(sid, RESUME_WORKING)
+        assert len(calls) == before
+        clock.t = deadline
+        assert not run.resume(sid, RESUME_WORKING)
+        assert run._rm_backoff[sid][1] == min(wait * 2, 900)  # pyright: ignore[reportPrivateUsage]
+    assert not run._resumes[sid]  # pyright: ignore[reportPrivateUsage]
+    assert "resumed 5 times" not in caplog.text
+    assert caplog.text.count("not resumed: claude rm") == 1
+    clock.t = run._rm_backoff[sid][0]  # pyright: ignore[reportPrivateUsage]
+    run.run_rm = lambda argv: (1, "a different refusal")
+    assert not run.resume(sid, RESUME_WORKING)
+    assert caplog.text.count("not resumed: claude rm") == 2
+    clock.t += 901
+    assert not run.resume(sid, RESUME_WORKING)
+    assert caplog.text.count("not resumed: claude rm") == 3
+    assert run._rm_backoff[sid][1] == run.interval  # pyright: ignore[reportPrivateUsage]
+    run.run_rm = counted
+    monkeypatch.setenv("FAKE_CLAUDE_RM", "ok")
+    clock.t = run._rm_backoff[sid][0]  # pyright: ignore[reportPrivateUsage]
+    assert run.resume(sid, RESUME_WORKING)
+    assert sid not in run._rm_backoff  # pyright: ignore[reportPrivateUsage]
+    assert len(run._resumes[sid]) == 1  # pyright: ignore[reportPrivateUsage]
 
 
 def test_no_resume_if_the_transcript_goes_with_the_job(
@@ -3063,3 +3085,246 @@ def test_fake_launch_settings_marker(
     env = json.loads((tmp_path / "jobs" / sid[:8] / "environment.json").read_text())
     env["CLAUDE_JOB_DIR"] = str(tmp_path / "jobs" / sid[:8])
     assert ClaudeCode.launch_marker("startup", env, sid) == ("l_right", "parent")
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "none",
+        "socket",
+        "roster",
+        "registry",
+        "running",
+        "bad-roster",
+        "bad-state",
+        "wrong-id",
+    ],
+)
+def test_unstick_abandoned_job(
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    guard: str,
+) -> None:
+    sid = str(uuid.uuid4())
+    path = job(
+        fake,
+        sid[:8],
+        sid,
+        state="blocked",
+        tempo="idle",
+        inFlight={},
+        needs="input",
+        block={},
+        extra="kept",
+    )
+    path.chmod(0o640)
+    control = tmp_path / "control.sock"
+    monkeypatch.setattr(host, "control_socket", lambda: control)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        if guard == "socket":
+            listener.bind(str(control))
+            listener.listen()
+        if guard in ("roster", "bad-roster"):
+            roster = fake.root / "daemon" / "roster.json"
+            roster.parent.mkdir(parents=True)
+            roster.write_text(
+                json.dumps({"workers": {sid[:8]: {"pid": os.getpid()}}})
+                if guard == "roster"
+                else "invalid"
+            )
+        if guard == "registry":
+            monkeypatch.setattr(host, "live_processes", lambda: [[sid]])
+        if guard == "running":
+            host.live.append(sid)
+        if guard == "bad-state":
+            path.write_text("invalid")
+        if guard == "wrong-id":
+            path.write_text(json.dumps({"sessionId": str(uuid.uuid4())}))
+        old = path.read_bytes()
+        # Keep the original job identity even when the file changes.
+        original = claude_code_mod.Job(sid[:8], 0, sid, (sid,))
+        assert host.unstick_job(original) is (guard == "none")
+        if guard != "none":
+            assert path.read_bytes() == old
+        else:
+            record = json.loads(path.read_text())
+            assert record["state"] == record["detail"] == "stopped"
+            assert record["tempo"] == "idle"
+            assert record["extra"] == "kept"
+            assert record["updatedAt"] == record["firstTerminalAt"]
+            assert record["updatedAt"].endswith("Z")
+            assert not {"inFlight", "needs", "block"} & record.keys()
+            assert path.stat().st_mode & 0o777 == 0o640
+    finally:
+        listener.close()
+
+
+@pytest.mark.parametrize("sweep", [False, True])
+def test_failed_removal_unsticks_and_retries(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sweep: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="hyperspace")
+    sid = held_session(ctx, fake, tmp_path / "ws")
+    set_status(ctx, sid, "done" if sweep else "working")
+    path = job(fake, sid[:8], sid, state="blocked", tempo="idle")
+    monkeypatch.setattr(host, "control_socket", lambda: tmp_path / "missing.sock")
+    run = runner(ctx, host, Bg(), Clock())
+    fake_jobs(fake, monkeypatch, run)
+    original = run.run_rm
+    calls = 0
+
+    def rm(argv: list[str]) -> tuple[int, str]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 1, "background service may be restarting"
+        assert json.loads(path.read_text())["state"] == "stopped"
+        return original(argv)
+
+    if sweep:
+        close_job(
+            ctx, host, next(j for j in host.jobs() if j.short == sid[:8]), "claude", rm
+        )
+    else:
+        run.run_rm = rm
+        assert run.resume(sid, RESUME_WORKING)
+    assert calls == 2
+    assert "marked abandoned job" in caplog.text
+
+
+def test_control_socket_uses_lexical_absolute_config_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.delenv("TERMUX_VERSION", raising=False)
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    digest = hashlib.sha256(str(link).encode()).hexdigest()[:8]
+    assert ClaudeCode(link).control_socket() == Path(
+        f"/tmp/cc-daemon-{os.getuid()}/{digest}/control.sock"
+    )
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "stale-socket",
+        "socket-error",
+        "dead-roster",
+        "job-registry",
+        "foreign-job",
+        "foreign-prefix",
+        "foreign-session",
+        "bad-registry",
+        "final",
+        "ambiguous",
+    ],
+)
+def test_unstick_additional_guards(
+    fake: FakeClaude,
+    host: Host,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    guard: str,
+) -> None:
+    caplog.set_level(logging.INFO, logger="hyperspace")
+    sid = str(uuid.uuid4())
+    path = job(fake, sid[:8], sid, state="blocked", tempo="idle")
+    control = tmp_path / "control.sock"
+    monkeypatch.setattr(host, "control_socket", lambda: control)
+    if guard == "stale-socket":
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(str(control))
+        sock.close()
+    if guard == "socket-error":
+        monkeypatch.setattr(host, "control_socket", lambda: Path("/" + "x" * 200))
+    if guard == "dead-roster":
+        roster = fake.root / "daemon" / "roster.json"
+        roster.parent.mkdir(parents=True)
+        roster.write_text(json.dumps({"workers": {sid[:8]: {"pid": 99999999}}}))
+    if guard in (
+        "job-registry",
+        "foreign-job",
+        "foreign-prefix",
+        "foreign-session",
+        "bad-registry",
+    ):
+        registry = fake.root / "sessions" / "entry.json"
+        registry.parent.mkdir(parents=True)
+        entry: dict[str, Any] = {"jobId": sid[:8], "pid": os.getpid()}
+        if guard.startswith("foreign"):
+            entry.update(pidDomain="other-domain", pid=99999999)
+        if guard == "foreign-prefix":
+            entry.pop("jobId")
+            entry["sessionId"] = sid[:8] + "-other"
+        if guard == "foreign-session":
+            entry.update(sessionId=sid, kind="bg")
+        registry.write_text("invalid" if guard == "bad-registry" else json.dumps(entry))
+    if guard == "final":
+        path.write_text(
+            json.dumps({"sessionId": sid, "state": "done", "tempo": "idle"})
+        )
+    candidates = () if guard == "ambiguous" else (sid,)
+    original = claude_code_mod.Job(sid[:8], 0, sid, candidates)
+    before = path.read_bytes()
+    succeeds = guard in ("stale-socket", "dead-roster")
+    assert host.unstick_job(original) is succeeds
+    if not succeeds:
+        assert path.read_bytes() == before
+        assert not host.unstick_job(original)
+        assert caplog.text.count("not marked stopped") == 1
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_sweep_rechecks_kill_unconfirmed(
+    ctx: Context,
+    fake: FakeClaude,
+    host: Host,
+    legacy: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sid = session(ctx, fake)
+    mark(ctx, sid, "done")
+    job(fake, "aa", sid, state="blocked", tempo="idle")
+    original = next(j for j in host.jobs() if j.short == "aa")
+    reason = "couldn't remove aa — the background service may be restarting"
+    clock = Clock()
+    rm = Rm(ctx, 1, reason)
+    run = launcher(ctx, host, rm, clock)
+    if legacy:
+        record_refusal(ctx.state, host, original, reason)
+    # A live daemon prevents the first attempt from rewriting the job.
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    control = tmp_path / "control.sock"
+    listener.bind(str(control))
+    listener.listen()
+    monkeypatch.setattr(host, "control_socket", lambda: control)
+    try:
+        run.sweep([])
+    finally:
+        listener.close()
+    assert len(rm.calls) == 1
+    clock.t += RECHECK + 1
+    run.sweep([])
+    assert len(rm.calls) == 3
+    current = next(j for j in host.jobs() if j.short == "aa")
+    saved = load_unclosed(ctx.state, host)["aa"]
+    assert saved["recheck"]
+    assert saved["mtime"] == current.mtime
+    assert saved["mtime"] != original.mtime
+    run.sweep([])
+    assert len(rm.calls) == 3

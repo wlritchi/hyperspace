@@ -86,6 +86,8 @@ _START_POLL = 0.5
 # session that stops at once is not resumed in a loop.
 MAX_RESUMES = 5
 RESUME_WINDOW = 3600.0
+# The longest wait after a failed job removal, in seconds.
+RM_BACKOFF_MAX = 15 * 60
 # The default of `max_sessions`.
 MAX_SESSIONS = 10
 # Claude Code 2.1.301 writes this note when `claude --bg --resume` starts a
@@ -353,13 +355,30 @@ def close_job(
             return NotClosed(blocked_reason(again), refused=False)
         # Never with --discard-unpushed or --force-remove-worktree: a refusal
         # keeps the work, and the user decides.
-        code, output = run([claude, "rm", job.short])
+        code, output = remove_job(adapter, job, claude, run)
     if code == 0:
         log.info("%s: closed the job %s", sid, job.short)
         return None
     reason = _reason(code, output)
     log.warning("%s: claude rm %s: %s", sid, job.short, reason)
-    return NotClosed(reason)
+    return NotClosed(reason, refused=not kill_unconfirmed(reason))
+
+
+def kill_unconfirmed(reason: str) -> bool:
+    """True if Claude Code could not confirm that the job stopped."""
+    return "the background service may be restarting" in reason
+
+
+def remove_job(
+    adapter: ClaudeCode, job: Job, claude: str, run: RunRm
+) -> tuple[int, str]:
+    """Retry a failed removal once if the adapter can mark the job stopped."""
+    argv = [claude, "rm", job.short]
+    code, output = run(argv)
+    if code != 0 and adapter.unstick_job(job):
+        log.info("%s: marked abandoned job %s stopped", job.own_id, job.short)
+        return run(argv)
+    return code, output
 
 
 def try_close(
@@ -401,7 +420,10 @@ def record_refusal(
 
 
 def record(state: State, adapter: ClaudeCode, job: Job, kept: NotClosed) -> None:
-    record_refusal(state, adapter, job, kept.reason, recheck=not kept.refused)
+    current = adapter.job(job.short, state.continued_from(adapter.harness))
+    record_refusal(
+        state, adapter, current or job, kept.reason, recheck=not kept.refused
+    )
 
 
 def forget_recheck(state: State, adapter: ClaudeCode, short: str) -> None:
@@ -624,6 +646,10 @@ class Launcher:
     )
     # Session id to the times of its recent resumes.
     _resumes: dict[str, deque[float]] = field(default_factory=dict[str, deque[float]])
+    # Session id to (next deadline, wait, last reason) for a failed removal.
+    _rm_backoff: dict[str, tuple[float, float, str]] = field(
+        default_factory=dict[str, tuple[float, float, str]]
+    )
     # The sessions at the resume limit, logged once until the limit ends.
     _limited: set[str] = field(default_factory=set[str])
     # The sessions that a resume copied, logged once by this launcher.
@@ -655,6 +681,9 @@ class Launcher:
         end_continued(self.ctx, adapter, jobs=jobs)
         by_name = {j.short: j for j in jobs}
         entries = load_unclosed(state, adapter)
+        for entry in entries.values():
+            if kill_unconfirmed(str(entry.get("reason", ""))):
+                entry["recheck"] = True
         # A refusal of `claude rm` holds until the job goes away or its state
         # changes. The next check of the job replaces any other entry.
         kept = {
@@ -694,6 +723,9 @@ class Launcher:
                 forget_recheck(state, adapter, job.short)
             else:
                 record(state, adapter, job, result)
+                current = adapter.job(job.short, state.continued_from(adapter.harness))
+                if current is not None:
+                    self._checked[job.short] = (current.mtime, now)
 
     def stop_idle(self, job: Job, sid: str) -> None:
         """In runner mode, stop the process of a `done` session when its turn
@@ -889,6 +921,12 @@ class Launcher:
         under its id (see `_resume_options`). Return True if `claude --bg`
         succeeded and the job did not fail at its start."""
         now = self.clock()
+        backoff = self._rm_backoff.get(sid)
+        if backoff is not None and now - (backoff[0] - backoff[1]) > RM_BACKOFF_MAX:
+            self._rm_backoff.pop(sid, None)
+            backoff = None
+        if backoff is not None and now < backoff[0]:
+            return False
         recent = self._resumes.setdefault(sid, deque[float]())
         while recent and now - recent[0] >= RESUME_WINDOW:
             recent.popleft()
@@ -974,15 +1012,13 @@ class Launcher:
                     )
                 return False
             self._unreadable_logged.discard(sid)
-            # Before the removal of job records, so that the limit also
-            # applies to a `claude rm` that fails at each tick.
-            recent.append(now)
             prepared = self._resume_options(sid)
             if prepared is None:
                 return False
             options, kept = prepared
             argv = [self.claude, *options, "--bg", "--resume", sid, prompt]
             before = self.adapter.job_names()
+            recent.append(self.clock())
             result = self.run_claude(argv, workspace, RESUME_TIMEOUT, {})
         if result.returncode != 0:
             first = next(iter(printable(result.output).splitlines()), "")
@@ -1018,6 +1054,7 @@ class Launcher:
         and the session's own model and effort level, into them."""
         jobs = [j for j in self.adapter.jobs() if j.own_id == sid]
         if not jobs:
+            self._rm_backoff.pop(sid, None)
             return self._session_options(sid, model=False), None
         kept = next((j for j in jobs if j.worktree is not None), None)
         if kept is not None:
@@ -1030,11 +1067,20 @@ class Launcher:
         for job in jobs:
             # Never with --discard-unpushed or --force-remove-worktree: a
             # refusal keeps the work, and the user decides.
-            code, output = self.run_rm([self.claude, "rm", job.short])
+            code, output = remove_job(self.adapter, job, self.claude, self.run_rm)
             if code != 0:
                 reason = _reason(code, output)
-                log.warning("%s: not resumed: claude rm %s: %s", sid, job.short, reason)
+                previous = self._rm_backoff.get(sid)
+                wait = min(
+                    previous[1] * 2 if previous else self.interval, RM_BACKOFF_MAX
+                )
+                if previous is None or previous[2] != reason:
+                    log.warning(
+                        "%s: not resumed: claude rm %s: %s", sid, job.short, reason
+                    )
+                self._rm_backoff[sid] = (self.clock() + wait, wait, reason)
                 return None
+            self._rm_backoff.pop(sid, None)
             log.info("%s: removed the job %s before the resume", sid, job.short)
         if not self.adapter.find_transcripts(sid):
             log.error("%s: not resumed: no transcript after claude rm", sid)

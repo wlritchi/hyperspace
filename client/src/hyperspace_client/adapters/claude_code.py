@@ -11,15 +11,19 @@ without change.
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
+import logging
 import os
 import re
 import socket
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import IO, Any, cast
 
@@ -693,6 +697,7 @@ class ClaudeCode:
 
     def __init__(self, config_dir: Path | None = None) -> None:
         self.config_dir = config_dir or default_config_dir()
+        self._unstick_declined: dict[str, str] = {}
 
     # --- Discovery -----------------------------------------------------------
 
@@ -1354,6 +1359,123 @@ class ClaudeCode:
         into each assistant record. The model in the message is the name
         that the backend gives, without the route."""
         return _last_turn_value(transcript, "requestedModel", _MODEL)
+
+    def control_socket(self) -> Path | None:
+        """The Claude Code 2.1.301 Unix control socket, or None off Unix.
+        The path is resolved lexically, not through symlinks. TMPDIR does
+        not change this path."""
+        if os.name != "posix":
+            return None
+        base = Path("/tmp")
+        if os.environ.get("TERMUX_VERSION") and os.environ.get("PREFIX"):
+            base = Path(os.environ["PREFIX"]) / "tmp"
+        digest = hashlib.sha256(
+            os.path.abspath(unicodedata.normalize("NFC", str(self.config_dir))).encode()
+        ).hexdigest()[:8]
+        return base / f"cc-daemon-{os.getuid()}" / digest / "control.sock"
+
+    def unstick_job(self, job: Job) -> bool:
+        """Mark an abandoned job stopped only when no process can run it.
+        A failed or uncertain check leaves the job unchanged."""
+
+        def decline(reason: str) -> bool:
+            if self._unstick_declined.get(job.short) != reason:
+                logging.getLogger("hyperspace").info(
+                    "%s: job %s not marked stopped: %s", job.own_id, job.short, reason
+                )
+                self._unstick_declined[job.short] = reason
+            return False
+
+        sid = job.session_id
+        if sid is None or not _JOB_NAME.fullmatch(job.short):
+            return decline("job identity is uncertain")
+        control = self.control_socket()
+        if control is None:
+            return decline("control socket path is unknown")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.2)
+            try:
+                sock.connect(str(control))
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT, errno.ECONNREFUSED):
+                    return decline("control socket check is uncertain")
+            else:
+                return decline("a daemon answers")
+        roster = self.config_dir / "daemon" / "roster.json"
+        try:
+            data: Any = json.loads(roster.read_text())
+        except FileNotFoundError:
+            data = {"workers": {}}
+        except (OSError, ValueError):
+            return decline("roster is unreadable")
+        if not isinstance(data, dict) or not isinstance(data.get("workers"), dict):
+            return decline("roster is invalid")
+        worker: Any = data["workers"].get(job.short)
+        if worker is not None:
+            if not isinstance(worker, dict):
+                return decline("roster worker is invalid")
+            pid = worker.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                return decline("roster pid is invalid")
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                return decline("roster process check is uncertain")
+            else:
+                return decline("roster process runs")
+        if (
+            self.is_running(sid)
+            or self.foreign_registrations(sid)
+            or any(sid in ids for ids in self.live_processes())
+        ):
+            return decline("session process may run")
+        for registration in (self.config_dir / "sessions").glob("*.json"):
+            record = _read_state(registration)
+            if record is None:
+                return decline("registry is unreadable")
+            own = record.get("sessionId")
+            matches = record.get("jobId") == job.short or (
+                isinstance(own, str) and own.startswith(job.short)
+            )
+            if matches and (
+                record.get("pidDomain") not in (None, _pid_domain()) or _alive(record)
+            ):
+                return decline("a job registry process may run")
+        path = self.config_dir / "jobs" / job.short / "state.json"
+        try:
+            seen = _stamp(path)
+            record = _read_state(path)
+            if (
+                record is None
+                or record.get("sessionId") != sid
+                or not isinstance(record.get("state"), str)
+            ):
+                return decline("job state is invalid")
+            if (
+                record.get("state") in ("done", "failed", "stopped")
+                and record.get("tempo") != "active"
+            ):
+                return decline("job state is already final")
+            now = (
+                datetime.now(UTC)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
+            record.update(
+                state="stopped", detail="stopped", tempo="idle", updatedAt=now
+            )
+            if record.get("firstTerminalAt") is None:
+                record["firstTerminalAt"] = now
+            for key in ("inFlight", "needs", "block"):
+                record.pop(key, None)
+            if not _replace(path, json.dumps(record).encode(), seen):
+                return decline("job state changed during the check")
+            self._unstick_declined.pop(job.short, None)
+            return True
+        except OSError:
+            return decline("job state is unreadable")
 
     def set_saved_options(self, short: str, options: list[str]) -> bool:
         """Put each option of `options` in place of the same option in the
