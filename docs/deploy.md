@@ -421,9 +421,19 @@ the local copies too.
 ## Launch requests
 
 Runner launchers and workstation launchers with `--stay` act on launch
-requests by default. Set `launches = false` in `config.toml` to turn this off.
-Such a launcher does not advertise launch support in its heartbeat. The
-`launch` scope lets a caller start sessions with the host's credentials.
+requests by default. The `launch` scope lets a caller start sessions with the
+host's credentials, so choose `launches` in `config.toml` for each host:
+
+- `launches = true` (the default): the host starts launches from all hosts of
+  its account.
+- `launches = "own"`: the host starts only its own launches, for example
+  `hyperspace launch` without `--host`. The launcher fails the launches of
+  other hosts. For example, use this on a workstation where agents on other
+  hosts of the account must not start sessions.
+- `launches = false`: the host starts no launches, also not its own.
+
+A launcher with `"own"` or `false` does not advertise launch support in its
+heartbeat.
 
 Use `hyperspace launch --host runner-1 --wait "Review the changes"` to start a
 session. Use `--workspace` for an absolute directory on the destination, and
