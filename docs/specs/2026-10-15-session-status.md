@@ -623,8 +623,9 @@ most 5 times in an hour, so that a session that stops at once does not start
 in a loop. It does not resume while `launcher_max_sessions` (default 10)
 Claude Code processes run on the host, so that many wakes at a time do not use
 all the memory of the host. Such a resume waits for a later tick, and it does
-not count toward the limit of 5. A runner with no session to resume runs only
-the launcher.
+not count toward the limit of 5. A resume that does not start because
+`claude rm` fails does not count either (see the wake spec). A runner with no
+session to resume runs only the launcher.
 
 The resume runs in the session's lease workspace, where it started on the
 runner. If that directory is not on the runner, it runs in the workspace that
